@@ -1,0 +1,3869 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { chromium } from 'playwright-core';
+import {
+  actionResponseKey,
+  actionId,
+  advanceSourcePackAfterBoundary,
+  assistantAfterActionMarker,
+  bucketBlocksCandidateActivation,
+  bucketHasGenerationReservation,
+  bucketHasUnresolvedAwaitingAction,
+  bucketIsUnfinished,
+  bucketNeedsReviewer,
+  bucketOccupiesLiveReviewerSlot,
+  bucketOccupiesReviewerSlot,
+  bucketReclaimableIdleSlot,
+  buildLiveReviewerOccupancy,
+  computeDesiredActiveReviewers,
+  conversationRolloverReasonFromText,
+  countOccupiedReviewerSlots,
+  getBucketState,
+  isExactSetupAck,
+  isRecoverableAdvisoryCoordinatorFooter,
+  isRecoverableReadbackFooter,
+  isRecoverableRegistryWriteFooter,
+  isRecoverableSourcePackHoldIncident,
+  isRecoverableTurnBoundaryFooter,
+  isRecoverableUnavailableSourcePackFooter,
+  isSourcePackBoundaryFooter,
+  isVerifiedCorpusCompletion,
+  markSourcePackAccessVerified,
+  nextSourcePackNumber,
+  normalizeBucketId,
+  parseSourcePackNumber,
+  packNumberFromFilename,
+  isValidSourcePackNumber,
+  isInvalidZeroSourcePackFilename,
+  resolveNextSourcePackTargetNumber,
+  sanitizeStoredSourcePackCursorFields,
+  extractLastVisibleSourcePackNumber,
+  extractPackNumbersFromText,
+  responseIndicatesSourcePackUnavailable,
+  parseCorpusCompletionEvidence,
+  parseFooter,
+  recoverablePackNumberFromFooter,
+  resetPerChatObservationState,
+  resetSourcePackAccessState,
+  clearStaleControllerSideSourcePackVerification,
+  buildSourcePackContinuationPrompt,
+  reviewerConfirmedSourcePackAccess,
+  selectPendingBuckets,
+  selectReviewerSlotCandidates,
+  setupAckTimedOut,
+  sha16,
+  shouldClearStaleGenerationReservation,
+  shouldEscalateFooter,
+  shouldRetrySourcePackContinuation,
+  sourcePackRetryDelayMs,
+  sourcePackRetryReady,
+  sourcePackContinuationAlreadySent,
+  sourcePackFilename,
+  sourcePackShardFolderUrl,
+  SOURCE_PACK_SHARDS,
+} from './protocol.mjs';
+import {
+  buildOperationsStatus,
+  normalizeOperationsState,
+  recordActivityEvent,
+  recordAuditProgressEvent,
+  recordSourcePackTransition,
+} from './operations.mjs';
+
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/(.:)/, '$1')), '..');
+const CONFIG_PATH = path.join(ROOT, 'config.json');
+const STATE_PATH = path.join(ROOT, 'data', 'state.json');
+const STATUS_PATH = path.join(ROOT, 'data', 'status.json');
+const CONTROL_PATH = path.join(ROOT, 'data', 'control.json');
+const COORDINATOR_STATUS_PATH = path.join(ROOT, 'data', 'coordinator-status.json');
+const LOG_PATH = path.join(ROOT, 'logs', 'controller.log');
+const INCIDENT_DIR = path.join(ROOT, 'data', 'incidents');
+const COORDINATOR_WAKE = path.join(ROOT, 'CoordinatorWake.ps1');
+const COORDINATOR_WAKE_STDOUT = path.join(ROOT, 'logs', 'coordinator-wake.stdout.log');
+const COORDINATOR_WAKE_STDERR = path.join(ROOT, 'logs', 'coordinator-wake.stderr.log');
+const SOURCE_PACK_READY_PATH = path.join(ROOT, 'data', 'source-packs-ready.json');
+
+function dispatchStartGraceMs() {
+  const configured = Number(config.dispatchStartGraceSeconds);
+  if (Number.isFinite(configured) && configured > 0) return configured * 1000;
+  return Math.max(45000, Number(config.pollSeconds || 12) * 3 * 1000);
+}
+
+const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8').replace(/^\uFEFF/, ''));
+const MAX_ACTIVE_REVIEWERS = Math.min(2, Math.max(1, Number(config.maxActiveReviewers || 2)));
+const SCHEDULING_BLOCKED_BUCKETS = new Set(
+  (Array.isArray(config.schedulingBlockedBuckets) ? config.schedulingBlockedBuckets : [])
+    .map(Number)
+    .filter(bucket => Number.isInteger(bucket) && bucket >= 0 && bucket < Number(config.bucketCount || 0)),
+);
+
+function isSchedulingBlockedBucket(bucket) {
+  return SCHEDULING_BLOCKED_BUCKETS.has(Number(bucket));
+}
+
+function bucketStateFor(value) {
+  return getBucketState(state, value, config.bucketCount);
+}
+
+for (const dir of [path.dirname(STATE_PATH), path.dirname(LOG_PATH), INCIDENT_DIR]) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function now() {
+  return new Date().toISOString();
+}
+
+function log(message) {
+  const line = `${now()} ${message}\n`;
+  fs.appendFileSync(LOG_PATH, line, 'utf8');
+  console.log(line.trim());
+}
+
+function loadJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+  } catch {
+    return fallback;
+  }
+}
+
+function readControl() {
+  const control = loadJson(CONTROL_PATH, null);
+  const desiredState = String(control?.desiredState || 'RUNNING').toUpperCase();
+  return {
+    desiredState: ['RUNNING', 'PAUSED', 'STOPPED'].includes(desiredState) ? desiredState : 'RUNNING',
+    requestedAt: control?.requestedAt || null,
+    requestedBy: control?.requestedBy || null,
+  };
+}
+
+function controlPauseError() {
+  const error = new Error('controller is paused before sending a new action');
+  error.code = 'CONTROL_PAUSED';
+  return error;
+}
+
+function assertControlRunning() {
+  const control = readControl();
+  if (control.desiredState === 'PAUSED') throw controlPauseError();
+  if (control.desiredState === 'STOPPED') {
+    const error = new Error('controller was stopped before sending a new action');
+    error.code = 'CONTROL_STOPPED';
+    throw error;
+  }
+}
+
+function saveJsonAtomic(file, value) {
+  // Multiple controller instances can briefly overlap during watchdog recovery.
+  // Keep each staging file private so they cannot race on one shared .tmp path.
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  let lastError;
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt === 8) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  throw lastError;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function projectConversationUrl(conversationId) {
+  return `${config.projectUrl}/c/${conversationId}`;
+}
+
+function defaultBucketState(bucket) {
+  const initial = config.buckets[String(bucket)] ?? {};
+  const conversationId = initial.conversationId || null;
+  const corpusCompleteVerified = Boolean(initial.corpusCompleteVerified);
+  const complete = corpusCompleteVerified;
+  return {
+    complete,
+    corpusCompleteVerified,
+    chatId: conversationId,
+    chatUrl: conversationId ? projectConversationUrl(conversationId) : null,
+    phase: complete ? 'COMPLETE' : conversationId ? 'ACTIVE' : 'PENDING',
+    lastHash: null,
+    processedHash: null,
+    processedResponseKey: null,
+    lastProcessedActionId: null,
+    lastProcessedStatus: null,
+    lastProcessedBlocker: null,
+    candidateHash: null,
+    candidateCount: 0,
+    candidateActionId: null,
+    candidateObservedAt: null,
+    lastSeen: null,
+    lastAction: null,
+    lastSentAt: 0,
+    lastMessageSentAt: null,
+    lastMessageSentKind: null,
+    lastMessageSentActionId: null,
+    lastMessageReceivedAt: null,
+    lastMessageReceivedHash: null,
+    lastMessageReceivedPreview: null,
+    lastResponseLatencyMs: null,
+    casesReported: 0,
+    casesSinceChatStart: 0,
+    awaitingResponseAt: null,
+    awaitingActionId: null,
+    responseBaselineHash: null,
+    setupVerified: false,
+    setupVerifiedChatId: null,
+    malformedCount: 0,
+    transientFailures: 0,
+    noAssistantCount: 0,
+    generationSeenSinceAction: false,
+    generationObservedAt: null,
+    writeRecoveryResumePending: false,
+    writeRecoveryIncidentId: null,
+    writeRecoveryInterruptedActionId: null,
+    advisoryAnomalyResumePending: false,
+    advisoryAnomalyInterruptedActionId: null,
+    chatHistory: [],
+    rolloverCount: 0,
+    lastRolloverAt: null,
+    lastRolloverReason: null,
+    sourcePackResumePending: false,
+    sourcePackResumeIncidentId: null,
+    sourcePackTargetNumber: null,
+    sourcePackTargetFilename: null,
+    sourcePackLastConsumedNumber: null,
+    sourcePackLastVisibleNumber: null,
+    sourcePackBoundaryResponsePreview: null,
+    sourcePackLastDeliveredNumber: null,
+    sourcePackLastDeliveredIncidentId: null,
+    sourcePackLastDeliveredAt: null,
+    sourcePackLastDeliveredActionId: null,
+    sourcePackAccessVerified: false,
+    sourcePackAccessVerifiedAt: null,
+    sourcePackRequestActionId: null,
+    sourcePackUnavailableCount: 0,
+    sourcePackLastUnavailableAt: null,
+    sourcePackRetryNotBefore: null,
+    lastProgressAt: null,
+    lastProgressActionId: null,
+    lastProgressNewCases: null,
+    lastProgressWritesVerified: null,
+    lastProgressPack: null,
+    lastSourcePackTransitionAt: null,
+    lastSourcePackTransitionFrom: null,
+    lastSourcePackTransitionTo: null,
+  };
+}
+
+function normalizeState(raw) {
+  const state = raw && typeof raw === 'object' ? raw : {};
+  state.version = 3;
+  state.startedAt ||= now();
+  state.buckets ||= {};
+  state.actions ||= {};
+  state.incidents ||= {};
+  state.completedAt ||= null;
+  state.runState ||= 'RUNNING';
+  state.runStartedAt ||= state.startedAt;
+  state.workingMs = Number(state.workingMs || 0);
+  state.lastWorkingAt ||= state.startedAt;
+  state.pausedAt ||= null;
+  state.metrics ||= {};
+  state.metrics.casesReported = Number(state.metrics.casesReported || 0);
+  state.metrics.casesReportedByBucket ||= {};
+  state.metrics.progressBasis ||= 'sum of accepted NEW_CASES footer values observed by this controller';
+  state.coordinator ||= {};
+
+  normalizeOperationsState(state);
+
+  for (let bucket = 0; bucket < Number(config.bucketCount); bucket += 1) {
+    const key = String(bucket);
+    const defaults = defaultBucketState(bucket);
+    const existing = state.buckets[key] && typeof state.buckets[key] === 'object'
+      ? state.buckets[key]
+      : {};
+    const merged = { ...defaults, ...existing };
+
+    if (!merged.chatUrl && merged.chatId) merged.chatUrl = projectConversationUrl(merged.chatId);
+    if (!Array.isArray(merged.chatHistory)) merged.chatHistory = [];
+    merged.rolloverCount = Number(merged.rolloverCount || 0);
+    merged.casesSinceChatStart = Number(merged.casesSinceChatStart || 0);
+    merged.generationSeenSinceAction = Boolean(merged.generationSeenSinceAction);
+    merged.writeRecoveryResumePending = Boolean(merged.writeRecoveryResumePending);
+    merged.advisoryAnomalyResumePending = Boolean(merged.advisoryAnomalyResumePending);
+    merged.setupVerified = Boolean(merged.setupVerified);
+    if (merged.setupVerified && merged.setupVerifiedChatId && merged.chatId
+      && String(merged.setupVerifiedChatId) !== String(merged.chatId)) {
+      merged.setupVerified = false;
+      merged.setupVerifiedChatId = null;
+    }
+    merged.sourcePackUnavailableCount = Math.max(0, Number(merged.sourcePackUnavailableCount || 0));
+    merged.sourcePackResumePending = Boolean(merged.sourcePackResumePending);
+    sanitizeStoredSourcePackCursorFields(Number(key), merged);
+    merged.sourcePackTargetNumber = parseSourcePackNumber(merged.sourcePackTargetNumber, Number(key));
+    merged.sourcePackLastDeliveredNumber = parseSourcePackNumber(merged.sourcePackLastDeliveredNumber, Number(key));
+    merged.sourcePackLastConsumedNumber = parseSourcePackNumber(merged.sourcePackLastConsumedNumber, Number(key));
+    merged.sourcePackLastVisibleNumber = parseSourcePackNumber(merged.sourcePackLastVisibleNumber, Number(key));
+    merged.sourcePackAccessVerified = Boolean(merged.sourcePackAccessVerified);
+    if (clearStaleControllerSideSourcePackVerification(merged)) {
+      merged.sourcePackAccessVerified = false;
+    }
+    if (merged.sourcePackResumePending && shouldRetrySourcePackContinuation(merged)) {
+      resetSourcePackAccessState(merged);
+    }
+
+    // v3 completion is fail-closed. Historical COMPLETE states represented only
+    // exhaustion of then-visible source packs, so they must not retire a bucket.
+    merged.corpusCompleteVerified = Boolean(merged.corpusCompleteVerified);
+    merged.complete = merged.corpusCompleteVerified;
+
+    if (merged.complete) {
+      merged.phase = 'COMPLETE';
+    } else if (merged.phase === 'COMPLETE') {
+      merged.phase = merged.chatUrl ? 'ACTIVE' : 'PENDING';
+    } else if (!merged.chatUrl && merged.phase !== 'HOLD') {
+      merged.phase = 'PENDING';
+    } else if (merged.chatUrl && !['SETUP_WAIT', 'ACTIVE', 'HOLD', 'PAUSED'].includes(merged.phase)) {
+      merged.phase = 'ACTIVE';
+    }
+    state.buckets[key] = merged;
+  }
+
+  return state;
+}
+
+const state = normalizeState(loadJson(STATE_PATH, null));
+state.controllerSessionStartedAt = now();
+state.responseMonitoringStartedAt = state.controllerSessionStartedAt;
+
+let lastLiveReviewerOccupancy = buildLiveReviewerOccupancy({
+  bucketStates: state.buckets,
+  liveGeneratingByBucket: {},
+  excludedBuckets: SCHEDULING_BLOCKED_BUCKETS,
+  maxActive: MAX_ACTIVE_REVIEWERS,
+  bucketCount: config.bucketCount,
+});
+let lastLiveGeneratingByBucket = {};
+
+function saveState() {
+  normalizeOperationsState(state);
+  saveJsonAtomic(STATE_PATH, state);
+}
+
+function updateWorkingClock(nextState) {
+  const at = Date.now();
+  if (state.runState === 'RUNNING' && state.lastWorkingAt) {
+    const last = Date.parse(state.lastWorkingAt);
+    if (Number.isFinite(last) && at > last) state.workingMs += at - last;
+  }
+  state.runState = nextState;
+  state.lastWorkingAt = new Date(at).toISOString();
+  if (nextState === 'RUNNING') state.responseMonitoringStartedAt = state.lastWorkingAt;
+  if (nextState === 'PAUSED') state.pausedAt = state.lastWorkingAt;
+  if (nextState === 'RUNNING') state.pausedAt = null;
+}
+
+function syncControlState() {
+  const control = readControl();
+  if (control.desiredState !== state.runState) {
+    updateWorkingClock(control.desiredState);
+    saveState();
+    log(`run state changed to ${control.desiredState}`);
+  }
+  return control;
+}
+
+function workingElapsedMs() {
+  let total = Number(state.workingMs || 0);
+  if (state.runState === 'RUNNING' && state.lastWorkingAt) {
+    const last = Date.parse(state.lastWorkingAt);
+    if (Number.isFinite(last)) total += Math.max(0, Date.now() - last);
+  }
+  return total;
+}
+
+function trimActionLedger() {
+  const entries = Object.entries(state.actions);
+  if (entries.length <= 2500) return;
+  entries
+    .sort((a, b) => String(a[1]?.updatedAt ?? '').localeCompare(String(b[1]?.updatedAt ?? '')))
+    .slice(0, entries.length - 2000)
+    .forEach(([key]) => delete state.actions[key]);
+}
+
+function setupPrompt(bucket) {
+  return `PROTOCOL SETUP ONLY. You are the R4.3.3 source-summary audit reviewer assigned Bucket ${bucket} in the Automated project.
+
+Canonical registry:
+${config.registryId}
+
+Permanent ownership:
+int(stable_id, 16) % 6 == ${bucket}
+
+Exact write tab:
+R433_AUDIT_SHARD_${bucket}
+
+This is a continuation of the existing R4.3.3 audit, not a restart. Preserve every valid terminal result already persisted by earlier reviewers. Do not audit, inspect source cases, write the registry, or make a substantive decision from this setup message. Do not write any other shard, CONFIG, MASTER, or immutable reconciliation/archive tab.
+
+For substantive turns after setup:
+- start from the current authoritative registry state;
+- skip every already terminalized case;
+- persist and readback-verify every newly completed result before treating it as authoritative;
+- preserve case-level source/technical failures as terminal outcomes where the existing protocol requires;
+- never overwrite a terminal result merely to reconcile a collision or duplicate mapping;
+- route genuine workflow ambiguity to the coordinator;
+- continue at maximum safe throughput across pack/group/run boundaries;
+- exhaustion of the source packs currently visible to you is NOT bucket completion;
+- STATUS: COMPLETE is allowed only after reconciliation against the full authoritative R4.3.3 finalized-summary population proves that this bucket has zero owned stable_ids without terminal registry results;
+- if current packs are exhausted but owned pending stable_ids remain, use STATUS: NORMAL and BLOCKER: NEXT_SOURCE_PACKS_REQUIRED;
+- end every substantive turn with exactly:
+AUDIT_TURN_STATUS
+STATUS: NORMAL / ERROR / COMPLETE
+NEW_CASES: <number>
+WRITES_VERIFIED: YES / NO / PARTIAL
+BLOCKER: NONE or <brief blocker>
+TRIGGER_COORDINATOR: YES / NO
+
+Reply with exactly PROTOCOL_SETUP_ACK_V3 and nothing else.`;
+}
+
+function initialAuditPrompt(bucket) {
+  return `Begin or resume Bucket ${bucket} from the current authoritative registry state. First reconcile R433_AUDIT_SHARD_${bucket} against the available R4.3.3 source packs and identify the next eligible pending case owned by int(stable_id, 16) % 6 == ${bucket}. Do not redo any valid terminalized case. Process as many additional eligible pending cases as this turn can safely complete, continuing across pack/group/run boundaries. Persist and readback-verify every new result before treating it as authoritative. Properly terminalized case-level source or technical failures are normal and must not stop the turn. Exhausting the source packs currently visible to you does not mean the bucket is complete. If visible packs are exhausted while full-corpus owned cases remain, use STATUS: NORMAL with BLOCKER: NEXT_SOURCE_PACKS_REQUIRED. Use STATUS: COMPLETE only after reconciliation against the full authoritative ${config.auditablePopulation}-summary R4.3.3 finalized population proves zero owned pending stable_ids and no unresolved writes. End with the required strict six-line AUDIT_TURN_STATUS footer.`;
+}
+
+function continuationPrompt(bucket) {
+  return `Continue the source-summary audit from the current authoritative registry state for Bucket ${bucket}. Review as many additional eligible cases in your assigned bucket as this turn can possibly complete. There is no voluntary case quota. Do not redo completed cases. Persist and readback-verify each result according to the existing protocol and continue across pack/group/run boundaries until the turn itself can no longer proceed, the full-corpus bucket is genuinely complete, or a real global blocker prevents further work. Exhaustion of currently visible packs is not completion; when that happens with owned cases still pending, use STATUS: NORMAL with BLOCKER: NEXT_SOURCE_PACKS_REQUIRED. STATUS: COMPLETE requires full-population reconciliation against all ${config.auditablePopulation} finalized summaries. End with the required strict six-line AUDIT_TURN_STATUS footer.`;
+}
+
+function sourcePackContinuationPrompt(bucket, source) {
+  return buildSourcePackContinuationPrompt(bucket, source);
+}
+
+function corpusReconciliationPrompt(bucket) {
+  return `Your prior response reported STATUS: COMPLETE for Bucket ${bucket}. Treat that only as a completion candidate, not as authorization to stop. Reconcile R433_AUDIT_SHARD_${bucket} against the full authoritative R4.3.3 finalized-summary population of ${config.auditablePopulation} cases, using permanent ownership int(stable_id, 16) % 6 == ${bucket}. Current source-pack exhaustion is not sufficient. If any owned stable_id lacks a terminal registry result, continue reviewing if its source pack is available; if the required later packs are not available, return STATUS: NORMAL with BLOCKER: NEXT_SOURCE_PACKS_REQUIRED and TRIGGER_COORDINATOR: YES. Only if full-population reconciliation proves zero owned pending stable_ids and there are no unresolved writes may you return STATUS: COMPLETE. In that case, immediately before the six-line footer include these exact evidence lines:\nFULL_CORPUS_RECONCILED: YES\nFULL_CORPUS_AUDITABLE_POPULATION: ${config.auditablePopulation}\nOWNED_PENDING_CASES: 0\nThen end with the strict six-line AUDIT_TURN_STATUS footer.`;
+}
+
+function malformedRecoveryPrompt(bucket) {
+  return `Recover conservatively from the prior malformed or truncated Bucket ${bucket} response. First reconcile against the authoritative registry and identify every result already persisted by the interrupted turn. Readback-verify any newly written rows whose verification is uncertain. Do not re-review or rewrite any case already validly terminalized. Resolve any incomplete or defective write before proceeding, then continue additional eligible pending Bucket ${bucket} cases at maximum safe throughput. End with exactly the required six-line AUDIT_TURN_STATUS footer.`;
+}
+
+function partialWriteRecoveryPrompt(bucket, footer) {
+  return `Recover Bucket ${bucket} conservatively before any new review work. The previous footer reported WRITES_VERIFIED: ${footer.writesVerified} and BLOCKER: ${footer.blocker || 'NONE'}. Reconcile only the uncertain write state from the previous turn against the authoritative registry, readback-verify every uncertain write, and repair only incomplete/defective writes. Do not re-audit or rewrite valid terminalized cases. Do not review any new cases in this recovery turn. Once the uncertain writes are fully reconciled, stop and return the required strict six-line AUDIT_TURN_STATUS footer with WRITES_VERIFIED: YES if and only if readback verification succeeded. The controller will resume ordinary source-pack work in a separate turn after this recovery completes.`;
+}
+
+function interruptedWriteRecoveryPrompt(bucket, footer, interruptedActionId) {
+  return `The prior WRITE_RECOVERY action ${interruptedActionId} began generating but its browser/session connection was interrupted before any attributable assistant response completed. Treat that interrupted attempt as uncertain execution: reconcile from the authoritative registry and readback state before making any repair, and do not assume that an unverified write either succeeded or failed. ${partialWriteRecoveryPrompt(bucket, footer)}`;
+}
+
+function isolatedAnomalyContinuationPrompt(bucket) {
+  return `Continue Bucket ${bucket} without allowing the previously reported isolated anomaly to freeze the whole bucket. The prior turn reported WRITES_VERIFIED: YES and requested coordinator attention for an anomaly that must not cause an already-terminal registry row to be rewritten. Preserve every existing terminal registry row exactly as-is, including any anomalous or disputed mapping described in the prior response; do not overwrite, relabel, or re-audit that terminalized case merely to reconcile the anomaly. Continue from the next eligible pending owned stable_id and process as many additional cases as this turn can safely complete. If the anomaly truly prevents identifying or processing later eligible cases, return a specific non-NONE blocker describing exactly what is blocked and set TRIGGER_COORDINATOR: YES. Otherwise continue normally and use TRIGGER_COORDINATOR: NO. Persist and readback-verify every new result and end with the required strict six-line AUDIT_TURN_STATUS footer.`;
+}
+
+async function readVisibleMessages(page) {
+  return withPageProbeTimeout(page.evaluate(() => {
+    const attributedNodes = [...document.querySelectorAll('[data-message-author-role]')];
+    if (attributedNodes.length) {
+      return attributedNodes.map(node => ({
+        role: node.getAttribute('data-message-author-role') || '',
+        text: (node.innerText || node.textContent || '').trim(),
+      }));
+    }
+
+    const userSelector = 'main .bg-user-message';
+    const assistantSelector = 'main .group.flex.min-w-0.flex-col';
+    const currentMessages = [...document.querySelectorAll(`${userSelector}, ${assistantSelector}`)]
+      .filter(node => {
+        const role = node.matches(userSelector) ? 'user' : 'assistant';
+        const selector = role === 'user' ? userSelector : assistantSelector;
+        return !node.querySelector(selector);
+      })
+      .map(node => ({
+        role: node.matches(userSelector) ? 'user' : 'assistant',
+        text: (node.innerText || node.textContent || '').trim(),
+      }))
+      .filter(message => message.text);
+    if (currentMessages.length) return currentMessages;
+
+    // Retain the older turn-wrapper fallback for UI variants that expose neither
+    // of the current user-message nor assistant-message structures.
+    const turns = [...document.querySelectorAll('main div.group.flex.flex-col.pb-2.pt-2')];
+    return turns.map(turn => {
+      const preferredNodes = [...turn.querySelectorAll('div.text-size-chat.whitespace-pre-wrap')];
+      const contentNodes = preferredNodes.length
+        ? preferredNodes
+        : [...turn.querySelectorAll('div.text-size-chat')]
+          .filter(node => !node.querySelector('div.text-size-chat')
+            && !node.classList.contains('min-w-0'));
+      const text = contentNodes
+        .map(node => (node.innerText || node.textContent || '').trim())
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+      if (!text) return null;
+      return {
+        role: /\[\[R433_ACTION:[^\]]+\]\]/.test(text) ? 'user' : 'assistant',
+        text,
+      };
+    }).filter(Boolean);
+  }), 'readVisibleMessages');
+}
+
+async function latestMessage(page, role) {
+  const messages = await readVisibleMessages(page);
+  const matches = messages.filter(message => message.role === role);
+  return matches.length ? matches[matches.length - 1].text : '';
+}
+
+async function latestAssistantAfterActionMarker(page, actionIdValue) {
+  if (!actionIdValue) return { attributed: false, text: '' };
+  const messages = await readVisibleMessages(page);
+  return assistantAfterActionMarker(messages, actionIdValue);
+}
+
+const COMPOSER_SELECTOR = '[role="textbox"][contenteditable="true"], #prompt-textarea';
+const COMPOSER_LOCATOR_SELECTOR =
+  '[role="textbox"][contenteditable="true"]:visible, #prompt-textarea:visible';
+
+async function composerText(page) {
+  return withPageProbeTimeout(page.evaluate((selector) => {
+    const el = Array.from(document.querySelectorAll(selector))
+      .find((candidate) => candidate.getClientRects().length > 0);
+    if (!el) return '';
+    return (el.innerText || el.textContent || el.value || '').trim();
+  }, COMPOSER_SELECTOR), 'composerText');
+}
+
+const PAGE_PROBE_TIMEOUT_MS = 5000;
+const PAGE_PROBE_STALL_THRESHOLD = 3;
+const pageProbeTimeoutCounts = new WeakMap();
+const GENERATION_STOP_SELECTORS = [
+  'button[data-testid="stop-button"]',
+  'button[aria-label*="Stop generating"]',
+  'button[aria-label="Stop"]',
+];
+
+function withPageProbeTimeout(promise, label, timeoutMs = PAGE_PROBE_TIMEOUT_MS) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error(`${label} timed out after ${timeoutMs}ms`);
+        error.code = 'PAGE_PROBE_TIMEOUT';
+        reject(error);
+      }, timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+async function isGenerating(page) {
+  try {
+    const generating = await withPageProbeTimeout((async () => {
+      for (const selector of GENERATION_STOP_SELECTORS) {
+        const locator = page.locator(selector).first();
+        if (await locator.count()) {
+          try {
+            if (await locator.isVisible()) return true;
+          } catch {}
+        }
+      }
+      return false;
+    })(), 'isGenerating');
+    pageProbeTimeoutCounts.delete(page);
+    return generating;
+  } catch (error) {
+    if (error?.code === 'PAGE_PROBE_TIMEOUT') {
+      const timeoutCount = Number(pageProbeTimeoutCounts.get(page) || 0) + 1;
+      pageProbeTimeoutCounts.set(page, timeoutCount);
+      if (timeoutCount >= PAGE_PROBE_STALL_THRESHOLD) {
+        const stalled = new Error(`reviewer page failed ${timeoutCount} consecutive live-generation probes`);
+        stalled.code = 'PAGE_PROBE_STALLED';
+        stalled.timeoutCount = timeoutCount;
+        throw stalled;
+      }
+      // Fail closed while a transiently slow page is still below the bounded
+      // stall threshold so scheduler capacity is never freed speculatively.
+      return true;
+    }
+    throw error;
+  }
+}
+
+async function stopLiveGeneration(page) {
+  for (const selector of GENERATION_STOP_SELECTORS) {
+    const locator = page.locator(selector).first();
+    try {
+      if (!(await locator.count()) || !(await locator.isVisible())) continue;
+      await locator.click({ timeout: 3000 });
+      try {
+        await locator.waitFor({ state: 'hidden', timeout: 5000 });
+      } catch {}
+      return true;
+    } catch {}
+  }
+  return false;
+}
+
+async function conversationRolloverReason(page) {
+  if (!config.conversationRolloverEnabled || config.conversationRolloverLimitDetection === false) return null;
+  let body = '';
+  try {
+    body = await page.locator('body').innerText({ timeout: 5000 });
+  } catch {
+    return null;
+  }
+  return conversationRolloverReasonFromText(body);
+}
+
+async function fillComposer(page, text) {
+  const composer = page.locator(COMPOSER_LOCATOR_SELECTOR).first();
+  await composer.waitFor({ state: 'visible', timeout: 20000 });
+  try {
+    await composer.fill(text);
+  } catch {
+    await composer.evaluate((el, value) => {
+      el.focus();
+      if ('value' in el) {
+        el.value = value;
+      } else {
+        el.textContent = value;
+      }
+      el.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        inputType: 'insertText',
+        data: value,
+      }));
+    }, text);
+  }
+}
+
+async function pressSend(page) {
+  assertControlRunning();
+  const composer = page.locator(COMPOSER_LOCATOR_SELECTOR).first();
+  const before = await composerText(page);
+  const button = page.locator('button[data-testid="send-button"]:visible, button[aria-label="Send"]:visible').first();
+  if (await button.count()) {
+    try {
+      if (await button.isVisible() && await button.isEnabled()) {
+        assertControlRunning();
+        await button.click();
+        await sleep(1200);
+        const afterClick = await composerText(page);
+        if (!afterClick || afterClick !== before) return;
+      }
+    } catch {}
+  }
+
+  // Some current project pages accept the draft but intermittently ignore the
+  // send-button click. Focused Enter remains the native chat submission path.
+  assertControlRunning();
+  await composer.focus();
+  await composer.press('Enter');
+  await sleep(1200);
+
+  const afterEnter = await composerText(page);
+  if (!afterEnter || afterEnter !== before) return;
+
+  // Final fallback for pages where the button's React handler is mounted but
+  // the pointer click is swallowed by the project shell.
+  if (await button.count()) {
+    assertControlRunning();
+    await button.dispatchEvent('click');
+  }
+}
+
+function actionMarker(id) {
+  return `[[R433_ACTION:${id}]]`;
+}
+
+async function waitForSentMarker(page, marker, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const latestUser = await latestMessage(page, 'user');
+    if (latestUser.includes(marker)) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+async function sendAction(page, bucket, kind, prompt, responseHash = '') {
+  assertControlRunning();
+  const bucketState = state.buckets[String(bucket)];
+  const rolloverReason = await conversationRolloverReason(page);
+  if (rolloverReason) {
+    const error = new Error(rolloverReason);
+    error.code = 'CHAT_ROLLOVER_REQUIRED';
+    throw error;
+  }
+  const chatKey = bucketState?.chatId || bucketState?.chatUrl || `bucket-${bucket}`;
+  const predecessorActionId = bucketState?.lastProcessedActionId || '';
+  let id = actionId({
+    bucket,
+    chatKey,
+    responseHash,
+    kind,
+    prompt,
+    predecessorActionId,
+  });
+  let marker = actionMarker(id);
+  let existingAction = state.actions[id];
+  let latestUser = await latestMessage(page, 'user');
+  if (!latestUser.includes(marker)) {
+    const observedDraft = Object.values(state.actions).find(action =>
+      action.bucket === bucket
+        && action.kind === kind
+        && (action.status === 'PREPARED' || action.status === 'DRAFTED')
+        && latestUser.includes(actionMarker(action.id))
+    );
+    if (observedDraft) {
+      id = observedDraft.id;
+      marker = actionMarker(id);
+      existingAction = observedDraft;
+    }
+  }
+  const text = prompt + '\n\n' + marker;
+  if (existingAction?.status === 'SENT') {
+    if (latestUser.includes(marker)) {
+      if (!bucketState.awaitingResponseAt
+        && (!responseHash || bucketState.processedHash === responseHash)) {
+        const sentAt = existingAction.sentAt || bucketState.lastMessageSentAt || now();
+        bucketState.lastSentAt = Date.parse(sentAt);
+        bucketState.lastMessageSentAt = sentAt;
+        bucketState.lastMessageSentKind = kind;
+        bucketState.lastMessageSentActionId = id;
+        bucketState.awaitingResponseAt = sentAt;
+        bucketState.awaitingActionId = id;
+        bucketState.responseBaselineHash = responseHash || null;
+        bucketState.candidateHash = null;
+        bucketState.candidateCount = 0;
+        bucketState.candidateActionId = null;
+        bucketState.candidateObservedAt = null;
+        bucketState.lastAction = `reconciled-sent:${id}`;
+        saveState();
+      }
+      return id;
+    }
+
+    // The ledger said SENT, but the action marker is absent from the chat.
+    // Treat this as an unconfirmed send and retry the preserved draft/action.
+    state.actions[id].status = 'DRAFTED';
+    state.actions[id].updatedAt = now();
+    state.actions[id].deliveryVerified = false;
+    saveState();
+  }
+
+  if (latestUser.includes(marker)) {
+    const reconciledAt = now();
+    const sentAt = existingAction?.sentAt || reconciledAt;
+    state.actions[id] = {
+      ...(existingAction || {}),
+      id,
+      bucket,
+      kind,
+      status: 'SENT',
+      updatedAt: reconciledAt,
+      sentAt,
+      deliveryVerified: true,
+      reconciledFromUserMessage: true,
+    };
+    bucketState.lastSentAt = Date.parse(sentAt);
+    bucketState.lastMessageSentAt = sentAt;
+    bucketState.lastMessageSentKind = kind;
+    bucketState.lastMessageSentActionId = id;
+    bucketState.awaitingResponseAt = sentAt;
+    bucketState.awaitingActionId = id;
+    bucketState.responseBaselineHash = responseHash || null;
+    bucketState.candidateHash = null;
+    bucketState.candidateCount = 0;
+    bucketState.candidateActionId = null;
+    bucketState.candidateObservedAt = null;
+    bucketState.generationSeenSinceAction = false;
+    bucketState.generationObservedAt = null;
+    bucketState.lastAction = 'reconciled-sent:' + id;
+    recordActivityEvent(state, {
+      bucket,
+      kind,
+      summary: kind + ' sent (' + id + ')',
+      at: reconciledAt,
+    });
+    saveState();
+    trimActionLedger();
+    return id;
+  }
+
+  const existingDraft = await composerText(page);
+  if (existingDraft) {
+    if (!existingDraft.includes(marker)) {
+      const error = new Error('composer contains a foreign or nonmatching draft; preserved');
+      error.code = 'FOREIGN_DRAFT';
+      throw error;
+    }
+    state.actions[id] = {
+      ...(existingAction || {}),
+      id,
+      bucket,
+      kind,
+      status: 'DRAFTED',
+      updatedAt: now(),
+    };
+    saveState();
+    assertControlRunning();
+    await pressSend(page);
+  } else {
+    state.actions[id] = {
+      id,
+      bucket,
+      kind,
+      status: 'PREPARED',
+      createdAt: existingAction?.createdAt || now(),
+      updatedAt: now(),
+      responseHash,
+      marker,
+    };
+    saveState();
+
+    await fillComposer(page, text);
+    state.actions[id].status = 'DRAFTED';
+    state.actions[id].updatedAt = now();
+    saveState();
+
+    assertControlRunning();
+    await pressSend(page);
+  }
+
+  const delivered = await waitForSentMarker(page, marker, 15000);
+  if (!delivered) {
+    state.actions[id].status = 'DRAFTED';
+    state.actions[id].updatedAt = now();
+    state.actions[id].deliveryVerified = false;
+    saveState();
+    const error = new Error(`send action ${id} was not observed in the chat after 15 seconds`);
+    error.code = 'SEND_NOT_OBSERVED';
+    throw error;
+  }
+
+  const sentAt = now();
+  state.actions[id].status = 'SENT';
+  state.actions[id].updatedAt = sentAt;
+  state.actions[id].sentAt = sentAt;
+  state.actions[id].deliveryVerified = true;
+  bucketState.lastSentAt = Date.parse(sentAt);
+  bucketState.lastMessageSentAt = sentAt;
+  bucketState.lastMessageSentKind = kind;
+  bucketState.lastMessageSentActionId = id;
+  bucketState.awaitingResponseAt = sentAt;
+  bucketState.awaitingActionId = id;
+  bucketState.responseBaselineHash = responseHash || null;
+  bucketState.candidateHash = null;
+  bucketState.candidateCount = 0;
+  bucketState.candidateActionId = null;
+  bucketState.candidateObservedAt = null;
+  bucketState.generationSeenSinceAction = false;
+  bucketState.generationObservedAt = null;
+  bucketState.lastAction = `${kind}:${id}`;
+  recordActivityEvent(state, {
+    bucket,
+    kind,
+    summary: `${kind} sent (${id})`,
+    at: sentAt,
+  });
+  saveState();
+  trimActionLedger();
+  return id;
+}
+
+async function inspectLiveGeneratingByBucket(context) {
+  const liveGeneratingByBucket = {};
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket) || bucketState.complete || !bucketState.chatUrl) continue;
+    try {
+      const page = await ensurePage(context, bucketState);
+      liveGeneratingByBucket[String(bucket)] = page ? await isGenerating(page) : false;
+    } catch (error) {
+      // A persistently unprobeable reviewer must remain slot-occupied until
+      // reconciliation rolls the dead chat over. This prevents a third live
+      // generation from being started during recovery.
+      liveGeneratingByBucket[String(bucket)] = error?.code === 'PAGE_PROBE_STALLED';
+    }
+  }
+  return liveGeneratingByBucket;
+}
+
+function refreshLiveReviewerOccupancy(liveGeneratingByBucket) {
+  lastLiveGeneratingByBucket = { ...liveGeneratingByBucket };
+  lastLiveReviewerOccupancy = buildLiveReviewerOccupancy({
+    bucketStates: state.buckets,
+    liveGeneratingByBucket,
+    excludedBuckets: SCHEDULING_BLOCKED_BUCKETS,
+    graceMs: dispatchStartGraceMs(),
+    maxActive: MAX_ACTIVE_REVIEWERS,
+    bucketCount: config.bucketCount,
+  });
+  return lastLiveReviewerOccupancy;
+}
+
+function bucketUsesLiveReviewerSlot(bucket, liveGeneratingByBucket) {
+  const bucketState = state.buckets[String(bucket)];
+  if (!bucketState) return false;
+  return bucketOccupiesLiveReviewerSlot(bucketState, {
+    isLiveGenerating: Boolean(liveGeneratingByBucket[String(bucket)]),
+    graceMs: dispatchStartGraceMs(),
+  });
+}
+
+function latestRecoverableWriteIncident(bucket) {
+  const candidates = Object.values(state.incidents || {})
+    .filter(entry => entry?.path)
+    .sort((a, b) => String(b.lastSeenAt || '').localeCompare(String(a.lastSeenAt || '')));
+  for (const record of candidates) {
+    const incident = loadJson(record.path, null);
+    if (Number(incident?.bucket) !== Number(bucket)) continue;
+    if (incident?.kind !== 'REVIEWER_ERROR_FOOTER') continue;
+    const footer = incident.footer;
+    if (!(isRecoverableReadbackFooter(footer) || isRecoverableRegistryWriteFooter(footer))) continue;
+    return { record, incident, footer };
+  }
+  return null;
+}
+
+function recoverableWriteIncidentById(bucket, incidentId) {
+  if (!incidentId) return null;
+  const record = Object.values(state.incidents || {}).find(entry => entry?.id === incidentId && entry?.path);
+  if (!record) return null;
+  const incident = loadJson(record.path, null);
+  if (Number(incident?.bucket) !== Number(bucket) || incident?.kind !== 'REVIEWER_ERROR_FOOTER') return null;
+  const footer = incident.footer;
+  if (!(isRecoverableReadbackFooter(footer) || isRecoverableRegistryWriteFooter(footer))) return null;
+  return { record, incident, footer };
+}
+
+function lostWriteRecoveryRetryReady(bucketState, responseAction, currentTimeMs = Date.now()) {
+  if (!bucketState || !responseAction || responseAction.kind !== 'WRITE_RECOVERY') return false;
+  if (!bucketState.generationSeenSinceAction) return false;
+  const observedAt = Date.parse(bucketState.generationObservedAt || '');
+  if (!Number.isFinite(observedAt)) return false;
+  return currentTimeMs - observedAt >= 60 * 1000;
+}
+
+function noteGenerationObserved(bucketState) {
+  const observedAt = Date.parse(bucketState.generationObservedAt || '');
+  bucketState.generationSeenSinceAction = true;
+  if (!Number.isFinite(observedAt)) bucketState.generationObservedAt = now();
+}
+
+function liveWriteRecoveryStallReason(bucketState, responseAction, currentTimeMs = Date.now()) {
+  if (!bucketState?.awaitingResponseAt || responseAction?.kind !== 'WRITE_RECOVERY') return null;
+  const sentAt = Date.parse(responseAction.sentAt || bucketState.awaitingResponseAt || '');
+  if (!Number.isFinite(sentAt)) return null;
+  const thresholdMinutes = Math.max(1, Number(config.writeRecoveryGenerationTimeoutMinutes || 10));
+  if (currentTimeMs - sentAt < thresholdMinutes * 60 * 1000) return null;
+  return `WRITE_RECOVERY ${responseAction.id || bucketState.awaitingActionId || 'unknown'} remained visibly generating for at least ${thresholdMinutes} minutes without an attributable assistant response`;
+}
+
+async function reconcileOutstandingResponses(context, liveGeneratingByBucket) {
+  if (readControl().desiredState !== 'RUNNING') return;
+
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (bucketState.complete || !bucketHasUnresolvedAwaitingAction(bucketState) || !bucketState.chatUrl) continue;
+
+    try {
+      const page = await ensurePage(context, bucketState);
+      if (!page) continue;
+      if (isAuthenticationPage(page)) continue;
+
+      if (await isGenerating(page)) {
+        bucketState.transientFailures = 0;
+        noteGenerationObserved(bucketState);
+        if (bucketState.awaitingActionId) {
+          bucketState.lastAction = `generating:${bucketState.awaitingActionId}`;
+        }
+        saveState();
+
+        const responseActionId = bucketState.awaitingActionId;
+        const responseAction = responseActionId ? state.actions[responseActionId] : null;
+        const liveRecoveryStall = liveWriteRecoveryStallReason(bucketState, responseAction);
+        if (liveRecoveryStall) {
+          const stopped = await stopLiveGeneration(page);
+          if (stopped) {
+            recordIncident(
+              'WRITE_RECOVERY_GENERATION_STALL',
+              bucket,
+              liveRecoveryStall,
+              { recoveryActionId: responseActionId },
+              { wakeCoordinator: false, holdBucket: false },
+            );
+            log(`B${bucket}: stopped stalled WRITE_RECOVERY ${responseActionId}; rolling over conservatively`);
+            await rolloverReviewer(context, Number(bucket), liveRecoveryStall);
+          }
+        }
+        continue;
+      }
+
+      const responseActionId = bucketState.awaitingActionId;
+      const attributed = await latestAssistantAfterActionMarker(page, responseActionId);
+      if (!attributed.attributed || !attributed.text) {
+        const responseAction = responseActionId ? state.actions[responseActionId] : null;
+        if (lostWriteRecoveryRetryReady(bucketState, responseAction)) {
+          const recovery = latestRecoverableWriteIncident(bucket);
+          if (recovery) {
+            const latestAssistant = await latestMessage(page, 'assistant');
+            const responseHash = latestAssistant
+              ? sha16(latestAssistant)
+              : (bucketState.processedHash || bucketState.lastHash || '');
+            clearAwaiting(bucketState, responseActionId);
+            bucketState.generationSeenSinceAction = false;
+            bucketState.generationObservedAt = null;
+            bucketState.candidateHash = null;
+            bucketState.candidateCount = 0;
+            bucketState.candidateActionId = null;
+            bucketState.candidateObservedAt = null;
+            saveState();
+            const retryActionId = await sendAction(
+              page,
+              Number(bucket),
+              'WRITE_RECOVERY',
+              interruptedWriteRecoveryPrompt(Number(bucket), recovery.footer, responseActionId),
+              responseHash,
+            );
+            bucketState.lastAction = `write-recovery-retried-after-interrupted-generation:${responseActionId}:${retryActionId}`;
+            saveState();
+            log(`B${bucket}: retried interrupted WRITE_RECOVERY ${responseActionId} as ${retryActionId}; incident preserved ${recovery.record.id}`);
+          }
+        }
+        continue;
+      }
+      const text = attributed.text;
+      const responseHash = sha16(text);
+      const responseKey = actionResponseKey(responseActionId, responseHash);
+      if (responseKey && bucketState.processedResponseKey === responseKey) {
+        clearAwaiting(bucketState, responseActionId);
+        saveState();
+        continue;
+      }
+      if (!updateStableCandidate(bucketState, responseHash, responseActionId)) {
+        saveState();
+        continue;
+      }
+
+      updateReceivedMessage(bucketState, text, responseHash);
+      const allowDispatch = !isSchedulingBlockedBucket(bucket)
+        && readControl().desiredState === 'RUNNING';
+
+      if (bucketState.phase === 'SETUP_WAIT') {
+        await processSetupWait(page, bucket, bucketState, text, responseHash);
+      } else {
+        await processActive(page, bucket, bucketState, text, responseHash, { allowDispatch });
+      }
+    } catch (error) {
+      if (error?.code === 'PAGE_PROBE_STALLED' && !isSchedulingBlockedBucket(bucket)) {
+        log(`B${bucket}: reviewer page probe stalled; rolling over unusable chat while preserving authoritative work state`);
+        await rolloverReviewer(
+          context,
+          Number(bucket),
+          `reviewer page failed ${error.timeoutCount || PAGE_PROBE_STALL_THRESHOLD} consecutive live-generation probes`,
+        );
+        continue;
+      }
+      log(`B${bucket}: outstanding-response reconciliation error ${error.message || error}`);
+    }
+  }
+}
+
+async function ensurePage(context, bucketState) {
+  if (!bucketState.chatUrl) return null;
+  let page = context.pages().find(candidate => candidate.url().startsWith(bucketState.chatUrl));
+  if (!page) {
+    page = await context.newPage();
+    await page.goto(bucketState.chatUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  }
+  return page;
+}
+
+function isAuthenticationPage(page) {
+  const url = String(page?.url?.() || '');
+  return url.includes('accounts.google.com')
+    || url.includes('auth.openai.com')
+    || url.includes('chatgpt.com/auth/login');
+}
+
+function incidentFingerprint(kind, bucket, detail) {
+  return sha16(`${kind}|${bucket ?? ''}|${detail}`);
+}
+
+function queueCoordinatorStatus(incidentId, detectedAt, kind) {
+  const existing = loadJson(COORDINATOR_STATUS_PATH, {});
+  saveJsonAtomic(COORDINATOR_STATUS_PATH, {
+    ...existing,
+    status: 'QUEUED',
+    incidentId,
+    queuedAt: detectedAt,
+    kind,
+    startedAt: null,
+    completedAt: null,
+    exitCode: null,
+    error: null,
+  });
+}
+
+function wakeCodex(incidentPath) {
+  try {
+    const stdout = fs.openSync(COORDINATOR_WAKE_STDOUT, 'a');
+    const stderr = fs.openSync(COORDINATOR_WAKE_STDERR, 'a');
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', COORDINATOR_WAKE, '-IncidentPath', incidentPath],
+      { detached: true, stdio: ['ignore', stdout, stderr], windowsHide: true },
+    );
+    child.on('error', error => log(`Coordinator wake process failed: ${error.message}`));
+    child.unref();
+    log(`Coordinator wake queued for ${path.basename(incidentPath)}`);
+  } catch (error) {
+    log(`Unable to launch Codex coordinator: ${error.message}`);
+  }
+}
+
+function notifyUserIncident(incident) {
+  try {
+    const recipient = process.env.USERNAME || '*';
+    const message = `R4.3.3 incident queued: ${incident.id}. Open the local dashboard for live coordinator status.`;
+    const child = spawn('msg.exe', [recipient, message], { detached: true, stdio: 'ignore', windowsHide: true });
+    child.unref();
+  } catch (error) {
+    log(`Unable to notify operator for ${incident.id}: ${error.message}`);
+  }
+}
+
+function recordIncident(kind, bucket, detail, extra = {}, options = {}) {
+  const fingerprint = incidentFingerprint(kind, bucket, detail);
+  const previous = state.incidents[fingerprint];
+  const nowMs = Date.now();
+  if (previous && nowMs - Number(previous.lastTriggeredMs || 0) < 30 * 60 * 1000) {
+    previous.lastSeenAt = now();
+    previous.count = Number(previous.count || 1) + 1;
+    saveState();
+    return previous.path;
+  }
+
+  const safeBucket = bucket === null || bucket === undefined ? 'GLOBAL' : `B${bucket}`;
+  const id = `INC-${safeBucket}-${new Date().toISOString().replace(/[:.]/g, '')}-${fingerprint}`;
+  const file = path.join(INCIDENT_DIR, `${id}.json`);
+  const incident = {
+    id,
+    detectedAt: now(),
+    kind,
+    bucket: bucket === null || bucket === undefined ? null : Number(bucket),
+    detail,
+    controllerRoot: ROOT,
+    statusPath: STATUS_PATH,
+    statePath: STATE_PATH,
+    logPath: LOG_PATH,
+    ...extra,
+  };
+  saveJsonAtomic(file, incident);
+  state.incidents[fingerprint] = {
+    id,
+    path: file,
+    lastTriggeredMs: nowMs,
+    lastSeenAt: incident.detectedAt,
+    count: 1,
+  };
+  const wakeCoordinator = options.wakeCoordinator !== false;
+  if (wakeCoordinator) {
+    state.coordinator.lastQueuedAt = incident.detectedAt;
+    state.coordinator.lastQueuedIncidentId = id;
+    state.coordinator.lastQueuedKind = kind;
+    queueCoordinatorStatus(id, incident.detectedAt, kind);
+  }
+  if (bucket !== null && bucket !== undefined && state.buckets[String(bucket)] && options.holdBucket !== false) {
+    state.buckets[String(bucket)].phase = 'HOLD';
+    state.buckets[String(bucket)].lastAction = `incident:${id}`;
+  }
+  saveState();
+  log(`${id} ${kind}: ${detail}`);
+  if (options.wakeCoordinator !== false) {
+    notifyUserIncident(incident);
+    wakeCodex(file);
+  }
+  return file;
+}
+
+function heldIncidentForCoordinator() {
+  for (const [, bucketState] of Object.entries(state.buckets)) {
+    if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
+    const incidentId = String(bucketState.lastAction).slice('incident:'.length);
+    const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+    if (!incidentRecord?.path) continue;
+    const incident = loadJson(incidentRecord.path, null);
+    if (incident?.id !== incidentId) continue;
+    if (incident.kind === 'NEXT_SOURCE_PACKS_REQUIRED') continue;
+    return { incident, path: incidentRecord.path };
+  }
+  return null;
+}
+
+function ensureCoordinatorWakeProgress() {
+  const target = heldIncidentForCoordinator();
+  if (!target) return;
+
+  const { incident, path: incidentPath } = target;
+  const coordinatorStatus = loadJson(COORDINATOR_STATUS_PATH, {});
+  const status = String(coordinatorStatus?.status || '').toUpperCase();
+  const sameIncident = coordinatorStatus?.incidentId === incident.id;
+  const retryAfterMs = 5 * 60 * 1000;
+  const currentTime = Date.now();
+
+  if (status === 'RUNNING') return;
+  if (sameIncident && status === 'COMPLETED') return;
+
+  const statusAt = Date.parse(
+    coordinatorStatus?.startedAt
+    || coordinatorStatus?.queuedAt
+    || coordinatorStatus?.completedAt
+    || '',
+  );
+  if (sameIncident
+    && ['QUEUED', 'FAILED'].includes(status)
+    && Number.isFinite(statusAt)
+    && currentTime - statusAt < retryAfterMs) return;
+
+  const lastRecoveryWakeAt = Date.parse(state.coordinator?.lastRecoveryWakeAt || '');
+  if (state.coordinator?.lastRecoveryWakeIncidentId === incident.id
+    && Number.isFinite(lastRecoveryWakeAt)
+    && currentTime - lastRecoveryWakeAt < retryAfterMs) return;
+
+  const retryAt = now();
+  state.coordinator.lastRecoveryWakeAt = retryAt;
+  state.coordinator.lastRecoveryWakeIncidentId = incident.id;
+  queueCoordinatorStatus(incident.id, retryAt, incident.kind || 'UNKNOWN');
+  saveState();
+  log(`Coordinator wake retry queued for ${incident.id}; prior status=${status || 'MISSING'}`);
+  wakeCodex(incidentPath);
+}
+
+async function createReviewer(context, bucket) {
+  assertControlRunning();
+  if (isSchedulingBlockedBucket(bucket)) return;
+  const bucketState = state.buckets[String(bucket)];
+  log(`B${bucket}: creating a new reviewer chat`);
+  const page = await context.newPage();
+  await page.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+
+  if (await isGenerating(page)) {
+    recordIncident('NEW_CHAT_BUSY', bucket, 'new project chat unexpectedly shows an active generation');
+    return;
+  }
+
+  assertControlRunning();
+  let id;
+  try {
+    id = await sendAction(page, bucket, 'PROTOCOL_SETUP', setupPrompt(bucket), '');
+  } catch (error) {
+    if (error.code !== 'SEND_NOT_OBSERVED') throw error;
+    bucketState.phase = 'PENDING';
+    bucketState.lastAction = 'new-chat-send-not-observed';
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    saveState();
+    try { await page.close(); } catch {}
+    log(`B${bucket}: setup send was not observed; closed draft tab and will retry next cycle`);
+    return;
+  }
+  const deadline = Date.now() + 45000;
+  let chatId = null;
+  while (Date.now() < deadline) {
+    const url = page.url();
+    const match = url.match(/\/c\/([0-9a-f-]{20,})/i);
+    if (match) {
+      chatId = match[1];
+      bucketState.chatId = chatId;
+      bucketState.chatUrl = url.split('?')[0];
+      resetPerChatObservationState(bucketState);
+      bucketState.setupVerified = false;
+      bucketState.setupVerifiedChatId = null;
+      bucketState.phase = 'SETUP_WAIT';
+      bucketState.lastAction = `setup-sent:${id}`;
+      saveState();
+      log(`B${bucket}: new reviewer chat ${chatId}`);
+      return;
+    }
+    await sleep(1000);
+  }
+
+  recordIncident('NEW_CHAT_ID_TIMEOUT', bucket, 'protocol setup was sent but the new conversation ID was not observed within 45 seconds');
+}
+
+async function rolloverReviewer(context, bucket, reason) {
+  const bucketState = state.buckets[String(bucket)];
+  const oldChatId = bucketState.chatId || null;
+  const oldChatUrl = bucketState.chatUrl || null;
+  const interruptedActionId = bucketState.awaitingActionId || null;
+  const interruptedAction = interruptedActionId ? state.actions[interruptedActionId] : null;
+  const resumeAdvisoryAnomaly = Boolean(
+    bucketState.advisoryAnomalyResumePending
+    || interruptedAction?.kind === 'ISOLATED_ANOMALY_CONTINUE',
+  );
+  const advisoryAnomalyInterruptedActionId = interruptedAction?.kind === 'ISOLATED_ANOMALY_CONTINUE'
+    ? interruptedActionId
+    : (bucketState.advisoryAnomalyInterruptedActionId || null);
+  let resumeWriteRecovery = Boolean(
+    bucketState.writeRecoveryResumePending && bucketState.writeRecoveryIncidentId,
+  );
+  let writeRecoveryIncidentId = bucketState.writeRecoveryIncidentId || null;
+  let writeRecoveryInterruptedActionId = bucketState.writeRecoveryInterruptedActionId || null;
+  if (interruptedAction?.kind === 'WRITE_RECOVERY') {
+    const recovery = latestRecoverableWriteIncident(bucket);
+    if (recovery) {
+      resumeWriteRecovery = true;
+      writeRecoveryIncidentId = recovery.record.id;
+      writeRecoveryInterruptedActionId = interruptedActionId;
+    }
+  }
+  const rolloverTarget = parseSourcePackNumber(bucketState.sourcePackTargetNumber, Number(bucket));
+  const rolloverConsumed = parseSourcePackNumber(bucketState.sourcePackLastConsumedNumber, Number(bucket));
+  const resumeExactSourcePack = Boolean(
+    rolloverTarget !== null
+    && !bucketState.sourcePackAccessVerified
+    && (rolloverConsumed === null || rolloverConsumed < rolloverTarget)
+    && bucketState.sourcePackResumeIncidentId,
+  );
+  if (oldChatUrl) {
+    bucketState.chatHistory ||= [];
+    bucketState.chatHistory.push({
+      chatId: oldChatId,
+      chatUrl: oldChatUrl,
+      rolledOverAt: now(),
+      reason,
+    });
+    if (bucketState.chatHistory.length > 50) bucketState.chatHistory = bucketState.chatHistory.slice(-50);
+  }
+  bucketState.rolloverCount = Number(bucketState.rolloverCount || 0) + 1;
+  bucketState.casesSinceChatStart = 0;
+  bucketState.lastRolloverAt = now();
+  bucketState.lastRolloverReason = reason;
+  bucketState.chatId = null;
+  bucketState.chatUrl = null;
+  bucketState.phase = 'PENDING';
+  bucketState.awaitingResponseAt = null;
+  bucketState.awaitingActionId = null;
+  bucketState.responseBaselineHash = null;
+  resetPerChatObservationState(bucketState);
+  bucketState.setupVerified = false;
+  bucketState.setupVerifiedChatId = null;
+  bucketState.transientFailures = 0;
+  bucketState.recoveryRolloverReason = null;
+  bucketState.writeRecoveryResumePending = resumeWriteRecovery;
+  bucketState.writeRecoveryIncidentId = resumeWriteRecovery ? writeRecoveryIncidentId : null;
+  bucketState.writeRecoveryInterruptedActionId = resumeWriteRecovery ? writeRecoveryInterruptedActionId : null;
+  bucketState.advisoryAnomalyResumePending = resumeAdvisoryAnomaly;
+  bucketState.advisoryAnomalyInterruptedActionId = resumeAdvisoryAnomaly
+    ? advisoryAnomalyInterruptedActionId
+    : null;
+  if (resumeExactSourcePack) {
+    bucketState.sourcePackResumePending = true;
+    resetSourcePackAccessState(bucketState);
+  }
+  bucketState.lastAction = 'adaptive-rollover-pending';
+  recordActivityEvent(state, {
+    bucket,
+    kind: 'ROLLOVER',
+    summary: `rollover queued: ${reason}`,
+  });
+  saveState();
+
+  if (oldChatUrl) {
+    const oldPage = context.pages().find(candidate => candidate.url().startsWith(oldChatUrl));
+    if (oldPage) {
+      try { await oldPage.close(); } catch {}
+    }
+  }
+  log(`B${bucket}: adaptive chat rollover queued; reason=${reason}`);
+}
+
+function updateStableCandidate(bucketState, hash, actionIdValue = null, observedAtMs = Date.now()) {
+  const sameCandidate = bucketState.candidateHash === hash
+    && String(bucketState.candidateActionId || '') === String(actionIdValue || '');
+  const previousObservedAt = Date.parse(bucketState.candidateObservedAt || '');
+  if (sameCandidate) {
+    if (!Number.isFinite(previousObservedAt) || observedAtMs - previousObservedAt >= 500) {
+      bucketState.candidateCount = Number(bucketState.candidateCount || 0) + 1;
+      bucketState.candidateObservedAt = new Date(observedAtMs).toISOString();
+    }
+  } else {
+    bucketState.candidateHash = hash;
+    bucketState.candidateCount = 1;
+    bucketState.candidateActionId = actionIdValue || null;
+    bucketState.candidateObservedAt = new Date(observedAtMs).toISOString();
+  }
+  return bucketState.candidateCount >= 2;
+}
+
+function clearAwaiting(bucketState, responseActionId) {
+  if (!bucketState.awaitingResponseAt || !responseActionId) return false;
+  if (String(bucketState.awaitingActionId || '') !== String(responseActionId)) return false;
+  bucketState.awaitingResponseAt = null;
+  bucketState.awaitingActionId = null;
+  bucketState.responseBaselineHash = null;
+  return true;
+}
+
+function markProcessedResponse(bucketState, responseHash, responseActionId, footer = null) {
+  bucketState.processedHash = responseHash;
+  bucketState.processedResponseKey = actionResponseKey(responseActionId, responseHash);
+  bucketState.lastProcessedActionId = responseActionId || null;
+  bucketState.lastProcessedStatus = footer?.status || null;
+  bucketState.lastProcessedBlocker = footer?.blocker || null;
+  bucketState.candidateHash = null;
+  bucketState.candidateCount = 0;
+  bucketState.candidateActionId = null;
+  bucketState.candidateObservedAt = null;
+}
+
+function turnStallReason(bucketState) {
+  if (!bucketState.awaitingResponseAt) return null;
+  const awaitingAt = Date.parse(bucketState.awaitingResponseAt);
+  const effectiveStart = Number.isFinite(awaitingAt) ? awaitingAt : Date.now();
+
+  const generationObservedAt = Date.parse(bucketState.generationObservedAt || '');
+  const generationSeen = Boolean(bucketState.generationSeenSinceAction) && Number.isFinite(generationObservedAt);
+  const thresholdMinutes = generationSeen
+    ? Number(config.postGenerationStallMinutes || 90)
+    : Number(config.generationFallbackTimeoutMinutes || Math.max(120, Number(config.turnTimeoutMinutes || 30)));
+  const anchor = generationSeen ? Math.max(effectiveStart, generationObservedAt) : effectiveStart;
+  const elapsed = Date.now() - anchor;
+  if (elapsed < thresholdMinutes * 60 * 1000) return null;
+
+  if (generationSeen) {
+    return `generation stopped and no new assistant response became available for ${thresholdMinutes} minutes after action ${bucketState.awaitingActionId || 'unknown'}`;
+  }
+  return `no visible generation or new assistant response was observed for ${thresholdMinutes} minutes after action ${bucketState.awaitingActionId || 'unknown'}`;
+}
+
+function recoverLostAwaitingState() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.complete || !['ACTIVE', 'SETUP_WAIT'].includes(bucketState.phase)) continue;
+    // A pending exact source-pack recovery intentionally clears the previous
+    // action's awaiting state so the retry can be sent. Do not resurrect the
+    // stale SENT action while that recovery is pending.
+    if (bucketState.sourcePackResumePending) continue;
+
+    if (bucketState.awaitingResponseAt || !bucketState.lastMessageSentActionId) continue;
+
+    const actionIdValue = bucketState.lastMessageSentActionId;
+    const action = state.actions[actionIdValue];
+    if (!action || action.status !== 'SENT') continue;
+    if (String(bucketState.lastProcessedActionId || '') === String(actionIdValue)) continue;
+
+    const actionBaseline = action.responseHash || null;
+
+    const sentAt = action.sentAt || bucketState.lastMessageSentAt;
+    if (!sentAt || !Number.isFinite(Date.parse(sentAt))) continue;
+    const sentAtMs = Date.parse(sentAt);
+    const receivedAt = Date.parse(bucketState.lastMessageReceivedAt || '');
+    if (Number.isFinite(receivedAt) && receivedAt > sentAtMs) continue;
+
+    const restoreThresholdMinutes = Number(config.generationFallbackTimeoutMinutes || 120);
+    if (Date.now() - sentAtMs > restoreThresholdMinutes * 60 * 1000) continue;
+
+    bucketState.awaitingResponseAt = sentAt;
+    bucketState.awaitingActionId = actionIdValue;
+    bucketState.responseBaselineHash = actionBaseline || bucketState.processedHash || bucketState.lastHash || null;
+    bucketState.lastAction = `recovered-awaiting:${actionIdValue}`;
+    recovered = true;
+    log(`B${bucket}: restored lost awaiting state for ${actionIdValue}`);
+  }
+  if (recovered) saveState();
+  return recovered;
+}
+
+function recoverTimeoutHolds() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
+    const incidentId = String(bucketState.lastAction).slice('incident:'.length);
+    const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    if (incident?.kind !== 'TURN_TIMEOUT') continue;
+    bucketState.phase = bucketState.chatUrl ? 'ACTIVE' : 'PENDING';
+    bucketState.lastAction = 'startup-timeout-recovery';
+    bucketState.transientFailures = 0;
+    recovered = true;
+    log(`B${bucket}: recovered timeout hold after controller restart; incident preserved ${incidentId}`);
+  }
+  if (recovered) saveState();
+}
+
+async function recoverSetupAckHolds(context) {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.phase !== 'HOLD' || !bucketState.chatUrl) continue;
+    const setupActionId = bucketState.lastMessageSentActionId;
+    const setupAction = setupActionId ? state.actions[setupActionId] : null;
+    if (String(bucketState.lastMessageSentKind || setupAction?.kind || '') !== 'PROTOCOL_SETUP') continue;
+
+    const preferredIncidentId = String(bucketState.lastAction || '').startsWith('incident:')
+      ? String(bucketState.lastAction).slice('incident:'.length)
+      : null;
+    const incidentCandidates = Object.values(state.incidents)
+      .filter(entry => entry?.path)
+      .sort((a, b) => String(b.lastSeenAt || '').localeCompare(String(a.lastSeenAt || '')));
+    if (preferredIncidentId) {
+      incidentCandidates.sort((a, b) => Number(b.id === preferredIncidentId) - Number(a.id === preferredIncidentId));
+    }
+    let incidentId = null;
+    let incident = null;
+    for (const incidentRecord of incidentCandidates) {
+      const candidate = loadJson(incidentRecord.path, null);
+      if (Number(candidate?.bucket) !== Number(bucket)) continue;
+      if (!['SETUP_ACK_MISMATCH', 'SETUP_ACK_TIMEOUT'].includes(String(candidate?.kind || ''))) continue;
+      incidentId = incidentRecord.id;
+      incident = candidate;
+      break;
+    }
+    if (!incidentId || !incident) continue;
+
+    const page = await ensurePage(context, bucketState);
+    if (!page || isAuthenticationPage(page) || await isGenerating(page)) continue;
+    const attributed = setupActionId
+      ? await latestAssistantAfterActionMarker(page, setupActionId)
+      : { attributed: false, text: '' };
+    if (!attributed.attributed || !isExactSetupAck(attributed.text)) continue;
+
+    const responseHash = sha16(attributed.text);
+    updateReceivedMessage(bucketState, attributed.text, responseHash);
+    markProcessedResponse(bucketState, responseHash, setupActionId);
+    clearAwaiting(bucketState, setupActionId);
+    bucketState.setupVerified = true;
+    bucketState.setupVerifiedChatId = bucketState.chatId || null;
+    bucketState.phase = 'SETUP_WAIT';
+    bucketState.transientFailures = 0;
+    bucketState.lastAction = `setup-ack-recovered:${incidentId}`;
+    recovered = true;
+    saveState();
+    log(`B${bucket}: recovered exact setup ACK from current chat; incident preserved ${incidentId}`);
+  }
+  return recovered;
+}
+
+async function recoverLegacyPromotedSetupWaitStates(context) {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.complete || bucketState.phase !== 'ACTIVE' || !bucketState.chatUrl) continue;
+    const setupActionId = bucketState.lastMessageSentActionId;
+    const setupAction = setupActionId ? state.actions[setupActionId] : null;
+    if (String(bucketState.lastMessageSentKind || setupAction?.kind || '') !== 'PROTOCOL_SETUP') continue;
+    if (!setupActionId || bucketHasUnresolvedAwaitingAction(bucketState)) continue;
+
+    const page = await ensurePage(context, bucketState);
+    if (!page || isAuthenticationPage(page) || await isGenerating(page)) continue;
+    const attributed = await latestAssistantAfterActionMarker(page, setupActionId);
+    if (!attributed.attributed || !isExactSetupAck(attributed.text)) continue;
+
+    const responseHash = sha16(attributed.text);
+    updateReceivedMessage(bucketState, attributed.text, responseHash);
+    markProcessedResponse(bucketState, responseHash, setupActionId);
+    clearAwaiting(bucketState, setupActionId);
+    bucketState.setupVerified = true;
+    bucketState.setupVerifiedChatId = bucketState.chatId || null;
+    bucketState.phase = 'SETUP_WAIT';
+    bucketState.transientFailures = 0;
+    bucketState.lastAction = `legacy-setup-wait-recovered:${setupActionId}`;
+    recovered = true;
+    saveState();
+    log(`B${bucket}: normalized legacy ACTIVE setup state after exact setup ACK ${setupActionId}`);
+  }
+  return recovered;
+}
+
+function stageReviewerStallRecovery(bucket, bucketState, reason, lastActionPrefix) {
+  if (bucketState.sourcePackResumePending) {
+    bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    bucketState.processedHash = null;
+    bucketState.candidateHash = null;
+    bucketState.candidateCount = 0;
+    bucketState.transientFailures = 0;
+    bucketState.lastAction = `${lastActionPrefix}-source-pack-stall-recovery:${reason}`;
+    log(`B${bucket}: recovered stalled source-pack in-flight state without resurrecting the prior action; ${reason}`);
+    return true;
+  }
+
+  if (bucketState.chatUrl) {
+    bucketState.chatHistory ||= [];
+    bucketState.chatHistory.push({
+      chatId: bucketState.chatId || null,
+      chatUrl: bucketState.chatUrl,
+      rolledOverAt: now(),
+      reason: `reviewer stall recovery: ${reason}`,
+    });
+    if (bucketState.chatHistory.length > 50) bucketState.chatHistory = bucketState.chatHistory.slice(-50);
+  }
+  bucketState.rolloverCount = Number(bucketState.rolloverCount || 0) + 1;
+  bucketState.casesSinceChatStart = 0;
+  bucketState.lastRolloverAt = now();
+  bucketState.lastRolloverReason = `reviewer stall recovery: ${reason}`;
+  bucketState.chatId = null;
+  bucketState.chatUrl = null;
+  bucketState.phase = 'PENDING';
+  bucketState.awaitingResponseAt = null;
+  bucketState.awaitingActionId = null;
+  bucketState.responseBaselineHash = null;
+  resetPerChatObservationState(bucketState);
+  bucketState.transientFailures = 0;
+  bucketState.lastAction = `${lastActionPrefix}-reviewer-stall-rollover:${reason}`;
+  log(`B${bucket}: staged clean reviewer rollover after stall; ${reason}`);
+  return true;
+}
+
+function recoverReviewerStallHolds() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
+    const incidentId = String(bucketState.lastAction).slice('incident:'.length);
+    const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    if (incident?.kind !== 'REVIEWER_STALL') continue;
+
+    if (stageReviewerStallRecovery(bucket, bucketState, incidentId, 'startup')) recovered = true;
+  }
+  if (recovered) saveState();
+}
+
+function recoverLegacyInterruptedWriteRecoveryRollovers() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)
+      || bucketState.complete
+      || bucketState.phase === 'HOLD'
+      || bucketState.writeRecoveryResumePending) continue;
+
+    const recovery = latestRecoverableWriteIncident(bucket);
+    if (!recovery) continue;
+    const incidentAt = Date.parse(recovery.incident?.detectedAt || '');
+    if (!Number.isFinite(incidentAt)) continue;
+
+    const lastProgressAt = Date.parse(bucketState.lastProgressAt || '');
+    if (Number.isFinite(lastProgressAt) && lastProgressAt > incidentAt) continue;
+
+    const recoveryActions = Object.values(state.actions || {})
+      .filter(action => (
+        Number(action?.bucket) === Number(bucket)
+        && action?.kind === 'WRITE_RECOVERY'
+        && Number.isFinite(Date.parse(action?.sentAt || ''))
+        && Date.parse(action.sentAt) >= incidentAt
+      ))
+      .sort((a, b) => Date.parse(b.sentAt) - Date.parse(a.sentAt));
+    const latestRecoveryAction = recoveryActions[0];
+    if (!latestRecoveryAction) continue;
+
+    const recoverySentAt = Date.parse(latestRecoveryAction.sentAt);
+    const rolloverAt = Date.parse(bucketState.lastRolloverAt || '');
+    if (!Number.isFinite(rolloverAt) || rolloverAt <= recoverySentAt) continue;
+
+    // A later processed action or source-pack transition proves this recovery
+    // completed before the later rollover. Do not resurrect historical
+    // WRITE_RECOVERY work merely because the original incident remains on disk.
+    const laterProcessedAction = bucketState.lastProcessedActionId
+      ? state.actions?.[bucketState.lastProcessedActionId]
+      : null;
+    const laterProcessedAt = Date.parse(laterProcessedAction?.sentAt || '');
+    const laterSourcePackTransitionAt = Date.parse(bucketState.lastSourcePackTransitionAt || '');
+    if ((Number.isFinite(laterProcessedAt) && laterProcessedAt > recoverySentAt)
+      || (Number.isFinite(laterSourcePackTransitionAt) && laterSourcePackTransitionAt > recoverySentAt)) {
+      continue;
+    }
+
+    const terminalFailureAfterRecovery = Object.values(state.incidents || {}).some(record => {
+      if (!record?.path) return false;
+      const incident = loadJson(record.path, null);
+      return Number(incident?.bucket) === Number(bucket)
+        && incident?.kind === 'WRITE_RECOVERY_TERMINAL_FAILURE'
+        && Number.isFinite(Date.parse(incident?.detectedAt || ''))
+        && Date.parse(incident.detectedAt) >= recoverySentAt;
+    });
+    if (terminalFailureAfterRecovery) continue;
+
+    bucketState.writeRecoveryResumePending = true;
+    bucketState.writeRecoveryIncidentId = recovery.record.id;
+    bucketState.writeRecoveryInterruptedActionId = latestRecoveryAction.id;
+
+    const target = parseSourcePackNumber(bucketState.sourcePackTargetNumber, Number(bucket));
+    const consumed = parseSourcePackNumber(bucketState.sourcePackLastConsumedNumber, Number(bucket));
+    if (target !== null
+      && !bucketState.sourcePackAccessVerified
+      && (consumed === null || consumed < target)) {
+      bucketState.sourcePackResumePending = true;
+      resetSourcePackAccessState(bucketState);
+    }
+    recovered = true;
+    log(`B${bucket}: restored interrupted WRITE_RECOVERY ${latestRecoveryAction.id} after legacy chat rollover; incident ${recovery.record.id}`);
+  }
+  if (recovered) saveState();
+  return recovered;
+}
+
+function recoverLegacyInterruptedAdvisoryAnomalyRollovers() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)
+      || bucketState.complete
+      || bucketState.advisoryAnomalyResumePending) continue;
+
+    const candidates = Object.values(state.incidents || {})
+      .filter(entry => entry?.path)
+      .map(record => ({ record, incident: loadJson(record.path, null) }))
+      .filter(entry => Number(entry.incident?.bucket) === Number(bucket)
+        && entry.incident?.kind === 'REVIEWER_ERROR_FOOTER'
+        && isRecoverableAdvisoryCoordinatorFooter(entry.incident?.footer))
+      .sort((a, b) => Date.parse(b.incident?.detectedAt || '') - Date.parse(a.incident?.detectedAt || ''));
+    const latestIncident = candidates[0];
+    if (!latestIncident) continue;
+
+    const incidentAt = Date.parse(latestIncident.incident?.detectedAt || '');
+    if (!Number.isFinite(incidentAt)) continue;
+    const advisoryActions = Object.values(state.actions || {})
+      .filter(action => (
+        Number(action?.bucket) === Number(bucket)
+        && action?.kind === 'ISOLATED_ANOMALY_CONTINUE'
+        && Number.isFinite(Date.parse(action?.sentAt || ''))
+        && Date.parse(action.sentAt) >= incidentAt
+      ))
+      .sort((a, b) => Date.parse(b.sentAt) - Date.parse(a.sentAt));
+    const latestAdvisoryAction = advisoryActions[0];
+    if (!latestAdvisoryAction) continue;
+
+    const advisorySentAt = Date.parse(latestAdvisoryAction.sentAt);
+    const rolloverAt = Date.parse(bucketState.lastRolloverAt || '');
+    if (!Number.isFinite(rolloverAt) || rolloverAt <= advisorySentAt) continue;
+
+    const laterProgressAt = Date.parse(bucketState.lastProgressAt || '');
+    const laterSourcePackTransitionAt = Date.parse(bucketState.lastSourcePackTransitionAt || '');
+    if ((Number.isFinite(laterProgressAt) && laterProgressAt > advisorySentAt)
+      || (Number.isFinite(laterSourcePackTransitionAt) && laterSourcePackTransitionAt > advisorySentAt)) {
+      continue;
+    }
+
+    const lastProcessedAction = bucketState.lastProcessedActionId
+      ? state.actions?.[bucketState.lastProcessedActionId]
+      : null;
+    const lastProcessedAt = Date.parse(lastProcessedAction?.sentAt || '');
+    if (lastProcessedAction?.kind !== 'PROTOCOL_SETUP'
+      && Number.isFinite(lastProcessedAt)
+      && lastProcessedAt > rolloverAt) {
+      continue;
+    }
+
+    bucketState.advisoryAnomalyResumePending = true;
+    bucketState.advisoryAnomalyInterruptedActionId = latestAdvisoryAction.id;
+    recovered = true;
+    log(`B${bucket}: restored interrupted ISOLATED_ANOMALY_CONTINUE ${latestAdvisoryAction.id} after legacy chat rollover; incident ${latestIncident.record.id}`);
+  }
+  if (recovered) saveState();
+  return recovered;
+}
+
+function recoverStaleAwaitingReviewers() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.complete || !['ACTIVE', 'SETUP_WAIT'].includes(bucketState.phase)) continue;
+    const stall = turnStallReason(bucketState);
+    if (!stall) continue;
+
+    if (stageReviewerStallRecovery(bucket, bucketState, stall, 'runtime')) recovered = true;
+  }
+  if (recovered) saveState();
+}
+
+function recoverUnavailableSourcePackHolds() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
+    const incidentId = String(bucketState.lastAction).slice('incident:'.length);
+    const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    const footer = incident?.footer;
+    const blocker = String(footer?.blocker || '').trim().toUpperCase();
+    if (incident?.kind !== 'REVIEWER_ERROR_FOOTER'
+      || footer?.status !== 'ERROR'
+      || footer?.writesVerified !== 'YES'
+      || blocker !== 'SOURCE_PACK_UNAVAILABLE_OR_UNVERIFIED') continue;
+
+    sanitizeStoredSourcePackCursorFields(Number(bucket), bucketState);
+    const resolved = resolveNextSourcePackTargetNumber(Number(bucket), {
+      bucketState,
+      incident,
+      incidentId,
+    });
+    if (!isValidSourcePackNumber(Number(bucket), resolved.targetNumber)) continue;
+
+    const unavailableAt = now();
+    const unavailableCount = Math.max(1, Number(bucketState.sourcePackUnavailableCount || 0));
+    const retryNotBefore = bucketState.sourcePackRetryNotBefore
+      || new Date(Date.parse(unavailableAt) + sourcePackRetryDelayMs(unavailableCount)).toISOString();
+    bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+    bucketState.lastAction = `startup-source-pack-unavailable-backoff:${incidentId}:pack-${resolved.targetNumber}:until-${retryNotBefore}`;
+    bucketState.candidateHash = null;
+    bucketState.candidateCount = 0;
+    bucketState.candidateActionId = null;
+    bucketState.candidateObservedAt = null;
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    bucketState.transientFailures = 0;
+    bucketState.sourcePackResumePending = true;
+    applyResolvedSourcePackTarget(Number(bucket), bucketState, resolved, incidentId);
+    resetSourcePackAccessState(bucketState);
+    bucketState.sourcePackUnavailableCount = unavailableCount;
+    bucketState.sourcePackLastUnavailableAt ||= unavailableAt;
+    bucketState.sourcePackRetryNotBefore = retryNotBefore;
+    recovered = true;
+    log(`B${bucket}: recovered unavailable source pack with persisted backoff until ${retryNotBefore}; incident preserved ${incidentId}`);
+  }
+  if (recovered) saveState();
+}
+
+function recoverRetryableNewChatHolds() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
+    const incidentId = String(bucketState.lastAction).slice('incident:'.length);
+    const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    if (incident?.kind !== 'NEW_CHAT_ID_TIMEOUT') continue;
+
+    bucketState.chatId = null;
+    bucketState.chatUrl = null;
+    bucketState.phase = 'PENDING';
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    resetPerChatObservationState(bucketState);
+    bucketState.lastAction = `startup-new-chat-retry:${incidentId}`;
+    recovered = true;
+    log(`B${bucket}: recovered new-chat timeout for retry; incident preserved ${incidentId}`);
+  }
+  if (recovered) saveState();
+}
+
+function recoverRetryablePartialWriteHolds() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
+    const incidentId = String(bucketState.lastAction).slice('incident:'.length);
+    const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    const footer = incident?.footer;
+    if (incident?.kind !== 'REVIEWER_ERROR_FOOTER'
+      || !(isRecoverableReadbackFooter(footer) || isRecoverableRegistryWriteFooter(footer))) continue;
+
+    // Reprocess the same stable response once after restart so the recovery
+    // action can be sent without discarding the incident record.
+    bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+    bucketState.lastAction = `startup-partial-write-recovery:${incidentId}`;
+    bucketState.processedHash = null;
+    bucketState.candidateHash = null;
+    bucketState.candidateCount = 0;
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    bucketState.transientFailures = 0;
+    recovered = true;
+    log(`B${bucket}: recovered partial-write hold after controller restart; incident preserved ${incidentId}`);
+  }
+  if (recovered) saveState();
+}
+
+function recoverRetryableExactPackHolds() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
+    const incidentId = String(bucketState.lastAction).slice('incident:'.length);
+    const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    const footer = incident?.footer;
+    const packNumber = recoverablePackNumberFromFooter(footer);
+    if (incident?.kind !== 'REVIEWER_ERROR_FOOTER' || !Number.isInteger(packNumber)) continue;
+
+    bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+    bucketState.lastAction = `startup-exact-pack-recovery:${incidentId}:pack-${packNumber}`;
+    bucketState.processedHash = null;
+    bucketState.candidateHash = null;
+    bucketState.candidateCount = 0;
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    bucketState.transientFailures = 0;
+    recovered = true;
+    log(`B${bucket}: staged exact-pack recovery for pack ${String(packNumber).padStart(6, '0')}; incident preserved ${incidentId}`);
+  }
+  if (recovered) saveState();
+}
+
+function recoverAdvisoryCoordinatorHolds() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.complete || bucketHasUnresolvedAwaitingAction(bucketState)) continue;
+
+    let incidentId = null;
+    let incidentRecord = null;
+    let incident = null;
+    if (bucketState.phase === 'HOLD' && String(bucketState.lastAction || '').startsWith('incident:')) {
+      incidentId = String(bucketState.lastAction).slice('incident:'.length);
+      incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+      incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    } else if (String(bucketState.lastProcessedStatus || '').toUpperCase() === 'ERROR'
+      && String(bucketState.lastProcessedBlocker || '').trim().toUpperCase() === 'TERMINAL_DUPLICATE_CLASSIFICATION_COLLISION') {
+      const candidates = Object.values(state.incidents || {})
+        .filter(entry => entry?.path)
+        .map(record => ({ record, incident: loadJson(record.path, null) }))
+        .filter(entry => Number(entry.incident?.bucket) === Number(bucket)
+          && entry.incident?.kind === 'REVIEWER_ERROR_FOOTER'
+          && isRecoverableAdvisoryCoordinatorFooter(entry.incident?.footer))
+        .sort((a, b) => Date.parse(b.incident?.detectedAt || '') - Date.parse(a.incident?.detectedAt || ''));
+      const latest = candidates[0];
+      if (!latest) continue;
+      const incidentAt = Date.parse(latest.incident?.detectedAt || '');
+      const lastSentAt = Date.parse(bucketState.lastMessageSentAt || '');
+      if (Number.isFinite(lastSentAt) && Number.isFinite(incidentAt) && lastSentAt > incidentAt) continue;
+      incidentRecord = latest.record;
+      incident = latest.incident;
+      incidentId = latest.record.id;
+    } else {
+      continue;
+    }
+
+    const footer = incident?.footer;
+    if (incident?.kind !== 'REVIEWER_ERROR_FOOTER' || !isRecoverableAdvisoryCoordinatorFooter(footer)) continue;
+
+    bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+    bucketState.lastAction = `startup-advisory-anomaly-recovery:${incidentId}`;
+    bucketState.processedHash = null;
+    bucketState.candidateHash = null;
+    bucketState.candidateCount = 0;
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    bucketState.transientFailures = 0;
+    recovered = true;
+    log(`B${bucket}: staged verified-write advisory anomaly recovery; incident preserved ${incidentId}`);
+  }
+  if (recovered) saveState();
+}
+
+function recoverRetryableTurnBoundaryHolds() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
+    const incidentId = String(bucketState.lastAction).slice('incident:'.length);
+    const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    const footer = incident?.footer;
+    if (incident?.kind !== 'REVIEWER_ERROR_FOOTER'
+      || !isRecoverableTurnBoundaryFooter(footer)) continue;
+
+    // The reviewer finished a valid turn and verified its writes. Reprocess
+    // that stable footer once so the normal continuation action is sent.
+    bucketState.phase = bucketState.chatUrl ? 'ACTIVE' : 'PENDING';
+    bucketState.lastAction = `startup-turn-boundary-recovery:${incidentId}`;
+    bucketState.processedHash = null;
+    bucketState.candidateHash = null;
+    bucketState.candidateCount = 0;
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    bucketState.transientFailures = 0;
+    recovered = true;
+    log(`B${bucket}: recovered benign ${footer.blocker} hold; incident preserved ${incidentId}`);
+  }
+  if (recovered) saveState();
+}
+
+function resetSetupWaitObservationState() {
+  let reset = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.complete || bucketState.phase !== 'SETUP_WAIT') continue;
+    if (bucketState.setupVerified
+      && String(bucketState.setupVerifiedChatId || '') === String(bucketState.chatId || '')) continue;
+    resetPerChatObservationState(bucketState);
+    bucketState.lastAction = bucketState.awaitingActionId
+      ? `setup-wait-observation-reset:${bucketState.awaitingActionId}`
+      : 'setup-wait-observation-reset';
+    reset = true;
+    log(`B${bucket}: reset per-chat response hashes for SETUP_WAIT recovery`);
+  }
+  if (reset) saveState();
+}
+
+function recoverInvalidLegacyChatRehydration() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    const configuredChatId = config.buckets?.[String(bucket)]?.conversationId || null;
+    if (!configuredChatId || bucketState.chatId !== configuredChatId || !bucketState.lastRolloverAt) continue;
+
+    const rolledOverAt = Date.parse(bucketState.lastRolloverAt);
+    const lastSentAt = Date.parse(bucketState.lastMessageSentAt || '');
+    if (!Number.isFinite(rolledOverAt)) continue;
+    if (Number.isFinite(lastSentAt) && rolledOverAt <= lastSentAt) continue;
+
+    bucketState.chatId = null;
+    bucketState.chatUrl = null;
+    bucketState.phase = 'PENDING';
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    resetPerChatObservationState(bucketState);
+    bucketState.lastAction = 'startup-invalid-legacy-chat-recovery';
+    recovered = true;
+    log(`B${bucket}: discarded legacy configured chat restored after a newer rollover`);
+  }
+  if (recovered) saveState();
+}
+
+function recoverSourcePackHolds() {
+  const marker = loadJson(SOURCE_PACK_READY_PATH, null);
+  const markerId = String(marker?.id || '').trim();
+  if (!markerId || String(marker?.status || '').toUpperCase() !== 'UPLOADED') return;
+
+  const released = [];
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
+    const incidentId = String(bucketState.lastAction).slice('incident:'.length);
+    const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    if (incident?.kind !== 'NEXT_SOURCE_PACKS_REQUIRED') continue;
+    const shard = SOURCE_PACK_SHARDS[Number(bucket)];
+    if (!shard) continue;
+    const targetNumber = nextSourcePackNumber({
+      startPack: shard.startPack,
+      incidentId,
+      lastDeliveredNumber: bucketState.sourcePackLastDeliveredNumber,
+      lastDeliveredIncidentId: bucketState.sourcePackLastDeliveredIncidentId,
+      bucket: Number(bucket),
+    });
+    if (!isValidSourcePackNumber(Number(bucket), targetNumber)) continue;
+    const filename = sourcePackFilename(targetNumber, Number(bucket));
+    if (bucketState.sourcePackResumePending
+      && bucketState.sourcePackResumeIncidentId === incidentId
+      && bucketState.sourcePackTargetNumber === targetNumber) continue;
+
+    bucketState.phase = 'PAUSED';
+    bucketState.lastAction = `source-pack-ready:${markerId}:${filename}:${incidentId}`;
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    bucketState.candidateHash = null;
+    bucketState.candidateCount = 0;
+    bucketState.transientFailures = 0;
+    bucketState.sourcePackResumePending = true;
+    bucketState.sourcePackResumeIncidentId = incidentId;
+    bucketState.sourcePackTargetNumber = targetNumber;
+    bucketState.sourcePackTargetFilename = filename;
+    resetSourcePackAccessState(bucketState);
+    released.push(Number(bucket));
+  }
+
+  if (released.length) {
+    state.sourcePackRelease = {
+      id: markerId,
+      recoveredAt: now(),
+      records: Number(marker?.records || 0),
+      packCount: Number(marker?.packCount || 0),
+      buckets: released,
+    };
+    saveState();
+    log(`source-pack release ${markerId}: prepared bucket boundaries ${released.join(',')}; active cap=${MAX_ACTIVE_REVIEWERS}`);
+  }
+}
+
+async function sendPendingSourcePackContinuations(context) {
+  for (const [bucket, bucketState] of Object.entries(state.buckets).sort((a, b) => Number(a[0]) - Number(b[0]))) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (!bucketState.sourcePackResumePending
+      || bucketState.complete
+      || bucketState.phase === 'HOLD'
+      || bucketState.writeRecoveryResumePending) continue;
+    if (bucketState.awaitingResponseAt || bucketState.awaitingActionId) continue;
+    if (!sourcePackRetryReady(bucketState)) continue;
+    assertControlRunning();
+
+    const incidentId = bucketState.sourcePackResumeIncidentId;
+    const incidentRecord = incidentId
+      ? Object.values(state.incidents).find(entry => entry.id === incidentId)
+      : null;
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    sanitizeStoredSourcePackCursorFields(Number(bucket), bucketState);
+    const resolved = resolveNextSourcePackTargetNumber(Number(bucket), {
+      bucketState,
+      incident,
+      incidentId,
+    });
+    if (!isValidSourcePackNumber(Number(bucket), resolved.targetNumber)) {
+      bucketState.sourcePackResumePending = false;
+      bucketState.lastAction = `source-pack-cursor-unresolved:${resolved.reason}`;
+      saveState();
+      log(`B${bucket}: refused invalid source-pack continuation target (${resolved.reason})`);
+      continue;
+    }
+    if (!applyResolvedSourcePackTarget(Number(bucket), bucketState, resolved, incidentId)) {
+      bucketState.lastAction = 'source-pack-invalid-target';
+      saveState();
+      continue;
+    }
+    const targetNumber = resolved.targetNumber;
+    const shard = SOURCE_PACK_SHARDS[Number(bucket)];
+    if (!shard || !incidentId) {
+      recordIncident('SOURCE_PACK_CURSOR_INVALID', Number(bucket), `source-pack recovery has no valid target for incident ${incidentId || 'unknown'}`);
+      continue;
+    }
+
+    const filename = bucketState.sourcePackTargetFilename;
+    if (path.basename(filename) !== filename || isInvalidZeroSourcePackFilename(filename)) {
+      bucketState.lastAction = `source-pack-invalid-filename:${filename}`;
+      saveState();
+      continue;
+    }
+
+    if (sourcePackContinuationAlreadySent(bucketState, state.actions, targetNumber, incidentId)) {
+      bucketState.sourcePackResumePending = false;
+      bucketState.lastAction = `source-pack-continuation-already-sent:${filename}`;
+      saveState();
+      continue;
+    }
+
+    if (!bucketState.chatUrl) continue;
+
+    const page = await ensurePage(context, bucketState);
+    if (!page || await isGenerating(page)) continue;
+    if (isAuthenticationPage(page)) {
+      bucketState.lastAction = 'waiting-for-browser-auth';
+      saveState();
+      continue;
+    }
+
+    const composer = page.locator(COMPOSER_LOCATOR_SELECTOR).first();
+    let composerVisible = false;
+    try {
+      composerVisible = await composer.count() > 0 && await composer.isVisible();
+    } catch {}
+    if (!composerVisible) {
+      bucketState.lastAction = 'waiting-for-chat-composer';
+      saveState();
+      continue;
+    }
+
+    const latestAssistant = await latestMessage(page, 'assistant');
+    const responseHash = latestAssistant ? sha16(latestAssistant) : (bucketState.processedHash || bucketState.lastHash || '');
+    const footer = incident?.footer;
+    const needsWriteRecovery = footer && footer.writesVerified !== 'YES';
+    const source = {
+      filename,
+      folderUrl: sourcePackShardFolderUrl(shard.folderId),
+    };
+    const kind = needsWriteRecovery ? 'WRITE_RECOVERY' : 'SOURCE_PACK_CONTINUE';
+    const prompt = needsWriteRecovery
+      ? partialWriteRecoveryPrompt(Number(bucket), footer)
+      : sourcePackContinuationPrompt(Number(bucket), source);
+
+    const actionIdSent = await sendAction(page, Number(bucket), kind, prompt, responseHash);
+    if (!needsWriteRecovery) {
+      bucketState.sourcePackLastDeliveredNumber = targetNumber;
+      bucketState.sourcePackLastDeliveredIncidentId = incidentId;
+      bucketState.sourcePackLastDeliveredAt = now();
+      bucketState.sourcePackLastDeliveredActionId = actionIdSent;
+      recordSourcePackTransition(state, bucket, {
+        fromPack: bucketState.sourcePackLastConsumedNumber != null
+          ? sourcePackFilename(bucketState.sourcePackLastConsumedNumber, Number(bucket))
+          : null,
+        toPack: filename,
+        at: now(),
+      });
+    }
+    bucketState.sourcePackResumePending = false;
+    bucketState.phase = 'ACTIVE';
+    bucketState.lastAction = `${kind}-connected-drive:${filename}:${actionIdSent}`;
+    saveState();
+    log(`B${bucket}: SOURCE_PACK_CONTINUE sent for ${filename} using connected Drive source (${actionIdSent})`);
+    recordActivityEvent(state, {
+      bucket,
+      kind: 'SOURCE_PACK_CONTINUE',
+      summary: `SOURCE_PACK_CONTINUE ${filename} (${actionIdSent})`,
+    });
+  }
+}
+
+function updateReceivedMessage(bucketState, text, responseHash) {
+  if (bucketState.lastMessageReceivedHash === responseHash) return false;
+  bucketState.lastHash = responseHash;
+  bucketState.lastMessageReceivedHash = responseHash;
+  bucketState.lastMessageReceivedAt = now();
+  bucketState.lastMessageReceivedPreview = String(text).replace(/\s+/g, ' ').trim().slice(0, 220);
+  return true;
+}
+
+function recordFooterProgress(bucket, bucketState, footer, responseAction) {
+  const count = Number(footer?.newCases || 0);
+  if (!Number.isFinite(count) || count <= 0) return;
+
+  bucketState.casesReported = Number(bucketState.casesReported || 0) + count;
+  bucketState.casesSinceChatStart = Number(bucketState.casesSinceChatStart || 0) + count;
+  state.metrics.casesReported = Number(state.metrics.casesReported || 0) + count;
+  state.metrics.casesReportedByBucket[String(bucket)] = Number(
+    state.metrics.casesReportedByBucket[String(bucket)] || 0,
+  ) + count;
+
+  const sourcePack = bucketState.sourcePackTargetFilename
+    || (bucketState.sourcePackTargetNumber != null
+      ? sourcePackFilename(bucketState.sourcePackTargetNumber, Number(bucket))
+      : null);
+  recordAuditProgressEvent(state, {
+    bucket,
+    actionId: responseAction?.id || bucketState.awaitingActionId || null,
+    newCases: count,
+    writesVerified: footer?.writesVerified || null,
+    sourcePack,
+    at: now(),
+  });
+  recordActivityEvent(state, {
+    bucket,
+    kind: 'AUDIT_PROGRESS',
+    summary: `${count} new cases, writes ${footer?.writesVerified || 'unknown'}${sourcePack ? ` (${sourcePack})` : ''}`,
+    at: state.metrics.lastProgressAt,
+  });
+}
+
+function recordResponseLatency(bucketState, responseAction) {
+  if (!responseAction?.sentAt || !bucketState.lastMessageReceivedAt) return;
+  const sent = Date.parse(responseAction.sentAt);
+  const received = Date.parse(bucketState.lastMessageReceivedAt);
+  if (Number.isFinite(sent) && Number.isFinite(received) && received >= sent) {
+    bucketState.lastResponseLatencyMs = received - sent;
+  }
+}
+
+async function processSetupWait(page, bucket, bucketState, text, responseHash) {
+  const responseActionId = bucketState.awaitingActionId;
+  const responseKey = actionResponseKey(responseActionId, responseHash);
+  if (responseKey && bucketState.processedResponseKey === responseKey) return;
+  bucketState.lastSeen = now();
+
+  if (!isExactSetupAck(text)) {
+    const setupAckTimeoutMinutes = Number(config.setupAckTimeoutMinutes || 5);
+    if (!setupAckTimedOut(bucketState, setupAckTimeoutMinutes)) {
+      saveState();
+      return;
+    }
+    markProcessedResponse(bucketState, responseHash, responseActionId);
+    clearAwaiting(bucketState, responseActionId);
+    saveState();
+    recordIncident(
+      'SETUP_ACK_MISMATCH',
+      bucket,
+      `setup ACK mismatch; expected PROTOCOL_SETUP_ACK_V3 but received: ${text.slice(0, 500)}`,
+    );
+    return;
+  }
+
+  markProcessedResponse(bucketState, responseHash, responseActionId);
+  clearAwaiting(bucketState, responseActionId);
+  bucketState.setupVerified = true;
+  bucketState.setupVerifiedChatId = bucketState.chatId || null;
+  bucketState.phase = 'SETUP_WAIT';
+  bucketState.lastAction = 'setup-ack-verified-awaiting-slot';
+  saveState();
+  log(`B${bucket}: setup ACK verified; waiting for a reviewer slot before initial audit dispatch`);
+}
+
+async function processActive(page, bucket, bucketState, text, responseHash, options = {}) {
+  const { allowDispatch = true } = options;
+  const responseActionId = bucketState.awaitingActionId;
+  const responseKey = actionResponseKey(responseActionId, responseHash);
+  if (responseKey && bucketState.processedResponseKey === responseKey) return;
+  const responseAction = responseActionId ? state.actions[responseActionId] : null;
+  clearAwaiting(bucketState, responseActionId);
+  bucketState.lastSeen = now();
+  recordResponseLatency(bucketState, responseAction);
+
+  const footer = parseFooter(text);
+
+  if (!footer) {
+    bucketState.malformedCount = Number(bucketState.malformedCount || 0) + 1;
+    markProcessedResponse(bucketState, responseHash, responseActionId);
+    saveState();
+
+    if (bucketState.malformedCount <= 1) {
+      if (!allowDispatch) {
+        bucketState.lastAction = 'malformed-response-reconciled-without-dispatch';
+        saveState();
+        log(`B${bucket}: malformed response reconciled without dispatch`);
+        return;
+      }
+      await sendAction(page, bucket, 'MALFORMED_RECOVERY', malformedRecoveryPrompt(bucket), responseHash);
+      bucketState.lastAction = 'malformed-recovery-sent';
+      saveState();
+      log(`B${bucket}: malformed/truncated footer; recovery turn sent`);
+      return;
+    }
+
+    recordIncident(
+      'REPEATED_MALFORMED_FOOTER',
+      bucket,
+      `two consecutive stable reviewer responses lacked the required footer. Latest response starts: ${text.slice(0, 700)}`,
+    );
+    return;
+  }
+
+  bucketState.malformedCount = 0;
+  markProcessedResponse(bucketState, responseHash, responseActionId, footer);
+  recordFooterProgress(bucket, bucketState, footer, responseAction);
+
+  if (reviewerConfirmedSourcePackAccess(bucketState, footer, responseAction)) {
+    markSourcePackAccessVerified(bucketState, {
+      targetNumber: bucketState.sourcePackTargetNumber,
+      incidentId: bucketState.sourcePackResumeIncidentId || bucketState.sourcePackLastDeliveredIncidentId,
+      filename: bucketState.sourcePackTargetFilename
+        || sourcePackFilename(bucketState.sourcePackTargetNumber),
+      requestActionId: responseAction?.id || bucketState.sourcePackLastDeliveredActionId,
+    });
+  }
+
+  if (responseAction?.kind === 'WRITE_RECOVERY') {
+    const blocker = String(footer.blocker || '').trim().toUpperCase();
+    const recoveryStillFailed = isRecoverableReadbackFooter(footer) || isRecoverableRegistryWriteFooter(footer);
+    if (recoveryStillFailed) {
+      bucketState.writeRecoveryResumePending = false;
+      bucketState.writeRecoveryIncidentId = null;
+      bucketState.writeRecoveryInterruptedActionId = null;
+      saveState();
+      recordIncident(
+        'WRITE_RECOVERY_TERMINAL_FAILURE',
+        bucket,
+        `WRITE_RECOVERY ${responseAction.id} returned STATUS=${footer.status}; WRITES_VERIFIED=${footer.writesVerified}; BLOCKER=${footer.blocker}; automatic retry stopped`,
+        { footer, recoveryActionId: responseAction.id },
+      );
+      return;
+    }
+
+    const recoverySucceeded = footer.status === 'NORMAL'
+      && footer.writesVerified === 'YES'
+      && footer.triggerCoordinator === 'NO'
+      && ['NONE', 'NEXT_SOURCE_PACKS_REQUIRED'].includes(blocker);
+    if (recoverySucceeded) {
+      bucketState.writeRecoveryResumePending = false;
+      bucketState.writeRecoveryIncidentId = null;
+      bucketState.writeRecoveryInterruptedActionId = null;
+
+      const recoveryTarget = parseSourcePackNumber(bucketState.sourcePackTargetNumber, Number(bucket));
+      const recoveryConsumed = parseSourcePackNumber(bucketState.sourcePackLastConsumedNumber, Number(bucket));
+      const exactSourcePackStillPending = Boolean(
+        bucketState.sourcePackResumePending
+        || (
+          recoveryTarget !== null
+          && !bucketState.sourcePackAccessVerified
+          && (recoveryConsumed === null || recoveryConsumed < recoveryTarget)
+          && bucketState.sourcePackResumeIncidentId
+        ),
+      );
+      if (exactSourcePackStillPending) {
+        bucketState.sourcePackResumePending = true;
+        resetSourcePackAccessState(bucketState);
+        bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+        bucketState.lastAction = 'write-recovery-complete-source-pack-resume-pending';
+        saveState();
+        log(`B${bucket}: write recovery verified; exact source-pack continuation remains pending`);
+        return;
+      }
+      saveState();
+    }
+  }
+
+  if (footer.status === 'COMPLETE') {
+    if (footer.writesVerified !== 'YES') {
+      saveState();
+      if (!allowDispatch) {
+        bucketState.lastAction = `complete-response-reconciled-without-dispatch-${footer.writesVerified.toLowerCase()}`;
+        saveState();
+        log(`B${bucket}: COMPLETE candidate reconciled without dispatch`);
+        return;
+      }
+      await sendAction(page, bucket, 'WRITE_RECOVERY', partialWriteRecoveryPrompt(bucket, footer), responseHash);
+      bucketState.lastAction = `write-recovery-before-corpus-completion-${footer.writesVerified.toLowerCase()}`;
+      saveState();
+      log(`B${bucket}: COMPLETE candidate had ${footer.writesVerified} writes; write reconciliation requested first`);
+      return;
+    }
+
+    const evidence = parseCorpusCompletionEvidence(text);
+    if (responseAction?.kind === 'CORPUS_RECONCILE') {
+      if (footer.triggerCoordinator === 'YES' || footer.blocker.trim().toUpperCase() !== 'NONE') {
+        saveState();
+        recordIncident(
+          'COMPLETE_WITH_UNRESOLVED_BLOCKER',
+          bucket,
+          `full-corpus reconciliation reported COMPLETE with BLOCKER=${footer.blocker}; TRIGGER_COORDINATOR=${footer.triggerCoordinator}`,
+          { footer, evidence },
+        );
+        return;
+      }
+
+      if (isVerifiedCorpusCompletion(evidence, config.auditablePopulation)) {
+        bucketState.corpusCompleteVerified = true;
+        bucketState.complete = true;
+        bucketState.phase = 'COMPLETE';
+        bucketState.lastAction = 'corpus-complete-verified';
+        bucketState.awaitingResponseAt = null;
+        bucketState.awaitingActionId = null;
+        saveState();
+        log(`B${bucket}: full-corpus COMPLETE verified; reviewer slot released`);
+        return;
+      }
+
+      saveState();
+      recordIncident(
+        'UNPROVEN_CORPUS_COMPLETION',
+        bucket,
+        `reviewer repeated COMPLETE without valid full-corpus evidence for auditable population ${config.auditablePopulation}`,
+        { footer, evidence },
+      );
+      return;
+    }
+
+    bucketState.complete = false;
+    bucketState.corpusCompleteVerified = false;
+    saveState();
+    if (!allowDispatch) {
+      bucketState.lastAction = 'complete-response-reconciled-without-dispatch';
+      saveState();
+      log(`B${bucket}: COMPLETE observed during reconciliation without dispatch`);
+      return;
+    }
+    await sendAction(page, bucket, 'CORPUS_RECONCILE', corpusReconciliationPrompt(bucket), responseHash);
+    bucketState.lastAction = 'corpus-reconcile-sent';
+    saveState();
+    log(`B${bucket}: COMPLETE observed; full-corpus reconciliation requested instead of retiring bucket`);
+    return;
+  }
+
+  if (footer.blocker.trim().toUpperCase() === 'NEXT_SOURCE_PACKS_REQUIRED') {
+    const currentTargetNumber = parseSourcePackNumber(bucketState.sourcePackTargetNumber, bucket);
+    const currentTargetFilename = sourcePackFilename(currentTargetNumber, Number(bucket));
+    if (currentTargetNumber !== null
+      && currentTargetFilename
+      && responseIndicatesSourcePackUnavailable(text, currentTargetFilename)) {
+      recordSourcePackBoundaryEvidence(bucket, bucketState, text);
+      const incidentPath = recordIncident(
+        'SOURCE_PACK_BOUNDARY_CONTRADICTION',
+        bucket,
+        `${currentTargetFilename} was explicitly unavailable in a NEXT_SOURCE_PACKS_REQUIRED response; preserving the exact target instead of advancing`,
+        { footer, preservedTarget: currentTargetFilename },
+        { wakeCoordinator: false, holdBucket: false },
+      );
+      const incidentRecord = incidentPath
+        ? Object.values(state.incidents).find(entry => entry.path === incidentPath)
+        : null;
+      stageUnavailableSourcePackBackoff(
+        bucket,
+        bucketState,
+        currentTargetNumber,
+        incidentRecord?.id || bucketState.sourcePackResumeIncidentId,
+      );
+      saveState();
+      log(`B${bucket}: boundary footer contradicted by unavailable ${currentTargetFilename}; target preserved with retry backoff`);
+      return;
+    }
+
+    recordSourcePackBoundaryEvidence(bucket, bucketState, text);
+    const lastConsumed = parseSourcePackNumber(bucketState.sourcePackTargetNumber, bucket)
+      ?? parseSourcePackNumber(bucketState.sourcePackLastConsumedNumber, bucket)
+      ?? parseSourcePackNumber(bucketState.sourcePackLastVisibleNumber, bucket)
+      ?? parseSourcePackNumber(bucketState.sourcePackLastDeliveredNumber, bucket);
+    if (lastConsumed !== null) {
+      bucketState.sourcePackLastDeliveredNumber = lastConsumed;
+      bucketState.sourcePackLastConsumedNumber = lastConsumed;
+    }
+    saveState();
+    const recoverableSourceBoundary = isSourcePackBoundaryFooter(footer);
+    const incidentPath = recordIncident(
+      'NEXT_SOURCE_PACKS_REQUIRED',
+      bucket,
+      `Bucket ${bucket} exhausted currently visible packs after delivered pack ${lastConsumed ?? bucketState.sourcePackLastDeliveredNumber ?? 'initial'} but still has owned cases pending in the ${config.auditablePopulation}-case finalized population`,
+      {
+        footer,
+        requiredAction: `Resume Bucket ${bucket} from the connected Google Drive source using the exact next pack filename and shard folder location in the SOURCE_PACK_CONTINUE prompt. Preserve all terminal registry rows and resume the existing reviewer chat.`,
+      },
+      { wakeCoordinator: !recoverableSourceBoundary, holdBucket: false },
+    );
+    const incidentRecord = incidentPath
+      ? Object.values(state.incidents).find(entry => entry.path === incidentPath)
+      : null;
+    const incidentId = incidentRecord?.id
+      || bucketState.sourcePackResumeIncidentId
+      || bucketState.sourcePackLastDeliveredIncidentId
+      || null;
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    const previousFilename = bucketState.sourcePackTargetFilename
+      || sourcePackFilename(lastConsumed, Number(bucket));
+    const advanced = advanceSourcePackAfterBoundary(Number(bucket), bucketState, {
+      incidentId,
+      incident,
+      responseText: text,
+    });
+    if (advanced.ok) {
+      bucketState.advisoryAnomalyResumePending = false;
+      bucketState.advisoryAnomalyInterruptedActionId = null;
+      bucketState.lastAction = responseActionId
+        ? `processed:${responseActionId}:source-pack-boundary:pack-${advanced.nextPack}`
+        : `source-pack-boundary:${incidentId || 'unknown'}:pack-${advanced.nextPack}`;
+      recordSourcePackTransition(state, bucket, {
+        fromPack: previousFilename || sourcePackFilename(advanced.consumed, Number(bucket)),
+        toPack: advanced.nextFilename,
+      });
+      recordActivityEvent(state, {
+        bucket,
+        kind: 'SOURCE_PACK_BOUNDARY',
+        summary: `pack ${advanced.consumed} exhausted, 0 new cases → staged ${advanced.nextFilename}`,
+      });
+      log(`B${bucket}: advanced source-pack target from ${previousFilename || sourcePackFilename(advanced.consumed, Number(bucket))} to ${advanced.nextFilename}`);
+    } else {
+      bucketState.lastAction = responseActionId
+        ? `processed:${responseActionId}:source-pack-boundary-unresolved:${advanced.reason}`
+        : `source-pack-boundary-unresolved:${advanced.reason}`;
+      log(`B${bucket}: source-pack boundary reconciled but next pack could not be derived (${advanced.reason})`);
+    }
+    saveState();
+    return;
+  }
+
+  const recoverablePackNumber = recoverablePackNumberFromFooter(footer);
+  if (Number.isInteger(recoverablePackNumber) && isValidSourcePackNumber(Number(bucket), recoverablePackNumber)) {
+    const shard = SOURCE_PACK_SHARDS[Number(bucket)];
+    if (!shard) {
+      saveState();
+      recordIncident('SOURCE_PACK_SHARD_CONFIG_MISSING', bucket, `no source-pack shard configuration exists for Bucket ${bucket}`, { footer });
+      return;
+    }
+    const filename = sourcePackFilename(recoverablePackNumber, Number(bucket));
+    bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+    bucketState.sourcePackResumePending = true;
+    bucketState.sourcePackResumeIncidentId = `pack-retry:${responseHash}`;
+    bucketState.sourcePackTargetNumber = recoverablePackNumber;
+    bucketState.sourcePackTargetFilename = filename;
+    resetSourcePackAccessState(bucketState);
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    bucketState.lastAction = `source-pack-retry-staged:${filename}`;
+    saveState();
+    log(`B${bucket}: exact source pack retry staged for connected Drive continuation (${filename})`);
+    return;
+  }
+
+  if (isRecoverableUnavailableSourcePackFooter(footer)) {
+    sanitizeStoredSourcePackCursorFields(Number(bucket), bucketState);
+    const incidentRecord = bucketState.sourcePackResumeIncidentId
+      ? Object.values(state.incidents).find(entry => entry.id === bucketState.sourcePackResumeIncidentId)
+      : null;
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    const resolved = resolveNextSourcePackTargetNumber(Number(bucket), {
+      bucketState,
+      incident,
+      incidentId: bucketState.sourcePackResumeIncidentId,
+      responseText: isInvalidZeroSourcePackFilename(bucketState.sourcePackTargetFilename)
+        ? bucketState.sourcePackBoundaryResponsePreview
+        : text,
+    });
+    if (isValidSourcePackNumber(Number(bucket), resolved.targetNumber)) {
+      stageUnavailableSourcePackBackoff(
+        bucket,
+        bucketState,
+        resolved.targetNumber,
+        bucketState.sourcePackResumeIncidentId,
+      );
+      saveState();
+      log(`B${bucket}: unavailable source pack ${bucketState.sourcePackTargetFilename}; retry ${bucketState.sourcePackUnavailableCount} deferred until ${bucketState.sourcePackRetryNotBefore}`);
+      return;
+    }
+  }
+
+  if (isRecoverableReadbackFooter(footer) || isRecoverableRegistryWriteFooter(footer)) {
+    saveState();
+    if (!allowDispatch) {
+      bucketState.lastAction = `write-recovery-reconciled-without-dispatch-${footer.writesVerified.toLowerCase()}`;
+      saveState();
+      log(`B${bucket}: recoverable readback response reconciled without dispatch`);
+      return;
+    }
+    await sendAction(page, bucket, 'WRITE_RECOVERY', partialWriteRecoveryPrompt(bucket, footer), responseHash);
+    bucketState.lastAction = `write-recovery-${footer.writesVerified.toLowerCase()}`;
+    saveState();
+    log(`B${bucket}: recoverable readback state (${footer.writesVerified}; ${footer.blocker || 'NONE'}); reconciliation turn sent`);
+    return;
+  }
+
+
+  if (isRecoverableAdvisoryCoordinatorFooter(footer)) {
+    saveState();
+    if (!allowDispatch) {
+      bucketState.lastAction = 'advisory-anomaly-reconciled-without-dispatch';
+      saveState();
+      log(`B${bucket}: advisory anomaly response reconciled without dispatch`);
+      return;
+    }
+    await sendAction(page, bucket, 'ISOLATED_ANOMALY_CONTINUE', isolatedAnomalyContinuationPrompt(bucket), responseHash);
+    bucketState.advisoryAnomalyResumePending = false;
+    bucketState.advisoryAnomalyInterruptedActionId = null;
+    bucketState.lastAction = 'isolated-anomaly-continuation-sent';
+    saveState();
+    log(`B${bucket}: verified-write advisory coordinator request isolated; continuation sent without rewriting anomaly`);
+    return;
+  }
+
+  if (shouldEscalateFooter(footer)) {
+    saveState();
+    recordIncident(
+      'REVIEWER_ERROR_FOOTER',
+      bucket,
+      `STATUS=${footer.status}; WRITES_VERIFIED=${footer.writesVerified}; BLOCKER=${footer.blocker}; TRIGGER_COORDINATOR=${footer.triggerCoordinator}`,
+      { footer },
+    );
+    return;
+  }
+
+  saveState();
+  if (bucketState.advisoryAnomalyResumePending) {
+    if (!allowDispatch) {
+      bucketState.lastAction = 'normal-response-reconciled-advisory-anomaly-pending';
+      saveState();
+      log(`B${bucket}: NORMAL footer reconciled; interrupted advisory anomaly continuation remains pending`);
+      return;
+    }
+    const interruptedActionId = bucketState.advisoryAnomalyInterruptedActionId;
+    await sendAction(
+      page,
+      bucket,
+      'ISOLATED_ANOMALY_CONTINUE',
+      interruptedActionId
+        ? `The prior ISOLATED_ANOMALY_CONTINUE action ${interruptedActionId} was interrupted by a reviewer-chat rollover before its attributable response was reconciled. Reconcile the authoritative registry first and preserve every valid terminal row. ${isolatedAnomalyContinuationPrompt(bucket)}`
+        : isolatedAnomalyContinuationPrompt(bucket),
+      responseHash,
+    );
+    bucketState.advisoryAnomalyResumePending = false;
+    bucketState.advisoryAnomalyInterruptedActionId = null;
+    bucketState.lastAction = 'isolated-anomaly-continuation-after-legacy-rollover';
+    saveState();
+    log(`B${bucket}: resumed interrupted advisory anomaly continuation before ordinary CONTINUE`);
+    return;
+  }
+  if (!allowDispatch) {
+    bucketState.lastAction = 'normal-response-reconciled-without-dispatch';
+    saveState();
+    log(`B${bucket}: NORMAL footer reconciled without dispatch`);
+    return;
+  }
+  await sendAction(page, bucket, 'CONTINUE', continuationPrompt(bucket), responseHash);
+  bucketState.lastAction = 'continuation-sent';
+  saveState();
+  log(`B${bucket}: NORMAL footer; continuation turn sent`);
+}
+
+async function recoverIdleActiveBucket(page, bucket, bucketState, text, responseHash) {
+  if (bucketState.phase !== 'ACTIVE'
+    || bucketState.awaitingResponseAt
+    || bucketState.processedHash !== responseHash) return false;
+
+  const footer = parseFooter(text);
+  if (!footer
+    || footer.status !== 'NORMAL'
+    || footer.writesVerified !== 'YES'
+    || (footer.blocker.trim().toUpperCase() !== 'NONE' && !isRecoverableTurnBoundaryFooter(footer))
+    || footer.triggerCoordinator !== 'NO') return false;
+
+  if (bucketState.advisoryAnomalyResumePending) {
+    const interruptedActionId = bucketState.advisoryAnomalyInterruptedActionId;
+    await sendAction(
+      page,
+      bucket,
+      'ISOLATED_ANOMALY_CONTINUE',
+      interruptedActionId
+        ? `The prior ISOLATED_ANOMALY_CONTINUE action ${interruptedActionId} was interrupted by a reviewer-chat rollover before its attributable response was reconciled. Reconcile the authoritative registry first and preserve every valid terminal row. ${isolatedAnomalyContinuationPrompt(bucket)}`
+        : isolatedAnomalyContinuationPrompt(bucket),
+      responseHash,
+    );
+    bucketState.advisoryAnomalyResumePending = false;
+    bucketState.advisoryAnomalyInterruptedActionId = null;
+    bucketState.lastAction = 'idle-isolated-anomaly-continuation-recovered';
+    saveState();
+    log(`B${bucket}: resumed interrupted advisory anomaly continuation from idle reconciled state`);
+    return true;
+  }
+
+  await sendAction(page, bucket, 'CONTINUE', continuationPrompt(bucket), responseHash);
+  bucketState.lastAction = 'idle-continuation-recovered';
+  saveState();
+  log(`B${bucket}: recovered idle ACTIVE bucket by restoring/sending continuation`);
+  return true;
+}
+
+async function processBucket(context, bucket) {
+  const bucketState = state.buckets[String(bucket)];
+  if (isSchedulingBlockedBucket(bucket)
+    || bucketState.complete
+    || bucketState.phase === 'PENDING'
+    || bucketState.phase === 'HOLD'
+    || bucketState.phase === 'PAUSED') return;
+  if (readControl().desiredState !== 'RUNNING') return;
+
+  try {
+    const page = await ensurePage(context, bucketState);
+    if (!page) return;
+    if (isAuthenticationPage(page)) {
+      bucketState.noAssistantCount = 0;
+      bucketState.lastAction = 'waiting-for-browser-auth';
+      saveState();
+      return;
+    }
+
+    if (bucketState.phase === 'SETUP_WAIT'
+      && bucketState.setupVerified
+      && String(bucketState.setupVerifiedChatId || '') === String(bucketState.chatId || '')
+      && !bucketState.awaitingActionId
+      && !bucketState.awaitingResponseAt) {
+      bucketState.lastAction = 'setup-verified-awaiting-slot';
+      saveState();
+      return;
+    }
+
+    // Explicit terminal/interrupted UI states override the stop-button signal.
+    // ChatGPT can leave the stop button visible while showing "Connection
+    // interrupted. Waiting for the complete answer", which otherwise looks
+    // like healthy generation forever and prevents conservative rollover.
+    const explicitRolloverReason = await conversationRolloverReason(page);
+    if (explicitRolloverReason) {
+      await rolloverReviewer(context, bucket, explicitRolloverReason);
+      return;
+    }
+
+    if (await isGenerating(page)) {
+      bucketState.transientFailures = 0;
+      noteGenerationObserved(bucketState);
+      bucketState.lastAction = bucketState.awaitingActionId
+        ? `generating:${bucketState.awaitingActionId}`
+        : 'generating';
+      saveState();
+      return;
+    }
+
+    const responseActionId = bucketState.awaitingActionId;
+    const attributed = responseActionId
+      ? await latestAssistantAfterActionMarker(page, responseActionId)
+      : null;
+    const text = responseActionId ? attributed?.text || '' : await latestMessage(page, 'assistant');
+    if (!text) {
+      const setupAckTimeoutMinutes = Number(config.setupAckTimeoutMinutes || 5);
+      if (setupAckTimedOut(bucketState, setupAckTimeoutMinutes)) {
+        recordIncident(
+          'SETUP_ACK_TIMEOUT',
+          bucket,
+          `setup ACK was not received within ${setupAckTimeoutMinutes} minutes after action ${bucketState.awaitingActionId || 'unknown'}`,
+        );
+        return;
+      }
+      const stall = turnStallReason(bucketState);
+      if (stall) {
+        recordIncident('REVIEWER_STALL', bucket, stall);
+        return;
+      }
+      if (bucketState.phase === 'SETUP_WAIT' || bucketState.awaitingResponseAt) {
+        bucketState.noAssistantCount = 0;
+        saveState();
+        return;
+      }
+      bucketState.noAssistantCount = Number(bucketState.noAssistantCount || 0) + 1;
+      if (bucketState.noAssistantCount >= 5) {
+        recordIncident(
+          'NO_ASSISTANT_RESPONSE',
+          bucket,
+          'five consecutive polling cycles found no visible assistant response; authentication or page state may require repair',
+        );
+      }
+      return;
+    }
+
+    bucketState.noAssistantCount = 0;
+    bucketState.transientFailures = 0;
+    if (bucketState.phase === 'SETUP_WAIT' && !isExactSetupAck(text)) {
+      const setupAckTimeoutMinutes = Number(config.setupAckTimeoutMinutes || 5);
+      if (setupAckTimedOut(bucketState, setupAckTimeoutMinutes)) {
+        recordIncident(
+          'SETUP_ACK_TIMEOUT',
+          bucket,
+          `setup ACK was not received within ${setupAckTimeoutMinutes} minutes after action ${bucketState.awaitingActionId || 'unknown'}`,
+        );
+        return;
+      }
+    }
+    const responseHash = sha16(text);
+    if (responseActionId && !attributed?.attributed) {
+      const stall = turnStallReason(bucketState);
+      if (stall) {
+        recordIncident('REVIEWER_STALL', bucket, stall);
+        return;
+      }
+      return;
+    }
+    const responseKey = actionResponseKey(responseActionId, responseHash);
+    if (responseKey && bucketState.processedResponseKey === responseKey) {
+      clearAwaiting(bucketState, responseActionId);
+      saveState();
+      return;
+    }
+    if (responseActionId && !updateStableCandidate(bucketState, responseHash, responseActionId)) {
+      saveState();
+      return;
+    }
+    if (updateReceivedMessage(bucketState, text, responseHash)) saveState();
+
+    if (await recoverIdleActiveBucket(page, bucket, bucketState, text, responseHash)) return;
+
+    if (bucketState.phase === 'SETUP_WAIT' && responseActionId) {
+      await processSetupWait(page, bucket, bucketState, text, responseHash);
+    } else if (bucketState.phase === 'ACTIVE' && responseActionId) {
+      await processActive(page, bucket, bucketState, text, responseHash);
+    }
+  } catch (error) {
+    if (error.code === 'CONTROL_PAUSED' || error.code === 'CONTROL_STOPPED') {
+      bucketState.lastAction = error.code === 'CONTROL_PAUSED'
+        ? 'paused-before-send'
+        : 'stopped-before-send';
+      saveState();
+      return;
+    }
+    if (error.code === 'CHAT_ROLLOVER_REQUIRED') {
+      await rolloverReviewer(context, bucket, error.message);
+      return;
+    }
+    if (error.code === 'PAGE_PROBE_STALLED') {
+      await rolloverReviewer(
+        context,
+        bucket,
+        `reviewer page failed ${error.timeoutCount || PAGE_PROBE_STALL_THRESHOLD} consecutive live-generation probes`,
+      );
+      return;
+    }
+    bucketState.transientFailures = Number(bucketState.transientFailures || 0) + 1;
+    bucketState.lastAction = `transient-error:${error.message}`;
+    saveState();
+    log(`B${bucket}: transient error ${bucketState.transientFailures}: ${error.stack || error}`);
+
+    if (error.code === 'FOREIGN_DRAFT' || bucketState.transientFailures >= 3) {
+      recordIncident(
+        error.code === 'FOREIGN_DRAFT' ? 'FOREIGN_DRAFT' : 'REPEATED_BROWSER_ERROR',
+        bucket,
+        error.message,
+        { stack: error.stack || null },
+      );
+    }
+  }
+}
+
+function rebalanceExistingReviewerSlots() {
+  const entries = Object.entries(state.buckets)
+    .sort((a, b) => Number(a[0]) - Number(b[0]));
+
+  let changed = false;
+  for (const [bucket, bucketState] of entries) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (!bucketReclaimableIdleSlot(bucketState)) continue;
+    bucketState.phase = 'PAUSED';
+    bucketState.lastAction = 'paused-awaiting-source-pack-continuation';
+    changed = true;
+    log(`B${bucket}: paused idle source-pack waiter to free a reviewer slot`);
+  }
+  if (changed) saveState();
+}
+
+function applyResolvedSourcePackTarget(bucket, bucketState, resolved, incidentId) {
+  const targetNumber = resolved?.targetNumber;
+  const filename = sourcePackFilename(targetNumber, Number(bucket));
+  if (!filename) return false;
+  bucketState.sourcePackTargetNumber = targetNumber;
+  bucketState.sourcePackTargetFilename = filename;
+  bucketState.sourcePackResumeIncidentId = incidentId;
+  if (Number.isInteger(resolved?.lastConsumed)) {
+    bucketState.sourcePackLastConsumedNumber = resolved.lastConsumed;
+  }
+  if (Number.isInteger(resolved?.lastVisible)) {
+    bucketState.sourcePackLastVisibleNumber = resolved.lastVisible;
+  }
+  return true;
+}
+
+function stageUnavailableSourcePackBackoff(
+  bucket,
+  bucketState,
+  targetNumber,
+  incidentId,
+  { incrementCount = true, preserveRetryNotBefore = null } = {},
+) {
+  const bucketNumber = Number(bucket);
+  const target = parseSourcePackNumber(targetNumber, bucketNumber);
+  const filename = sourcePackFilename(target, bucketNumber);
+  if (target === null || !filename) return false;
+
+  const unavailableAt = now();
+  const priorCount = Math.max(0, Number(bucketState.sourcePackUnavailableCount || 0));
+  const unavailableCount = incrementCount ? priorCount + 1 : Math.max(1, priorCount);
+  const preservedRetryAt = Date.parse(preserveRetryNotBefore || '');
+  const retryNotBefore = Number.isFinite(preservedRetryAt) && preservedRetryAt > Date.now()
+    ? new Date(preservedRetryAt).toISOString()
+    : new Date(Date.parse(unavailableAt) + sourcePackRetryDelayMs(unavailableCount)).toISOString();
+
+  bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+  bucketState.sourcePackResumePending = true;
+  bucketState.sourcePackResumeIncidentId = incidentId || bucketState.sourcePackResumeIncidentId || null;
+  bucketState.sourcePackTargetNumber = target;
+  bucketState.sourcePackTargetFilename = filename;
+  resetSourcePackAccessState(bucketState);
+  bucketState.sourcePackUnavailableCount = unavailableCount;
+  bucketState.sourcePackLastUnavailableAt = unavailableAt;
+  bucketState.sourcePackRetryNotBefore = retryNotBefore;
+  bucketState.awaitingResponseAt = null;
+  bucketState.awaitingActionId = null;
+  bucketState.responseBaselineHash = null;
+  bucketState.lastAction = `source-pack-unavailable-backoff:pack-${target}:until-${retryNotBefore}`;
+  return true;
+}
+
+function recordSourcePackBoundaryEvidence(bucket, bucketState, text) {
+  const bucketNumber = Number(bucket);
+  const normalized = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return;
+  bucketState.sourcePackBoundaryResponsePreview = normalized.slice(0, 500);
+  const targetNumber = parseSourcePackNumber(bucketState.sourcePackTargetNumber, bucketNumber);
+  const targetFilename = sourcePackFilename(targetNumber, bucketNumber);
+  const targetUnavailable = Boolean(
+    targetFilename && responseIndicatesSourcePackUnavailable(normalized, targetFilename),
+  );
+  const lastVisible = extractLastVisibleSourcePackNumber(normalized, bucketNumber);
+  if (lastVisible !== null) bucketState.sourcePackLastVisibleNumber = lastVisible;
+  if (targetUnavailable) {
+    if (lastVisible !== null && (targetNumber === null || lastVisible < targetNumber)) {
+      bucketState.sourcePackLastConsumedNumber = lastVisible;
+    }
+    return;
+  }
+  const packNumbers = extractPackNumbersFromText(normalized, bucketNumber);
+  if (packNumbers.length) {
+    bucketState.sourcePackLastConsumedNumber = packNumbers[packNumbers.length - 1];
+  }
+}
+
+function recoverFalseSourcePackBoundaryAdvances() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket) || bucketState.complete || !bucketState.sourcePackResumePending) continue;
+    const bucketNumber = Number(bucket);
+    const currentTarget = parseSourcePackNumber(bucketState.sourcePackTargetNumber, bucketNumber);
+    if (currentTarget === null) continue;
+    const priorTarget = currentTarget - 1;
+    const priorFilename = sourcePackFilename(priorTarget, bucketNumber);
+    if (!priorFilename) continue;
+
+    const incidentId = bucketState.sourcePackResumeIncidentId;
+    const incidentRecord = incidentId
+      ? Object.values(state.incidents).find(entry => entry.id === incidentId)
+      : null;
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    if (incident?.kind !== 'NEXT_SOURCE_PACKS_REQUIRED') continue;
+
+    const boundaryText = String(bucketState.sourcePackBoundaryResponsePreview || '');
+    if (!responseIndicatesSourcePackUnavailable(boundaryText, priorFilename)) continue;
+
+    const visible = extractLastVisibleSourcePackNumber(boundaryText, bucketNumber);
+    const priorConsumed = parseSourcePackNumber(bucketState.sourcePackLastConsumedNumber, bucketNumber);
+    const priorVisible = parseSourcePackNumber(bucketState.sourcePackLastVisibleNumber, bucketNumber);
+    const trustedConsumed = [visible, priorVisible, priorConsumed]
+      .filter(value => Number.isInteger(value) && value < priorTarget)
+      .sort((a, b) => b - a)[0] ?? null;
+
+    const correctionPath = recordIncident(
+      'SOURCE_PACK_BOUNDARY_CONTRADICTION',
+      bucketNumber,
+      `${priorFilename} was explicitly unavailable in the response that advanced the cursor to ${sourcePackFilename(currentTarget, bucketNumber)}; restoring the exact unavailable target`,
+      { originalIncidentId: incidentId, preservedTarget: priorFilename },
+      { wakeCoordinator: false, holdBucket: false },
+    );
+    const correctionRecord = correctionPath
+      ? Object.values(state.incidents).find(entry => entry.path === correctionPath)
+      : null;
+
+    bucketState.sourcePackTargetNumber = priorTarget;
+    bucketState.sourcePackTargetFilename = priorFilename;
+    bucketState.sourcePackLastConsumedNumber = trustedConsumed;
+    if (visible !== null && visible < priorTarget) bucketState.sourcePackLastVisibleNumber = visible;
+    bucketState.sourcePackLastDeliveredNumber = null;
+    bucketState.sourcePackLastDeliveredIncidentId = null;
+    bucketState.sourcePackLastDeliveredAt = null;
+    bucketState.sourcePackLastDeliveredActionId = null;
+    stageUnavailableSourcePackBackoff(
+      bucketNumber,
+      bucketState,
+      priorTarget,
+      correctionRecord?.id || incidentId,
+      {
+        incrementCount: false,
+        preserveRetryNotBefore: bucketState.sourcePackRetryNotBefore,
+      },
+    );
+    bucketState.lastAction = `recovered-false-boundary-advance:pack-${priorTarget}:${incidentId}`;
+    recovered = true;
+    log(`B${bucket}: restored falsely advanced source-pack target to ${priorFilename}; trusted consumed frontier=${trustedConsumed ?? 'unknown'}`);
+  }
+  if (recovered) saveState();
+  return recovered;
+}
+
+function recoverStaleSourcePackBoundaryState() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (bucketState.complete) continue;
+    if (bucketState.sourcePackResumePending) continue;
+    if (bucketHasUnresolvedAwaitingAction(bucketState)) continue;
+
+    const staleGenerating = String(bucketState.lastAction || '').startsWith('generating:');
+    const actionScopedBoundary = Boolean(
+      bucketState.lastProcessedActionId
+      && bucketState.processedResponseKey
+      && String(bucketState.processedResponseKey).startsWith(`${bucketState.lastProcessedActionId}:`)
+      && String(bucketState.lastProcessedStatus || '').toUpperCase() === 'NORMAL'
+      && String(bucketState.lastProcessedBlocker || '').trim().toUpperCase() === 'NEXT_SOURCE_PACKS_REQUIRED'
+      && bucketState.sourcePackBoundaryResponsePreview,
+    );
+    if (!actionScopedBoundary) continue;
+
+    const incidentId = bucketState.sourcePackResumeIncidentId
+      || bucketState.sourcePackLastDeliveredIncidentId;
+    const incidentRecord = incidentId
+      ? Object.values(state.incidents).find(entry => entry.id === incidentId)
+      : null;
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    const responseText = bucketState.sourcePackBoundaryResponsePreview
+      || bucketState.lastMessageReceivedPreview
+      || null;
+    const previousFilename = bucketState.sourcePackTargetFilename
+      || sourcePackFilename(bucketState.sourcePackTargetNumber, Number(bucket));
+    const advanced = advanceSourcePackAfterBoundary(Number(bucket), bucketState, {
+      incidentId,
+      incident,
+      responseText,
+    });
+    if (!advanced.ok) {
+      if (staleGenerating) {
+        const actionFromLast = String(bucketState.lastAction).slice('generating:'.length);
+        bucketState.lastAction = `processed:${actionFromLast}:source-pack-boundary-unresolved:${advanced.reason}`;
+        recovered = true;
+      }
+      continue;
+    }
+
+    bucketState.lastAction = `recovered-source-pack-boundary:pack-${advanced.nextPack}`;
+    recovered = true;
+    recordSourcePackTransition(state, bucket, {
+      fromPack: previousFilename,
+      toPack: advanced.nextFilename,
+    });
+    recordActivityEvent(state, {
+      bucket,
+      kind: 'SOURCE_PACK_BOUNDARY',
+      summary: `recovered stale boundary ${previousFilename || 'unknown'} → ${advanced.nextFilename}`,
+    });
+    log(`B${bucket}: advanced source-pack target from ${previousFilename} to ${advanced.nextFilename} during stale-boundary recovery`);
+  }
+  if (recovered) saveState();
+}
+
+async function recoverInvalidSourcePackCursors(context) {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    const bucketNumber = Number(bucket);
+    const hadInvalid = sanitizeStoredSourcePackCursorFields(bucketNumber, bucketState)
+      || isInvalidZeroSourcePackFilename(bucketState.sourcePackTargetFilename)
+      || bucketState.sourcePackTargetNumber === 0
+      || bucketState.sourcePackLastDeliveredNumber === 0;
+
+    if (hadInvalid) {
+      if (bucketState.sourcePackLastDeliveredNumber === 0
+        || isInvalidZeroSourcePackFilename(sourcePackFilename(bucketState.sourcePackLastDeliveredNumber, bucketNumber))) {
+        bucketState.sourcePackLastDeliveredNumber = null;
+        bucketState.sourcePackLastDeliveredIncidentId = null;
+        bucketState.sourcePackLastDeliveredAt = null;
+        bucketState.sourcePackLastDeliveredActionId = null;
+      }
+      if (String(bucketState.lastMessageSentKind || '') === 'SOURCE_PACK_CONTINUE'
+        && (bucketState.sourcePackTargetNumber === 0 || isInvalidZeroSourcePackFilename(bucketState.sourcePackTargetFilename))) {
+        bucketState.awaitingResponseAt = null;
+        bucketState.awaitingActionId = null;
+      }
+    }
+
+    if (!hadInvalid && isValidSourcePackNumber(bucketNumber, bucketState.sourcePackTargetNumber)) continue;
+
+    let responseText = bucketState.sourcePackBoundaryResponsePreview || null;
+    if (!responseText && bucketState.chatUrl && context) {
+      try {
+        const page = await ensurePage(context, bucketState);
+        if (page) {
+          const messages = await readVisibleMessages(page);
+          responseText = messages
+            .filter(message => message.role === 'assistant')
+            .map(message => message.text)
+            .join('\n');
+        }
+      } catch {}
+    }
+
+    const incidentId = bucketState.sourcePackResumeIncidentId;
+    const incidentRecord = incidentId
+      ? Object.values(state.incidents).find(entry => entry.id === incidentId)
+      : null;
+    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+
+    const resolved = resolveNextSourcePackTargetNumber(bucketNumber, {
+      bucketState,
+      incident,
+      incidentId,
+      responseText,
+    });
+
+    if (!isValidSourcePackNumber(bucketNumber, resolved.targetNumber)) {
+      if (hadInvalid) {
+        bucketState.sourcePackResumePending = false;
+        bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+        bucketState.lastAction = `source-pack-cursor-unresolved:${resolved.reason}`;
+        log(`B${bucket}: rejected invalid source-pack cursor; could not resolve exact next pack (${resolved.reason})`);
+        recovered = true;
+      }
+      continue;
+    }
+
+    if (bucketState.sourcePackTargetNumber === resolved.targetNumber
+      && bucketState.sourcePackTargetFilename === sourcePackFilename(resolved.targetNumber, bucketNumber)) {
+      if (hadInvalid) recovered = true;
+      continue;
+    }
+
+    applyResolvedSourcePackTarget(bucketNumber, bucketState, resolved, incidentId);
+    bucketState.sourcePackResumePending = true;
+    bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    resetSourcePackAccessState(bucketState);
+    bucketState.lastAction = `source-pack-cursor-recovered:${resolved.reason}:pack-${resolved.targetNumber}`;
+    log(`B${bucket}: recovered invalid source-pack cursor to pack_${String(resolved.targetNumber).padStart(6, '0')}.jsonl (${resolved.reason})`);
+    recovered = true;
+  }
+  if (recovered) saveState();
+  return recovered;
+}
+
+function stageRecoverableSourcePackHold(bucket, bucketState, incidentId, incident, reasonPrefix) {
+  sanitizeStoredSourcePackCursorFields(Number(bucket), bucketState);
+  const resolved = resolveNextSourcePackTargetNumber(Number(bucket), {
+    bucketState,
+    incident,
+    incidentId,
+  });
+  if (!isValidSourcePackNumber(Number(bucket), resolved.targetNumber)) {
+    bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+    bucketState.lastAction = `${reasonPrefix}-source-pack-cursor-unresolved:${incidentId}:${resolved.reason}`;
+    bucketState.sourcePackResumePending = false;
+    return false;
+  }
+
+  bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+  bucketState.lastAction = `${reasonPrefix}-source-pack-recovery:${incidentId}:pack-${resolved.targetNumber}`;
+  bucketState.processedHash = null;
+  bucketState.candidateHash = null;
+  bucketState.candidateCount = 0;
+  bucketState.awaitingResponseAt = null;
+  bucketState.awaitingActionId = null;
+  bucketState.responseBaselineHash = null;
+  bucketState.transientFailures = 0;
+  bucketState.sourcePackResumePending = true;
+  applyResolvedSourcePackTarget(Number(bucket), bucketState, resolved, incidentId);
+  resetSourcePackAccessState(bucketState);
+  return true;
+}
+
+function recoverRecoverableHoldForScheduling(bucket, bucketState) {
+  if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) return false;
+  const incidentId = String(bucketState.lastAction).slice('incident:'.length);
+  const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+  const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+  if (!isRecoverableSourcePackHoldIncident(incident, bucketState)) return false;
+  if (!stageRecoverableSourcePackHold(bucket, bucketState, incidentId, incident, 'scheduler')) return false;
+  log(`B${bucket}: staged recoverable source-pack hold for scheduling; incident preserved ${incidentId}`);
+  return true;
+}
+
+function recoverRecoverableHoldsForScheduling() {
+  let recovered = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (recoverRecoverableHoldForScheduling(bucket, bucketState)) recovered = true;
+  }
+  if (recovered) saveState();
+}
+
+async function reconcileStaleGenerationReservations(context) {
+  let changed = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    const staleGeneratingLastAction = String(bucketState.lastAction || '').startsWith('generating');
+    if (!bucketHasGenerationReservation(bucketState) && !staleGeneratingLastAction) continue;
+
+    let isGen = false;
+    if (bucketState.chatUrl) {
+      try {
+        const page = await ensurePage(context, bucketState);
+        isGen = page ? await isGenerating(page) : false;
+      } catch (error) {
+        if (isSchedulingBlockedBucket(bucket)) {
+          isGen = false;
+          log(`B${bucket}: could not inspect blocked bucket generation state; treating as not generating (${error.message || error})`);
+        }
+      }
+    }
+
+    const stall = turnStallReason(bucketState);
+    if (!shouldClearStaleGenerationReservation({ bucketState, isGenerating: isGen, stallReason: stall })) continue;
+
+    bucketState.awaitingResponseAt = null;
+    bucketState.awaitingActionId = null;
+    bucketState.responseBaselineHash = null;
+    bucketState.generationSeenSinceAction = false;
+    bucketState.generationObservedAt = null;
+    if (String(bucketState.lastAction || '').startsWith('generating')) {
+      bucketState.lastAction = isSchedulingBlockedBucket(bucket)
+        ? 'blocked-stale-generation-cleared'
+        : 'stale-generation-cleared';
+    }
+    changed = true;
+    log(`B${bucket}: cleared stale generation reservation`);
+  }
+  if (changed) saveState();
+}
+
+async function attemptActivateReviewerSlot(context, bucket, liveGeneratingByBucket) {
+  if (isSchedulingBlockedBucket(bucket)) {
+    return { activated: false, reason: 'scheduling-blocked' };
+  }
+
+  const bucketState = bucketStateFor(bucket);
+  if (!bucketIsUnfinished(bucketState)) {
+    return { activated: false, reason: 'missing-or-complete' };
+  }
+  if (bucketBlocksCandidateActivation(bucketState)) {
+    return { activated: false, reason: 'awaiting-unresolved-action' };
+  }
+  if (bucketUsesLiveReviewerSlot(bucket, liveGeneratingByBucket)) {
+    return { activated: false, reason: 'already-occupies-live-slot' };
+  }
+
+  if (bucketState.phase === 'HOLD') {
+    return { activated: false, reason: 'hold-not-recoverable' };
+  }
+
+  if (bucketState.writeRecoveryResumePending && bucketState.chatUrl) {
+    if (bucketState.phase === 'SETUP_WAIT'
+      && (!bucketState.setupVerified
+        || String(bucketState.setupVerifiedChatId || '') !== String(bucketState.chatId || ''))) {
+      return { activated: false, reason: 'write-recovery-waiting-for-setup-ack' };
+    }
+    const recovery = recoverableWriteIncidentById(bucket, bucketState.writeRecoveryIncidentId)
+      || latestRecoverableWriteIncident(bucket);
+    if (!recovery) {
+      return { activated: false, reason: 'write-recovery-incident-invalid' };
+    }
+    const page = await ensurePage(context, bucketState);
+    if (!page || isAuthenticationPage(page)) {
+      return { activated: false, reason: 'write-recovery-chat-unavailable' };
+    }
+    if (await isGenerating(page)) {
+      return { activated: false, reason: 'write-recovery-chat-generating' };
+    }
+    const latestAssistant = await latestMessage(page, 'assistant');
+    const responseHash = latestAssistant ? sha16(latestAssistant) : (bucketState.processedHash || bucketState.lastHash || '');
+    const interruptedActionId = bucketState.writeRecoveryInterruptedActionId;
+    await sendAction(
+      page,
+      Number(bucket),
+      'WRITE_RECOVERY',
+      interruptedActionId
+        ? interruptedWriteRecoveryPrompt(Number(bucket), recovery.footer, interruptedActionId)
+        : partialWriteRecoveryPrompt(Number(bucket), recovery.footer),
+      responseHash,
+    );
+    bucketState.writeRecoveryResumePending = false;
+    bucketState.writeRecoveryIncidentId = null;
+    bucketState.writeRecoveryInterruptedActionId = null;
+    bucketState.phase = 'ACTIVE';
+    bucketState.lastAction = `write-recovery-dispatched-after-rollover:${recovery.record.id}`;
+    saveState();
+    return { activated: true, method: 'resume-interrupted-write-recovery' };
+  }
+
+  if (bucketState.advisoryAnomalyResumePending && bucketState.chatUrl) {
+    if (bucketState.phase === 'SETUP_WAIT'
+      && (!bucketState.setupVerified
+        || String(bucketState.setupVerifiedChatId || '') !== String(bucketState.chatId || ''))) {
+      return { activated: false, reason: 'advisory-anomaly-waiting-for-setup-ack' };
+    }
+    const page = await ensurePage(context, bucketState);
+    if (!page || isAuthenticationPage(page)) {
+      return { activated: false, reason: 'advisory-anomaly-chat-unavailable' };
+    }
+    if (await isGenerating(page)) {
+      return { activated: false, reason: 'advisory-anomaly-chat-generating' };
+    }
+    const latestAssistant = await latestMessage(page, 'assistant');
+    const responseHash = latestAssistant ? sha16(latestAssistant) : (bucketState.processedHash || bucketState.lastHash || '');
+    const interruptedActionId = bucketState.advisoryAnomalyInterruptedActionId;
+    await sendAction(
+      page,
+      Number(bucket),
+      'ISOLATED_ANOMALY_CONTINUE',
+      interruptedActionId
+        ? `The prior ISOLATED_ANOMALY_CONTINUE action ${interruptedActionId} began generating but its browser/session connection was interrupted before an attributable assistant response completed. Reconcile the authoritative registry first and do not assume the interrupted attempt made no writes. ${isolatedAnomalyContinuationPrompt(Number(bucket))}`
+        : isolatedAnomalyContinuationPrompt(Number(bucket)),
+      responseHash,
+    );
+    bucketState.advisoryAnomalyResumePending = false;
+    bucketState.advisoryAnomalyInterruptedActionId = null;
+    bucketState.phase = 'ACTIVE';
+    bucketState.lastAction = 'isolated-anomaly-continuation-dispatched-after-rollover';
+    saveState();
+    return { activated: true, method: 'resume-interrupted-advisory-anomaly' };
+  }
+
+  if (bucketState.phase === 'SETUP_WAIT'
+    && bucketState.setupVerified
+    && String(bucketState.setupVerifiedChatId || '') === String(bucketState.chatId || '')
+    && !bucketState.awaitingActionId
+    && !bucketState.awaitingResponseAt
+    && bucketState.chatUrl) {
+    if (bucketState.sourcePackResumePending) {
+      return { activated: false, reason: 'setup-awaiting-source-pack-continuation' };
+    }
+    const page = await ensurePage(context, bucketState);
+    if (!page || isAuthenticationPage(page)) {
+      return { activated: false, reason: 'setup-chat-unavailable' };
+    }
+    if (await isGenerating(page)) {
+      return { activated: false, reason: 'setup-chat-generating' };
+    }
+    await sendAction(page, Number(bucket), 'INITIAL_AUDIT', initialAuditPrompt(Number(bucket)), bucketState.processedHash || '');
+    bucketState.phase = 'ACTIVE';
+    bucketState.lastAction = 'initial-audit-sent-after-setup-recovery';
+    saveState();
+    return { activated: true, method: 'verified-setup-initial-audit' };
+  }
+
+  if (bucketState.phase === 'PAUSED' && bucketState.chatUrl) {
+    if (bucketState.sourcePackResumePending) {
+      return { activated: false, reason: 'awaiting-source-pack-continuation' };
+    }
+    const advisoryRecoveryPrefix = 'startup-advisory-anomaly-recovery:';
+    if (String(bucketState.lastAction || '').startsWith(advisoryRecoveryPrefix)) {
+      const incidentId = String(bucketState.lastAction).slice(advisoryRecoveryPrefix.length);
+      const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+      const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+      const footer = incident?.footer;
+      if (incident?.kind !== 'REVIEWER_ERROR_FOOTER'
+        || !isRecoverableAdvisoryCoordinatorFooter(footer)) {
+        return { activated: false, reason: 'advisory-recovery-incident-invalid' };
+      }
+
+      const page = await ensurePage(context, bucketState);
+      if (!page || isAuthenticationPage(page)) {
+        return { activated: false, reason: 'advisory-recovery-chat-unavailable' };
+      }
+      if (await isGenerating(page)) {
+        return { activated: false, reason: 'advisory-recovery-chat-generating' };
+      }
+
+      const latestAssistant = await latestMessage(page, 'assistant');
+      const responseHash = latestAssistant ? sha16(latestAssistant) : (bucketState.lastHash || '');
+      await sendAction(
+        page,
+        Number(bucket),
+        'ISOLATED_ANOMALY_CONTINUE',
+        isolatedAnomalyContinuationPrompt(Number(bucket)),
+        responseHash,
+      );
+      bucketState.phase = 'ACTIVE';
+      bucketState.lastAction = 'isolated-anomaly-continuation-after-hold:' + incidentId;
+      saveState();
+      return { activated: true, method: 'recover-advisory-anomaly-hold' };
+    }
+    const partialWriteRecoveryPrefix = 'startup-partial-write-recovery:';
+    if (String(bucketState.lastAction || '').startsWith(partialWriteRecoveryPrefix)) {
+      const incidentId = String(bucketState.lastAction).slice(partialWriteRecoveryPrefix.length);
+      const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
+      const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+      const footer = incident?.footer;
+      if (incident?.kind !== 'REVIEWER_ERROR_FOOTER'
+        || !(isRecoverableReadbackFooter(footer) || isRecoverableRegistryWriteFooter(footer))) {
+        return { activated: false, reason: 'write-recovery-incident-invalid' };
+      }
+
+      const page = await ensurePage(context, bucketState);
+      if (!page || isAuthenticationPage(page)) {
+        return { activated: false, reason: 'write-recovery-chat-unavailable' };
+      }
+      if (await isGenerating(page)) {
+        return { activated: false, reason: 'write-recovery-chat-generating' };
+      }
+
+      const latestAssistant = await latestMessage(page, 'assistant');
+      const responseHash = latestAssistant ? sha16(latestAssistant) : (bucketState.processedHash || bucketState.lastHash || '');
+      await sendAction(
+        page,
+        Number(bucket),
+        'WRITE_RECOVERY',
+        partialWriteRecoveryPrompt(Number(bucket), footer),
+        responseHash,
+      );
+      bucketState.phase = 'ACTIVE';
+      bucketState.lastAction = `write-recovery-dispatched-after-hold:${incidentId}`;
+      saveState();
+      return { activated: true, method: 'recover-partial-write-hold' };
+    }
+    bucketState.phase = 'ACTIVE';
+    bucketState.lastAction = 'resumed-from-reviewer-cap';
+    saveState();
+    return { activated: true, method: 'resume-paused' };
+  }
+
+  if (bucketNeedsReviewer(bucketState)) {
+    try {
+      await createReviewer(context, Number(bucket));
+      const updated = bucketStateFor(bucket);
+      if (updated?.chatUrl) return { activated: true, method: 'create-reviewer' };
+      return { activated: false, reason: 'create-reviewer-no-chat' };
+    } catch (error) {
+      if (error.code === 'CONTROL_PAUSED' || error.code === 'CONTROL_STOPPED') throw error;
+      return { activated: false, reason: error.message || String(error) };
+    }
+  }
+
+  return { activated: false, reason: 'not-eligible' };
+}
+
+async function fillReviewerSlots(context) {
+  if (readControl().desiredState !== 'RUNNING') return;
+
+  let liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
+  await reconcileOutstandingResponses(context, liveGeneratingByBucket);
+  liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
+  await reconcileStaleGenerationReservations(context);
+  await recoverSetupAckHolds(context);
+  await recoverLegacyPromotedSetupWaitStates(context);
+  recoverRecoverableHoldsForScheduling();
+  rebalanceExistingReviewerSlots();
+
+  let occupancy = refreshLiveReviewerOccupancy(liveGeneratingByBucket);
+  while (occupancy.availableSlots > 0) {
+    const writeRecoveryCandidates = Object.entries(state.buckets)
+      .filter(([bucket, bucketState]) => (
+        !isSchedulingBlockedBucket(bucket)
+        && !bucketState.complete
+        && bucketState.phase !== 'HOLD'
+        && bucketState.writeRecoveryResumePending
+        && Boolean(bucketState.chatUrl)
+        && !bucketBlocksCandidateActivation(bucketState)
+        && (bucketState.phase !== 'SETUP_WAIT'
+          || (bucketState.setupVerified
+            && String(bucketState.setupVerifiedChatId || '') === String(bucketState.chatId || '')))
+      ))
+      .sort((a, b) => Number(a[0]) - Number(b[0]))
+      .map(([bucket]) => bucket);
+    const setupReadyCandidates = Object.entries(state.buckets)
+      .filter(([bucket, bucketState]) => (
+        !isSchedulingBlockedBucket(bucket)
+        && bucketState.phase === 'SETUP_WAIT'
+        && bucketState.setupVerified
+        && String(bucketState.setupVerifiedChatId || '') === String(bucketState.chatId || '')
+        && !bucketBlocksCandidateActivation(bucketState)
+        && Boolean(bucketState.chatUrl)
+      ))
+      .sort((a, b) => Number(a[0]) - Number(b[0]))
+      .map(([bucket]) => bucket);
+    const regularCandidates = selectReviewerSlotCandidates(state.buckets, SCHEDULING_BLOCKED_BUCKETS);
+    const candidates = [
+      ...writeRecoveryCandidates,
+      ...setupReadyCandidates.filter(bucket => !writeRecoveryCandidates.includes(bucket)),
+      ...regularCandidates.filter(bucket => (
+        !writeRecoveryCandidates.includes(bucket) && !setupReadyCandidates.includes(bucket)
+      )),
+    ];
+    if (!candidates.length) break;
+
+    let progressed = false;
+    for (const bucket of candidates) {
+      liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
+      occupancy = refreshLiveReviewerOccupancy(liveGeneratingByBucket);
+      if (occupancy.availableSlots <= 0) break;
+      if (bucketUsesLiveReviewerSlot(bucket, liveGeneratingByBucket)) continue;
+
+      const result = await attemptActivateReviewerSlot(context, bucket, liveGeneratingByBucket);
+      if (result.activated) {
+        liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
+        occupancy = refreshLiveReviewerOccupancy(liveGeneratingByBucket);
+        progressed = true;
+        log(`B${bucket}: reviewer slot activation (${result.method})`);
+        await sleep(500);
+        break;
+      }
+      log(`B${bucket}: reviewer slot activation skipped (${result.reason})`);
+    }
+    if (!progressed) break;
+  }
+}
+
+function allBucketsComplete() {
+  return Object.values(state.buckets).every(bucket => bucket.complete);
+}
+
+function latestBucketEvent(field) {
+  const entries = Object.entries(state.buckets)
+    .map(([bucket, value]) => ({ bucket: Number(bucket), value, at: value[field] }))
+    .filter(entry => entry.at && Number.isFinite(Date.parse(entry.at)))
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  return entries[0] || null;
+}
+
+function statusMetrics() {
+  const processed = Number(state.metrics.casesReported || 0);
+  const population = Number(config.auditablePopulation || 0);
+  const remaining = Math.max(0, population - processed);
+  const elapsedWorkingMs = workingElapsedMs();
+  const ratePerHour = elapsedWorkingMs > 0 ? processed / (elapsedWorkingMs / 3600000) : 0;
+  const etaSeconds = remaining === 0 ? 0 : ratePerHour > 0 ? Math.ceil(remaining / ratePerHour * 3600) : null;
+  const received = latestBucketEvent('lastMessageReceivedAt');
+  const sent = latestBucketEvent('lastMessageSentAt');
+
+  return {
+    auditablePopulation: population,
+    casesProcessed: processed,
+    casesRemaining: remaining,
+    casesProcessedExact: false,
+    progressBasis: state.metrics.progressBasis,
+    workingElapsedMs: elapsedWorkingMs,
+    processingRatePerHour: Number(ratePerHour.toFixed(2)),
+    etaSeconds,
+    lastProgressAt: state.metrics.lastProgressAt || null,
+    lastMessageReceived: received ? {
+      bucket: received.bucket,
+      at: received.at,
+      preview: received.value.lastMessageReceivedPreview || null,
+    } : null,
+    lastMessageSent: sent ? {
+      bucket: sent.bucket,
+      at: sent.at,
+      kind: sent.value.lastMessageSentKind || null,
+      actionId: sent.value.lastMessageSentActionId || null,
+    } : null,
+  };
+}
+
+function writeStatus(extra = {}) {
+  const control = readControl();
+  const metrics = statusMetrics();
+  const operations = buildOperationsStatus({
+    state,
+    occupancy: lastLiveReviewerOccupancy,
+    liveGeneratingByBucket: lastLiveGeneratingByBucket,
+    excludedBuckets: SCHEDULING_BLOCKED_BUCKETS,
+    maxActive: MAX_ACTIVE_REVIEWERS,
+    bucketCount: config.bucketCount,
+    auditablePopulation: config.auditablePopulation,
+    graceMs: dispatchStartGraceMs(),
+  });
+  const status = {
+    updatedAt: now(),
+    connected: true,
+    runState: control.desiredState === 'RUNNING' ? state.runState : control.desiredState,
+    controllerState: state.runState,
+    control,
+    maxActiveReviewers: MAX_ACTIVE_REVIEWERS,
+    maxReviewerGenerations: operations.maxReviewerGenerations,
+    liveReviewerGenerations: operations.liveReviewerGenerations,
+    productiveReviewerCount: operations.productiveReviewerCount,
+    substantiveAuditGenerations: operations.substantiveAuditGenerations,
+    schedulingBlockedBuckets: Array.from(SCHEDULING_BLOCKED_BUCKETS).sort((a, b) => a - b),
+    activeReviewers: operations.liveReviewerGenerations,
+    scheduledReviewers: lastLiveReviewerOccupancy.scheduledReviewers,
+    liveGeneratingBuckets: operations.liveGeneratingBuckets,
+    dispatchStartBuckets: lastLiveReviewerOccupancy.dispatchStartBuckets,
+    availableReviewerSlots: operations.availableReviewerSlots,
+    desiredActiveReviewers: operations.desiredLiveReviewers,
+    desiredLiveReviewers: operations.desiredLiveReviewers,
+    schedulerUnderutilized: operations.schedulerUnderutilized,
+    idleReviewerCapacity: operations.idleReviewerCapacity,
+    idleCapacityReason: operations.idleCapacityReason,
+    progressingBuckets5m: operations.progressingBuckets5m,
+    progressingBuckets15m: operations.progressingBuckets15m,
+    progressingBuckets60m: operations.progressingBuckets60m,
+    newCasesLast5m: operations.newCasesLast5m,
+    newCasesLast15m: operations.newCasesLast15m,
+    newCasesLast60m: operations.newCasesLast60m,
+    verifiedWritesLast5m: operations.verifiedWritesLast5m,
+    verifiedWritesLast15m: operations.verifiedWritesLast15m,
+    verifiedWritesLast60m: operations.verifiedWritesLast60m,
+    lastGlobalProgressAt: operations.lastGlobalProgressAt,
+    minutesSinceLastGlobalProgress: operations.minutesSinceLastGlobalProgress,
+    casesProcessedTotal: operations.casesProcessedTotal,
+    casesRemainingEstimate: operations.casesRemainingEstimate,
+    pendingBuckets: Object.entries(state.buckets)
+      .filter(([bucket, value]) => !isSchedulingBlockedBucket(bucket) && !value.complete && !value.chatUrl && value.phase !== 'HOLD')
+      .map(([bucket]) => Number(bucket)),
+    heldBuckets: Object.entries(state.buckets)
+      .filter(([, bucket]) => bucket.phase === 'HOLD')
+      .map(([bucket]) => Number(bucket)),
+    pausedBuckets: Object.entries(state.buckets)
+      .filter(([, bucket]) => bucket.phase === 'PAUSED')
+      .map(([bucket]) => Number(bucket)),
+    buckets: Object.fromEntries(
+      Object.entries(state.buckets).map(([bucket, value]) => {
+        const ops = operations.buckets[bucket] || {};
+        return [
+          bucket,
+          {
+            schedulingBlocked: isSchedulingBlockedBucket(bucket),
+            complete: value.complete,
+            phase: value.phase,
+            operationalState: ops.operationalState || null,
+            workflowPhase: value.phase,
+            liveGeneration: ops.liveGeneration ?? false,
+            chatId: value.chatId,
+            chatUrl: value.chatUrl,
+            lastSeen: value.lastSeen,
+            lastAction: value.lastAction,
+            currentActionId: ops.currentActionId || value.awaitingActionId || value.lastMessageSentActionId || null,
+            currentActionType: ops.currentActionType || value.lastMessageSentKind || null,
+            currentSourcePack: ops.currentSourcePack || null,
+            lastConsumedSourcePack: ops.lastConsumedSourcePack || null,
+            nextStagedSourcePack: ops.nextStagedSourcePack || null,
+            sourcePackResumePending: ops.sourcePackResumePending ?? Boolean(value.sourcePackResumePending),
+            sourcePackAccessVerified: ops.sourcePackAccessVerified ?? Boolean(value.sourcePackAccessVerified),
+            lastProgressAt: ops.lastProgressAt || value.lastProgressAt || null,
+            minutesSinceLastProgress: ops.minutesSinceLastProgress ?? null,
+            lastProgressNewCases: ops.lastProgressNewCases ?? value.lastProgressNewCases ?? null,
+            recentCases15m: ops.recentCases15m ?? 0,
+            recentCases60m: ops.recentCases60m ?? 0,
+            awaitingResponse: ops.awaitingResponse ?? Boolean(value.awaitingActionId && value.awaitingResponseAt),
+            exactBlocker: ops.exactBlocker || null,
+            awaitingResponseAt: value.awaitingResponseAt,
+            awaitingActionId: value.awaitingActionId,
+            casesReported: Number(value.casesReported || 0),
+            casesSinceChatStart: Number(value.casesSinceChatStart || 0),
+            lastMessageReceivedAt: value.lastMessageReceivedAt,
+            lastMessageReceivedPreview: value.lastMessageReceivedPreview,
+            lastMessageSentAt: value.lastMessageSentAt,
+            lastMessageSentKind: value.lastMessageSentKind,
+            lastMessageSentActionId: value.lastMessageSentActionId,
+            lastResponseLatencyMs: value.lastResponseLatencyMs,
+            minutesSinceActionSent: ops.minutesSinceActionSent ?? null,
+            minutesSinceGenerationObserved: ops.minutesSinceGenerationObserved ?? null,
+            visibilityClass: ops.visibilityClass || 'normal',
+          },
+        ];
+      }),
+    ),
+    metrics: {
+      ...metrics,
+      casesProcessedTotal: operations.casesProcessedTotal,
+      newCasesLast5m: operations.newCasesLast5m,
+      newCasesLast15m: operations.newCasesLast15m,
+      newCasesLast60m: operations.newCasesLast60m,
+      lastGlobalProgressAt: operations.lastGlobalProgressAt,
+      minutesSinceLastGlobalProgress: operations.minutesSinceLastGlobalProgress,
+    },
+    operations,
+    recentActivity: operations.recentActivity,
+    coordinator: loadJson(COORDINATOR_STATUS_PATH, null),
+    ...extra,
+  };
+  saveJsonAtomic(STATUS_PATH, status);
+}
+
+async function connectBrowserWithRetry() {
+  const endpoint = `http://127.0.0.1:${config.cdpPort}`;
+  const maxAttempts = 4;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      writeStatus({ connected: false, connecting: true, cdpAttempt: attempt });
+      log(`connecting to Chrome CDP on ${config.cdpPort} (attempt ${attempt}/${maxAttempts})`);
+      const browser = await chromium.connectOverCDP(endpoint, { timeout: 10000 });
+      writeStatus({ connected: true, connecting: false, cdpAttempt: attempt });
+      return browser;
+    } catch (error) {
+      lastError = error;
+      log(`Chrome CDP connection attempt ${attempt}/${maxAttempts} failed: ${error.message || error}`);
+      writeStatus({
+        connected: false,
+        connecting: attempt < maxAttempts,
+        cdpAttempt: attempt,
+        cdpError: error.message || String(error),
+      });
+      if (attempt < maxAttempts) await sleep(5000);
+    }
+  }
+
+  throw lastError || new Error('Chrome CDP connection failed');
+}
+
+function isBrowserDisconnectedError(error) {
+  const text = String(error?.stack || error?.message || error || '');
+  return /browser|context|target page|CDP/i.test(text)
+    && /closed|disconnect|timeout|target|ECONNREFUSED|ECONNRESET|ETIMEDOUT/i.test(text);
+}
+
+async function main() {
+  recoverInvalidLegacyChatRehydration();
+  recoverTimeoutHolds();
+  recoverReviewerStallHolds();
+  recoverLegacyInterruptedWriteRecoveryRollovers();
+  recoverLegacyInterruptedAdvisoryAnomalyRollovers();
+  recoverUnavailableSourcePackHolds();
+  recoverRetryableNewChatHolds();
+  recoverRetryablePartialWriteHolds();
+  recoverRetryableExactPackHolds();
+  recoverAdvisoryCoordinatorHolds();
+  recoverRetryableTurnBoundaryHolds();
+  recoverSourcePackHolds();
+  recoverFalseSourcePackBoundaryAdvances();
+  recoverStaleAwaitingReviewers();
+  recoverStaleSourcePackBoundaryState();
+  resetSetupWaitObservationState();
+  recoverLostAwaitingState();
+  saveState();
+  log(`controller v6 starting; maxActiveReviewers=${MAX_ACTIVE_REVIEWERS}; auditablePopulation=${config.auditablePopulation}`);
+  writeStatus({ connected: false, starting: true });
+  let browser = null;
+  let context = null;
+
+  while (true) {
+    const control = syncControlState();
+    if (control.desiredState === 'STOPPED') {
+      writeStatus({ connected: false, stopped: true, allComplete: allBucketsComplete() });
+      log('controller stopped by operator control');
+      return;
+    }
+    if (control.desiredState === 'PAUSED') {
+      writeStatus({ paused: true, allComplete: allBucketsComplete() });
+      await sleep(Number(config.pollSeconds) * 1000);
+      continue;
+    }
+
+    try {
+      if (!browser || !browser.isConnected() || !context) {
+        browser = await connectBrowserWithRetry();
+        context = browser.contexts()[0];
+        if (!context) throw new Error('Chrome CDP connected but no browser context exists');
+      }
+
+      recoverLostAwaitingState();
+      recoverSourcePackHolds();
+      recoverFalseSourcePackBoundaryAdvances();
+      recoverRecoverableHoldsForScheduling();
+      recoverStaleAwaitingReviewers();
+      recoverStaleSourcePackBoundaryState();
+      let liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
+      await reconcileOutstandingResponses(context, liveGeneratingByBucket);
+      liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
+      refreshLiveReviewerOccupancy(liveGeneratingByBucket);
+      await recoverInvalidSourcePackCursors(context);
+      ensureCoordinatorWakeProgress();
+      await sendPendingSourcePackContinuations(context);
+      await fillReviewerSlots(context);
+
+      for (let bucket = 0; bucket < Number(config.bucketCount); bucket += 1) {
+        await processBucket(context, bucket);
+      }
+
+      await sendPendingSourcePackContinuations(context);
+      liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
+      refreshLiveReviewerOccupancy(liveGeneratingByBucket);
+      await fillReviewerSlots(context);
+
+      if (allBucketsComplete()) {
+        if (!state.completedAt) {
+          state.completedAt = now();
+          saveState();
+          log('ALL BUCKETS COMPLETE');
+        }
+        writeStatus({ allComplete: true });
+      } else {
+        writeStatus({ allComplete: false });
+      }
+    } catch (error) {
+      if (!isBrowserDisconnectedError(error)) throw error;
+      log(`browser connection lost; reconnecting: ${error.message || error}`);
+      recordIncident(
+        'BROWSER_DISCONNECTED',
+        null,
+        'browser or page connection closed; controller will retry',
+        { lastError: error.message || String(error), stack: error.stack || null },
+      );
+      writeStatus({ connected: false, reconnecting: true, browserError: error.message || String(error) });
+      browser = null;
+      context = null;
+      await sleep(5000);
+      continue;
+    }
+
+    await sleep(Number(config.pollSeconds) * 1000);
+  }
+}
+
+main().then(() => {
+  process.exit(0);
+}).catch(error => {
+  try {
+    log(`FATAL ${error.stack || error}`);
+    recordIncident('CONTROLLER_FATAL', null, error.message || String(error), { stack: error.stack || null });
+    writeStatus({ connected: false, fatal: error.message || String(error) });
+  } catch {}
+  process.exit(1);
+});
