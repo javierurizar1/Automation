@@ -16,6 +16,10 @@ OWNED_PENDING_CASES: 0
 
 Bucket 0 owned **11,046** finalized IDs and all were terminalized. Existing anomalous/disputed terminal rows were preserved rather than rewritten. This is the strongest recovered evidence that B0 was complete as of September 18.
 
+### Bucket 1
+
+The exact next-pack work repeatedly referenced `pack_000217.jsonl` in shard 1 (`1Iuk_HValMXjtkEMjLSX1qf0J-e8u0jTH`). The controller incident record also ties this pack to action `A-a99ac408f013af1f`. Treat pack 217 as the latest recoverable B1 target unless the live registry/controller state proves it has since advanced.
+
 ### Bucket 2
 
 A recovery turn verified pack 111 rows 5860–5909 without repair. A subsequent continuation found `pack_000134.jsonl` partially terminalized and resumed at case 26.
