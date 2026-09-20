@@ -1,6 +1,6 @@
 {
-  "recordedAtUtc": "2026-09-20T02:35:22Z",
-  "sourceRevision": "4ea43accfd3fae13986457c6fbb7b7133f2586b8",
+  "recordedAtUtc": "2026-09-20T02:58:39Z",
+  "sourceRevision": "de2f39ef5a8b65ef653e6c0223cf00de89409c14",
   "policy": {
     "maxConcurrentGenerations": 2,
     "maxManagedBucketChats": 5,
@@ -22,12 +22,25 @@
     "managedBucketChats": 5,
     "maxConcurrentGenerations": 2,
     "liveGenerationsAtCapture": 1,
-    "freshAuditDispatch": {
-      "kind": "INITIAL_AUDIT",
+    "writeRecovery": {
+      "kind": "WRITE_RECOVERY",
       "model": "GPT-5.6 Sol",
       "reasoningEffort": "High",
-      "generationActiveAtCapture": true,
-      "caseProgressObservedAtCapture": false
+      "recoveryCompleted": true,
+      "holdCleared": true,
+      "registryReadback": "flagged range present and reviewed; case content excluded",
+      "newCaseWritesDuringRecovery": 0
+    },
+    "activeWork": {
+      "bucket": "3",
+      "kind": "CONTINUE",
+      "model": "GPT-5.6 Sol",
+      "reasoningEffort": "High",
+      "generationActiveAtCapture": true
+    },
+    "waitingWork": {
+      "bucket1": "source pack unavailable; retry backoff pending",
+      "bucket2": "stalled; no recent audit progress"
     },
     "dashboardHttpStatus": 200,
     "dashboardShowsPerBucketModelCheck": true
@@ -45,7 +58,7 @@
     "retroactiveRewrite": false
   },
   "validation": {
-    "command": "npm test",
+    "command": "npm test -- --test-reporter=dot",
     "tests": 157,
     "passed": 157,
     "failed": 0,
@@ -55,6 +68,6 @@
     "powershellScriptsParsed": 6,
     "privacyScan": "no configured private-data patterns found"
   },
-  "operationalLimit": "A pre-existing source-pack boundary leaves the second generation slot idle; the unresolved source state was preserved.",
+  "operationalLimit": "B1 is waiting after source-pack unavailability and B2 remains stalled, so one generation was active at capture; both states were preserved.",
   "privateRuntimeData": "excluded"
 }
