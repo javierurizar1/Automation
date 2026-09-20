@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>R4.3.3 Audit Controller — Operations</title>
+  <style>
+    :root { color-scheme: dark; font-family: Segoe UI, system-ui, sans-serif; background: #10151c; color: #e8eef6; }
+    body { margin: 0; padding: 24px; max-width: 1600px; margin-inline: auto; }
+    h1, h2 { margin: 0 0 12px; font-weight: 600; }
+    h1 { font-size: 24px; } h2 { font-size: 16px; color: #a9bdd2; }
+    .toolbar, .hero, .metrics, .messages, .panel { background: #18212b; border: 1px solid #2a3948; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    button { border: 0; border-radius: 7px; padding: 9px 15px; color: #071018; background: #7dd3fc; cursor: pointer; font-weight: 600; }
+    button:hover { filter: brightness(1.1); } button:disabled { opacity: .45; cursor: wait; }
+    button.warn { background: #fbbf24; } button.stop { background: #fb7185; } button.neutral { background: #94a3b8; }
+    #runState { font-size: 18px; font-weight: 700; margin-right: auto; }
+    .subtle { color: #91a4b8; font-size: 12px; }
+    .hero { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+    .heroBlock { background: #111923; border-radius: 10px; padding: 14px; }
+    .heroBlock .label { color: #91a4b8; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+    .heroBlock .value { font-size: 28px; font-weight: 700; margin-top: 6px; }
+    .heroBlock .detail { margin-top: 8px; color: #cbd5e1; font-size: 13px; line-height: 1.45; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+    .metric { padding: 12px; background: #111923; border-radius: 9px; }
+    .metric .label { color: #91a4b8; font-size: 12px; } .metric .value { font-size: 18px; margin-top: 5px; }
+    .messages { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; }
+    .message { background: #111923; border-radius: 9px; padding: 12px; min-height: 56px; }
+    .message .title { color: #7dd3fc; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+    .message .body { margin-top: 7px; word-break: break-word; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 8px 6px; border-bottom: 1px solid #293744; text-align: left; vertical-align: top; }
+    th { color: #91a4b8; font-weight: 500; position: sticky; top: 0; background: #18212b; }
+    td.action { max-width: 260px; word-break: break-word; }
+    a { color: #7dd3fc; }
+    .state { font-weight: 700; letter-spacing: .02em; }
+    .GENERATING { color: #86efac; } .RECENT_PROGRESS { color: #67e8f9; } .WAITING_RESPONSE { color: #fbbf24; }
+    .WAITING_SOURCE_PACK { color: #fbbf24; } .SETUP, .ROLLOVER { color: #c4b5fd; } .STALLED { color: #fb7185; }
+    .BLOCKED { color: #94a3b8; } .RUNNABLE_IDLE { color: #cbd5e1; } .IDLE { color: #64748b; }
+    .error { border-left: 3px solid #fb7185; padding: 8px 10px; margin: 7px 0; background: #211b23; }
+    .error .meta { color: #fda4af; font-size: 12px; } .error .detail { margin-top: 4px; word-break: break-word; }
+    .ok { color: #86efac; } .bad { color: #fb7185; } .warnText { color: #fbbf24; }
+    .activity { font-family: Consolas, monospace; font-size: 12px; line-height: 1.5; }
+    .activity div { padding: 4px 0; border-bottom: 1px solid #223041; }
+    .underutil { border: 1px solid #fbbf24; background: #2a2318; }
+    @media (max-width: 900px) { body { padding: 12px; } .panel { overflow-x: auto; } }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <div><h1>R4.3.3 Audit Controller</h1><div class="subtle">Operations view · max 2 simultaneous reviewers · 5 bucket chats · GPT-5.6 Sol High</div></div>
+    <div id="runState">Loading…</div>
+    <button class="stop" data-action="stop">STOP AUTOMATION</button>
+    <button data-action="start">RESTART AUTOMATION</button>
+    <button class="neutral" id="refresh">Refresh</button>
+  </div>
+
+  <div class="hero" id="hero"></div>
+  <div class="metrics" id="metrics"></div>
+
+  <div class="messages">
+    <div class="message"><div class="title">Registry tracker</div><div class="body" id="tracker">—</div></div>
+    <div class="message"><div class="title">Scheduler health</div><div class="body" id="schedulerHealth">—</div></div>
+    <div class="message"><div class="title">Recent activity</div><div class="body activity" id="activity">—</div></div>
+    <div class="message"><div class="title">Coordinator delivery</div><div class="body" id="coordinator">—</div></div>
+  </div>
+
+  <section class="panel"><h2>Bucket operations</h2><div id="buckets">Loading…</div></section>
+  <section class="panel"><h2>Error log and coordinator incidents</h2><div id="errors">No incidents found.</div></section>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const buttons = [...document.querySelectorAll('[data-action]')];
+    const fmtTime = value => value ? new Date(value).toLocaleString() : '—';
+    const fmtShort = value => value ? new Date(value).toLocaleTimeString() : '—';
+    const fmtDuration = seconds => {
+      if (seconds == null || !Number.isFinite(Number(seconds))) return 'unknown';
+      seconds = Math.max(0, Math.round(Number(seconds)));
+      const d = Math.floor(seconds / 86400); seconds %= 86400;
+      const h = Math.floor(seconds / 3600); seconds %= 3600;
+      const m = Math.floor(seconds / 60); const s = seconds % 60;
+      return `${d ? d + 'd ' : ''}${h ? h + 'h ' : ''}${m ? m + 'm ' : ''}${s}s`;
+    };
+    const fmtMinutes = value => value == null || !Number.isFinite(Number(value)) ? '—' : `${Math.round(Number(value))}m`;
+    const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+
+    function render(data) {
+      const s = data.status || {};
+      const m = s.metrics || {};
+      const tracker = data.tracker || {};
+      const trackerBaseline = Number(tracker.controllerCasesReportedBaseline);
+      const controllerObserved = Number(s.casesProcessedTotal ?? m.casesProcessed ?? 0);
+      const trackerDelta = Number.isFinite(trackerBaseline) ? Math.max(0, controllerObserved - trackerBaseline) : 0;
+      const verifiedTerminal = tracker.canonicalTerminalRecords == null ? null : Number(tracker.canonicalTerminalRecords);
+      const liveTerminal = verifiedTerminal == null ? null : verifiedTerminal + trackerDelta;
+      const liveRemaining = liveTerminal == null || tracker.finalizedPopulation == null
+        ? null
+        : Math.max(0, Number(tracker.finalizedPopulation) - liveTerminal);
+      const desired = (data.control?.desiredState || s.runState || 'UNKNOWN').toUpperCase();
+      const statusAge = s.updatedAt ? Math.round((Date.now() - new Date(s.updatedAt).getTime()) / 1000) : null;
+      const health = statusAge != null && statusAge > 120 ? 'STALE' : (s.connected ? 'CONNECTED' : 'OFFLINE');
+      const live = Number(s.liveReviewerGenerations ?? s.activeReviewers ?? 0);
+      const maxLive = Number(s.maxReviewerGenerations ?? s.maxActiveReviewers ?? 2);
+      const productiveLive = Number(s.productiveReviewerCount ?? s.substantiveAuditGenerations ?? 0);
+      const productive15 = Array.isArray(s.progressingBuckets15m) ? s.progressingBuckets15m.length : 0;
+      const modelPolicy = s.reviewerModelPolicy || {};
+      const requiredModel = modelPolicy.model || 'GPT-5.6 Sol';
+      const requiredEffort = modelPolicy.effort || 'High';
+      const managedChats = s.managedReviewerChatCount ?? '—';
+      const maxReviewerChats = s.maxReviewerChatTabs ?? 5;
+
+      $('runState').innerHTML = `${esc(desired)} <span class="subtle">· ${esc(health)}${statusAge != null ? ` · heartbeat ${statusAge}s ago` : ''}</span>`;
+
+      const underutilClass = s.schedulerUnderutilized ? 'heroBlock underutil' : 'heroBlock';
+      $('hero').innerHTML = [
+        `<div class="${underutilClass}"><div class="label">Reviewers live (CDP)</div><div class="value">${live} / ${maxLive}</div><div class="detail">Substantive audit generations: ${esc(productiveLive)} · Scheduled slots: ${esc(s.scheduledReviewers ?? live)} · Available: ${esc(s.availableReviewerSlots ?? 0)} · Desired: ${esc(s.desiredLiveReviewers ?? s.desiredActiveReviewers ?? maxLive)}</div></div>`,
+        `<div class="heroBlock"><div class="label">Reviewer model</div><div class="value">${esc(requiredModel)}</div><div class="detail">Required effort: ${esc(requiredEffort)}. Verified before every send; unavailable holds the bucket without downgrading. Managed bucket chats: ${esc(managedChats)} / ${esc(maxReviewerChats)}.</div></div>`,
+        `<div class="heroBlock"><div class="label">Progress</div><div class="value">${esc(s.newCasesLast15m ?? 0)} cases / 15m</div><div class="detail">5m: ${esc(s.newCasesLast5m ?? 0)} · 60m: ${esc(s.newCasesLast60m ?? 0)} · Productive buckets (15m): ${productive15}<br>Last global progress: ${esc(fmtTime(s.lastGlobalProgressAt ?? m.lastProgressAt))} (${esc(fmtMinutes(s.minutesSinceLastGlobalProgress))} ago)</div></div>`,
+        `<div class="heroBlock"><div class="label">Corpus observed*</div><div class="value">${esc(controllerObserved)}</div><div class="detail">Remaining estimate: ${esc(s.casesRemainingEstimate ?? m.casesRemaining ?? '—')} of ${esc(m.auditablePopulation ?? 'not configured')}<br>Rate*: ${esc(m.processingRatePerHour ?? 0)} cases/hr · ETA*: ${esc(fmtDuration(m.etaSeconds))}</div></div>`,
+        `<div class="${s.schedulerUnderutilized ? 'heroBlock underutil' : 'heroBlock'}"><div class="label">Capacity</div><div class="value">${s.schedulerUnderutilized ? 'UNDERUTILIZED' : 'OK'}</div><div class="detail">${s.idleReviewerCapacity > 0 ? `Idle reviewer capacity: ${esc(s.idleReviewerCapacity)}<br>Reason: ${esc(s.idleCapacityReason || 'none')}` : 'Both reviewer slots productively occupied or legitimately blocked.'}</div></div>`,
+      ].join('');
+
+      $('metrics').innerHTML = [
+        ['Live generating buckets', (s.liveGeneratingBuckets || []).map(b => `B${b}`).join(', ') || 'none'],
+        ['Productive reviewer count', productiveLive],
+        ['Dispatch-start reservations', (s.dispatchStartBuckets || []).map(b => `B${b}`).join(', ') || 'none'],
+        ['Verified writes 5m', s.verifiedWritesLast5m ?? 0],
+        ['Verified writes 15m', s.verifiedWritesLast15m ?? 0],
+        ['Verified writes 60m', s.verifiedWritesLast60m ?? 0],
+        ['Progressing buckets 5m', (s.progressingBuckets5m || []).map(b => `B${b}`).join(', ') || 'none'],
+        ['Progressing buckets 60m', (s.progressingBuckets60m || []).map(b => `B${b}`).join(', ') || 'none'],
+        ['Time working', fmtDuration(Number(m.workingElapsedMs || 0) / 1000)],
+        ['Live terminal', liveTerminal ?? '—'],
+        ['Live remaining', liveRemaining ?? '—'],
+      ].map(([label, value]) => `<div class="metric"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join('');
+
+      if (tracker.canonicalTerminalRecords != null) {
+        const pending = Object.entries(tracker.pendingByBucket || {}).map(([bucket, count]) => `B${bucket}: ${count}`).join(' · ') || 'none';
+        $('tracker').innerHTML = `<b>${esc(liveTerminal)}</b> live terminal of <b>${esc(tracker.finalizedPopulation)}</b> finalized · <b>${esc(liveRemaining)}</b> remaining<br><span class="subtle">registry verified ${esc(tracker.canonicalTerminalRecords)} at ${esc(fmtTime(tracker.verifiedAt))} · +${esc(trackerDelta)} controller-terminalized since verification · pending re-review ${esc(tracker.pendingReReview ?? '—')} (${esc(pending)})</span>`;
+      } else {
+        $('tracker').innerHTML = '<span class="bad">Tracker snapshot unavailable.</span>';
+      }
+
+      $('schedulerHealth').innerHTML = `<b>Desired live:</b> ${esc(s.desiredLiveReviewers ?? '—')} · <b>Live:</b> ${esc(live)} · <b>Underutilized:</b> ${s.schedulerUnderutilized ? '<span class="warnText">YES</span>' : '<span class="ok">NO</span>'}<br><span class="subtle">${esc(s.idleCapacityReason || 'No idle capacity issue detected.')}</span>`;
+
+      const activity = s.recentActivity || s.operations?.recentActivity || [];
+      $('activity').innerHTML = activity.length
+        ? activity.slice(0, 20).map(item => `<div>${esc(fmtShort(item.at))} ${item.bucket == null ? '' : `B${esc(item.bucket)} `}${esc(item.kind || 'EVENT')}: ${esc(item.summary || '')}</div>`).join('')
+        : '<span class="subtle">No recent controller events recorded yet.</span>';
+
+      const c = data.coordinator;
+      $('coordinator').innerHTML = c ? `<b>${esc(c.status || 'UNKNOWN')}</b> · ${esc(c.incidentId || 'no incident')}<br><span class="subtle">queued ${esc(fmtTime(c.queuedAt))} · started ${esc(fmtTime(c.startedAt))} · finished ${esc(fmtTime(c.completedAt))}</span>` : 'No coordinator activity recorded.';
+
+      const buckets = Object.entries(s.buckets || {}).sort((a,b) => Number(a[0]) - Number(b[0]));
+      $('buckets').innerHTML = `<table><thead><tr>
+        <th>Bucket</th><th>Operational</th><th>Workflow</th><th>Live</th><th>Model check</th><th>Current pack</th><th>Pack staging</th><th>Last progress</th><th>Cases 15m/60m</th><th>Action</th><th>Blocker</th><th>Chat</th>
+      </tr></thead><tbody>${buckets.map(([bucket, b]) => `<tr>
+        <td>B${esc(bucket)}</td>
+        <td class="state ${esc(b.operationalState || 'IDLE')}">${esc(b.operationalState || '—')}</td>
+        <td>${esc(b.workflowPhase || b.phase || '—')}</td>
+        <td>${b.liveGeneration ? '<span class="ok">YES</span>' : 'NO'}</td>
+        <td>${b.reviewerModelVerification
+          ? `<span class="${b.reviewerModelVerification.model === requiredModel && b.reviewerModelVerification.effort === requiredEffort ? 'ok' : 'bad'}">${esc(b.reviewerModelVerification.model)} · ${esc(b.reviewerModelVerification.effort)}</span><br><span class="subtle">verified ${esc(fmtTime(b.reviewerModelVerification.verifiedAt))}</span>`
+          : '<span class="warnText">checked before next send</span>'}
+          ${b.newChatCreationStatus ? `<br><span class="warnText">chat creation: ${esc(b.newChatCreationStatus)}</span>` : ''}</td>
+        <td>${esc(b.currentSourcePack || '—')}<br><span class="subtle">last ${esc(b.lastConsumedSourcePack || '—')}</span></td>
+        <td>${b.sourcePackResumePending ? `<span class="warnText">pending ${esc(b.nextStagedSourcePack || '?')}</span>` : (b.sourcePackAccessVerified ? 'verified' : '—')}</td>
+        <td>${esc(fmtTime(b.lastProgressAt))}<br><span class="subtle">${esc(fmtMinutes(b.minutesSinceLastProgress))} ago · last +${esc(b.lastProgressNewCases ?? '—')}</span></td>
+        <td>${esc(b.recentCases15m ?? 0)} / ${esc(b.recentCases60m ?? 0)}</td>
+        <td class="action">${esc(b.currentActionType || '—')}<br><span class="subtle">${esc(b.currentActionId || b.lastAction || '')}</span>${b.awaitingResponse ? '<br><span class="warnText">awaiting response</span>' : ''}</td>
+        <td>${esc(b.exactBlocker || (b.schedulingBlocked ? 'scheduling-blocked' : 'none'))}</td>
+        <td>${b.chatUrl ? `<a href="${esc(b.chatUrl)}" target="_blank" rel="noreferrer">open</a><br><span class="subtle">${esc((b.chatId || '').slice(0, 8))}</span>` : '—'}</td>
+      </tr>`).join('')}</tbody></table>`;
+
+      $('errors').innerHTML = (data.incidents || []).length ? data.incidents.map(i => `<div class="error"><div class="meta">${esc(fmtTime(i.detectedAt))} · ${esc(i.kind)}${i.bucket == null ? '' : ` · B${esc(i.bucket)}`}</div><div class="detail">${esc(i.detail)}</div>${i.requiredAction ? `<div class="subtle">Next: ${esc(i.requiredAction)}</div>` : ''}</div>`).join('') : '<span class="ok">No incidents found.</span>';
+    }
+
+    async function refresh() {
+      try { render(await (await fetch('/api/status', { cache: 'no-store' })).json()); }
+      catch (error) { $('runState').textContent = `DASHBOARD ERROR: ${error.message}`; }
+    }
+    async function control(action) {
+      buttons.forEach(button => button.disabled = true);
+      try {
+        const response = await fetch('/api/control', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ action }) });
+        if (!response.ok) throw new Error((await response.json()).error || `control request failed (${response.status})`);
+      }
+      catch (error) { $('runState').textContent = `CONTROL ERROR: ${error.message}`; }
+      finally { buttons.forEach(button => button.disabled = false); await refresh(); }
+    }
+    buttons.forEach(button => button.addEventListener('click', () => control(button.dataset.action)));
+    $('refresh').addEventListener('click', refresh);
+    refresh(); setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

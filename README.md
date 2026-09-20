@@ -1,57 +1,38 @@
-# Automation — R4.3.3 Audit Controller
+# R4.3.3 Audit Controller
 
-This repository is the project handoff and recovery base for the **R4.3.3 Audit Controller** used to coordinate audit review of **65,720 finalized summaries**.
+This repository contains the runnable local audit controller, dashboard, regression tests, and review protocol. Runtime configuration, browser profiles, chat state, case data, and logs remain local and are excluded from version control.
 
-## Canonical project identity
+## Operating limits
 
-- Local project root: `C:\Users\javi_\.codex\Apps\R433AuditController`
-- Controller UI: `http://127.0.0.1:9350/`
-- Canonical registry: Google Sheet ID `1N1JyWple9cs3-P-lWdGBIeZEUD0SlEsLNYC60AEvKuw`
-- Permanent ownership rule: `bucket = int(stable_id, 16) % 6`
-- Buckets: `B0` through `B5`
-- Maximum concurrent reviewer generations: **2**
-- Terminal classifications:
-  - `PASS`
-  - `MINOR`
-  - `FAIL`
-  - `SOURCE_UNAVAILABLE`
-  - `TECHNICAL_REVIEW_FAILURE`
+- At most two reviewer generations run at once.
+- At most five managed bucket conversations are kept in rotation across six stable buckets.
+- Before replacement, close tabs matching saved retired bucket conversations; leave unrelated tabs untouched.
+- Each bucket owns records by the stable ID modulo six rule.
+- Every new send verifies GPT-5.6 Sol with High reasoning effort before composing the action. The controller holds that bucket if it cannot confirm the required model and effort.
+- Uncertain new-chat creation stays held. The controller preserves the existing tab and never retries automatically when a retry might create a duplicate conversation.
+- Existing terminal registry results are preserved.
 
-## Core invariants
+GPT-5.6 Sol was the highest selectable option verified in the connected account during this repair. Availability depends on that account. The controller does not claim an inaccessible upgrade option.
 
-1. A `stable_id` belongs to exactly one bucket forever: `int(stable_id,16) % 6`.
-2. Exactly one terminal registry result is allowed per `stable_id` in its owning shard tab.
-3. Existing valid terminal rows are preserved and skipped; they are not re-audited merely to reconcile controller state.
-4. Every new registry write must be read back and verified.
-5. Pack-local exhaustion is **not** corpus completion.
-6. `STATUS: COMPLETE` is allowed only after full-population reconciliation against all **65,720** finalized summaries proves zero owned pending IDs and no unresolved writes.
-7. Reviewer source retrieval must use the exact connected Google Drive shard and exact requested JSONL pack. A failed exact-name Drive search is not proof of absence; the shard folder must be listed/paginated until the pack is found or the listing is exhausted.
-8. Do not substitute another pack and do not infer source content from prior context.
-9. Only `.jsonl` source packs are substantive audit inputs; README/manifests/metadata/archive material is not a substitute for source text.
+## Local setup
 
-## Repository contents
+1. Install the pinned Node.js dependencies with npm ci.
+2. Create a private root config.json using config/recovered-config.json as a shape reference. Supply the local project, registry, bucket, and conversation settings. Do not commit the completed config.
+3. Start the controller with Start-Controller.ps1. It connects to the dedicated Chrome CDP session and serves the dashboard on the configured loopback port.
+4. Open the dashboard locally. The default address is http://127.0.0.1:9350/.
 
-- `docs/PROJECT_CONTEXT.md` — architecture, mappings, registry IDs, controller behavior.
-- `docs/AUDIT_PROTOCOL.md` — reviewer-side protocol, ownership, write verification, completion semantics.
-- `docs/KNOWN_INCIDENTS.md` — diagnosed controller/scheduler incidents and unresolved blockers.
-- `docs/RECOVERY_STATUS.md` — latest recoverable operational state and important pack/action references.
-- `docs/CODE_RECOVERY_GAPS.md` — which original local source bodies were not recoverable from chat history.
-- `config/recovered-config.json` — machine-readable recovered project constants.
-- `src/recovered-invariants.mjs` — reconstructed helper code containing only documented project invariants; it is **not** represented as the original controller source.
-- `tools/publish-local-project.ps1` — explicit script for importing the real local project tree into this repository from the known Windows project path.
+The example config contains placeholders and is not runnable as-is. Never publish chat IDs, service identifiers, cookies, tokens, browser profiles, case data, or runtime state. This review copy also replaces private source-shard folder IDs and operational pack offsets with placeholders; it is not a production checkout.
 
-## Important source-code note
+## Validation
 
-The GitHub repository was empty when this handoff was created. The prior conversation record preserved architecture, identifiers, state transitions, symbol names, tests/fixes, and incident details, but not complete literal bodies for the local files such as `src/controller.mjs`, `src/protocol.mjs`, `src/operations.mjs`, `dashboard.html`, or the full test suite.
+Run npm test for protocol parsing, bucket scheduling, new-chat recovery, model enforcement, operations, and watchdog coverage.
 
-Accordingly, this repository distinguishes:
+## Key files
 
-- **Recovered authoritative context**: facts and constraints carried forward from the live project.
-- **Reconstructed helper code**: code derived directly from those documented invariants.
-- **Original local implementation**: still located at the known local project path and should be imported verbatim with the provided publishing script rather than reconstructed from memory.
-
-## Current high-value controller symbols previously observed
-
-`rebalanceExistingReviewerSlots`, `fillReviewerSlots`, `selectPendingBuckets`, `selectReviewerSlotCandidates`, `bucketHasGenerationReservation`, `turnStallReason`, `stageReviewerStallRecovery`, `recoverStaleAwaitingReviewers`, `recoverRetryableExactPackHolds`, `recoverAdvisoryCoordinatorHolds`, and `recoverRetryablePartialWriteHolds`.
-
-See the docs for the diagnosed behaviors around `processedHash`, `responseHash`, `SOURCE_PACK_CONTINUE`, setup ACK delivery, source-pack progression, slot accounting, and reviewer-stall rollover.
+- src/controller.mjs: scheduling, reconciliation, send gating, and safe chat creation.
+- src/reviewer-model.mjs: required model and reasoning-effort selection with fail-closed verification.
+- src/reviewer-tabs.mjs: match retired tracked tabs without selecting unrelated pages.
+- dashboard.html and src/dashboard.mjs: local status and per-bucket model verification.
+- src/protocol.mjs and src/operations.mjs: review protocol and dashboard metrics.
+- tests/: controller and protocol regression coverage.
+- docs/: sanitized project context, repair summary, and evidence.

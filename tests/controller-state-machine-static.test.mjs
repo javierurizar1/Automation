@@ -3,15 +3,47 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { listRetiredReviewerTabs } from '../src/reviewer-tabs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const controller = fs.readFileSync(path.join(ROOT, 'src', 'controller.mjs'), 'utf8');
+const reviewerModel = fs.readFileSync(path.join(ROOT, 'src', 'reviewer-model.mjs'), 'utf8');
 
 test('response reconciliation requires action attribution and real stability', () => {
   assert.match(controller, /latestAssistantAfterActionMarker\(page, responseActionId\)/);
   assert.match(controller, /processedResponseKey === responseKey/);
   assert.match(controller, /updateStableCandidate\(bucketState, responseHash, responseActionId\)/);
   assert.doesNotMatch(controller, /candidateCount\s*=\s*2/);
+});
+
+test('new-chat model verification waits for the selector and never downgrades', () => {
+  const verificationStart = reviewerModel.indexOf('export async function ensureHighestReviewerModel');
+  const verificationEnd = reviewerModel.indexOf('catch (cause)', verificationStart);
+  const verification = reviewerModel.slice(verificationStart, verificationEnd);
+  assert.ok(verification.indexOf("await selector.waitFor({ state: 'visible', timeout: 15000 })") >= 0);
+  assert.ok(verification.indexOf('await selector.waitFor') < verification.indexOf('await selector.count()'));
+  assert.match(reviewerModel, /REQUIRED_REVIEWER_MODEL = 'GPT-5\.6 Sol'/);
+  assert.match(reviewerModel, /REQUIRED_REVIEWER_EFFORT = 'High'/);
+  assert.match(verification, /modelUnavailable\(/);
+});
+
+test('chat rotation identifies only open retired controller conversations', () => {
+  const currentUrl = 'https://example.test/project/current';
+  const retiredUrl = 'https://example.test/project/retired';
+  const unrelatedUrl = 'https://example.test/chat/unassigned';
+  const retired = listRetiredReviewerTabs({
+    1: { chatUrl: currentUrl, chatHistory: [{ chatUrl: retiredUrl }] },
+    2: { chatUrl: null, chatHistory: [{ url: 'https://example.test/project/older' }] },
+  }, [
+    `${retiredUrl}?mode=high`,
+    currentUrl,
+    unrelatedUrl,
+    'not-a-url',
+  ]);
+
+  assert.deepEqual(retired, [{ bucket: '1', url: `${retiredUrl}?mode=high` }]);
+  assert.match(controller, /await closeRetiredReviewerTabs\(context, bucket\)/);
+  assert.match(controller, /'RETIRED_REVIEWER_TABS_NOT_CLOSED'/);
 });
 
 test('setup verification is persisted and INITIAL_AUDIT dispatch is scheduler-gated', () => {
@@ -405,4 +437,42 @@ test('source-pack boundary advancement is gated by exact-target availability evi
   assert.ok(advanceAt > unavailableAt);
   assert.match(processActive, /boundary footer contradicted by unavailable/);
   assert.match(controller, /recoverFalseSourcePackBoundaryAdvances\(\)/);
+});
+
+
+test('reviewer sends require the highest accessible model and High effort', () => {
+  const modelHelper = fs.readFileSync(path.join(ROOT, 'src', 'reviewer-model.mjs'), 'utf8');
+  const sendAction = controller.slice(
+    controller.indexOf('async function sendAction'),
+    controller.indexOf('async function inspectLiveGeneratingByBucket'),
+  );
+  const verificationAt = sendAction.indexOf('ensureHighestReviewerModel(page)');
+  const fillAt = sendAction.indexOf('fillComposer(page, text)');
+  const sendAt = sendAction.indexOf('pressSend(page)');
+  assert.ok(verificationAt >= 0 && verificationAt < fillAt && verificationAt < sendAt);
+  assert.match(modelHelper, /GPT-5\.6 Sol/);
+  assert.match(modelHelper, /High,\\s\*3 of 3/);
+  assert.match(modelHelper, /REVIEWER_MODEL_UNAVAILABLE/);
+  assert.match(sendAction, /verifiedBeforeEverySend|ensureHighestReviewerModel/);
+});
+
+test('reviewer rotation is capped at five chats and ambiguous creation never retries automatically', () => {
+  assert.ok(controller.includes('const MAX_REVIEWER_CHAT_TABS = 5;'));
+  assert.ok(controller.includes('managedReviewerChatCount() >= MAX_REVIEWER_CHAT_TABS'));
+  assert.ok(controller.includes("error.code === 'SEND_NOT_OBSERVED' ? 'SEND_UNCONFIRMED' : 'UNRESOLVED'"));
+  assert.ok(controller.includes('retry is disabled to avoid duplicate conversations'));
+  const creation = controller.slice(
+    controller.indexOf('async function createReviewer'),
+    controller.indexOf('async function rolloverReviewer'),
+  );
+  assert.ok(creation.includes("'NEW_CHAT_ID_TIMEOUT'"));
+  assert.ok(creation.includes('wakeCoordinator: false'));
+  const recovery = controller.slice(
+    controller.indexOf('function preserveUnresolvedNewChatHolds'),
+    controller.indexOf('function recoverRetryablePartialWriteHolds'),
+  );
+  assert.doesNotMatch(recovery, /phase = 'PENDING'/);
+  assert.match(recovery, /new-chat-send-not-observed/);
+  assert.match(recovery, /startup-new-chat-retry:/);
+  assert.doesNotMatch(controller, /recoverRetryableNewChatHolds/);
 });

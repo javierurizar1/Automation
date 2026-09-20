@@ -1,0 +1,60 @@
+{
+  "recordedAtUtc": "2026-09-20T02:31:30Z",
+  "sourceRevision": "See pull request head",
+  "policy": {
+    "maxConcurrentGenerations": 2,
+    "maxManagedBucketChats": 5,
+    "requiredModel": "GPT-5.6 Sol",
+    "requiredReasoningEffort": "High",
+    "fallbackAllowed": false,
+    "modelVerifiedBeforeEverySend": true
+  },
+  "liveUiReadback": {
+    "managedBucketChatsChecked": 5,
+    "model": "GPT-5.6 Sol",
+    "reasoningEffort": "High",
+    "messagesSentDuringReadback": false,
+    "retiredTrackedTabsStillOpen": 0
+  },
+  "liveController": {
+    "runState": "RUNNING",
+    "connected": true,
+    "managedBucketChats": 5,
+    "maxConcurrentGenerations": 2,
+    "liveGenerationsAtCapture": 1,
+    "freshAuditDispatch": {
+      "kind": "INITIAL_AUDIT",
+      "model": "GPT-5.6 Sol",
+      "reasoningEffort": "High",
+      "generationActiveAtCapture": true,
+      "caseProgressObservedAtCapture": false
+    },
+    "dashboardHttpStatus": 200,
+    "dashboardShowsPerBucketModelCheck": true
+  },
+  "chatCreation": {
+    "ambiguousSetup": "preserve tab, hold bucket, disable automatic retry",
+    "legacyRetryState": "migrate to hold",
+    "retiredTrackedTab": "closed before replacement",
+    "unrelatedTabs": "not matched or closed"
+  },
+  "priorAction": {
+    "completedBeforeRepair": true,
+    "selectedTier": "Instant",
+    "existingVerifiedWritesPreserved": true,
+    "retroactiveRewrite": false
+  },
+  "validation": {
+    "command": "npm test",
+    "tests": 157,
+    "passed": 157,
+    "failed": 0,
+    "localApplicationTests": "152 passed",
+    "javascriptSyntaxModules": 7,
+    "dashboardInlineScripts": 1,
+    "powershellScriptsParsed": 6,
+    "privacyScan": "no configured private-data patterns found"
+  },
+  "operationalLimit": "A pre-existing source-pack boundary leaves the second generation slot idle; the unresolved source state was preserved.",
+  "privateRuntimeData": "excluded"
+}

@@ -70,6 +70,8 @@ import {
   recordAuditProgressEvent,
   recordSourcePackTransition,
 } from './operations.mjs';
+import { ensureHighestReviewerModel, REQUIRED_REVIEWER_EFFORT, REQUIRED_REVIEWER_MODEL } from './reviewer-model.mjs';
+import { listRetiredReviewerTabs } from './reviewer-tabs.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/(.:)/, '$1')), '..');
 const CONFIG_PATH = path.join(ROOT, 'config.json');
@@ -92,6 +94,7 @@ function dispatchStartGraceMs() {
 
 const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8').replace(/^\uFEFF/, ''));
 const MAX_ACTIVE_REVIEWERS = Math.min(2, Math.max(1, Number(config.maxActiveReviewers || 2)));
+const MAX_REVIEWER_CHAT_TABS = 5;
 const SCHEDULING_BLOCKED_BUCKETS = new Set(
   (Array.isArray(config.schedulingBlockedBuckets) ? config.schedulingBlockedBuckets : [])
     .map(Number)
@@ -191,6 +194,8 @@ function defaultBucketState(bucket) {
     corpusCompleteVerified,
     chatId: conversationId,
     chatUrl: conversationId ? projectConversationUrl(conversationId) : null,
+    newChatCreation: null,
+    reviewerModelVerification: null,
     phase: complete ? 'COMPLETE' : conversationId ? 'ACTIVE' : 'PENDING',
     lastHash: null,
     processedHash: null,
@@ -291,6 +296,8 @@ function normalizeState(raw) {
     const merged = { ...defaults, ...existing };
 
     if (!merged.chatUrl && merged.chatId) merged.chatUrl = projectConversationUrl(merged.chatId);
+    if (!merged.newChatCreation || typeof merged.newChatCreation !== 'object') merged.newChatCreation = null;
+    if (!merged.reviewerModelVerification || typeof merged.reviewerModelVerification !== 'object') merged.reviewerModelVerification = null;
     if (!Array.isArray(merged.chatHistory)) merged.chatHistory = [];
     merged.rolloverCount = Number(merged.rolloverCount || 0);
     merged.casesSinceChatStart = Number(merged.casesSinceChatStart || 0);
@@ -799,6 +806,29 @@ async function sendAction(page, bucket, kind, prompt, responseHash = '') {
     return id;
   }
 
+  let modelVerification;
+  try {
+    modelVerification = await ensureHighestReviewerModel(page);
+  } catch (error) {
+    if (error.code === 'REVIEWER_MODEL_UNAVAILABLE') {
+      recordIncident(
+        'REVIEWER_MODEL_UNAVAILABLE',
+        bucket,
+        'the required highest available model and High reasoning effort could not be confirmed; action was not sent',
+        { requiredModel: REQUIRED_REVIEWER_MODEL, requiredEffort: REQUIRED_REVIEWER_EFFORT },
+        { wakeCoordinator: false },
+      );
+    }
+    throw error;
+  }
+  bucketState.reviewerModelVerification = {
+    model: modelVerification.model,
+    effort: modelVerification.effort,
+    verifiedAt: now(),
+    actionKind: kind,
+  };
+  saveState();
+
   const existingDraft = await composerText(page);
   if (existingDraft) {
     if (!existingDraft.includes(marker)) {
@@ -1203,7 +1233,16 @@ function heldIncidentForCoordinator() {
     if (!incidentRecord?.path) continue;
     const incident = loadJson(incidentRecord.path, null);
     if (incident?.id !== incidentId) continue;
-    if (incident.kind === 'NEXT_SOURCE_PACKS_REQUIRED') continue;
+    if ([
+      'NEXT_SOURCE_PACKS_REQUIRED',
+      'NEW_CHAT_ID_TIMEOUT',
+      'NEW_CHAT_SEND_UNCONFIRMED',
+      'NEW_CHAT_CREATION_UNRESOLVED',
+      'REVIEWER_MODEL_UNAVAILABLE',
+      'REVIEWER_CHAT_CAP_REACHED',
+      'RETIRED_REVIEWER_TABS_NOT_CLOSED',
+      'NEW_CHAT_BUSY',
+    ].includes(incident.kind)) continue;
     return { incident, path: incidentRecord.path };
   }
   return null;
@@ -1248,57 +1287,198 @@ function ensureCoordinatorWakeProgress() {
   wakeCodex(incidentPath);
 }
 
+function managedReviewerChatCount() {
+  return Object.values(state.buckets).filter(bucketState => (
+    !bucketState.complete
+    && (Boolean(bucketState.chatUrl) || Boolean(bucketState.newChatCreation?.status))
+  )).length;
+}
+
+async function closeRetiredReviewerTabs(context, requestedBucket) {
+  const pages = context.pages().filter(page => !page.isClosed());
+  const retired = listRetiredReviewerTabs(
+    state.buckets,
+    pages.map(page => page.url()),
+  );
+  const failed = [];
+
+  for (const entry of retired) {
+    const page = pages.find(candidate => !candidate.isClosed() && candidate.url() === entry.url);
+    if (!page) continue;
+    try {
+      await page.close();
+    } catch (error) {
+      failed.push({ bucket: entry.bucket, error });
+      log(`B${requestedBucket}: could not close a retired reviewer tab for B${entry.bucket}`);
+    }
+  }
+
+  if (failed.length) {
+    recordIncident(
+      'RETIRED_REVIEWER_TABS_NOT_CLOSED',
+      requestedBucket,
+      'a retired bucket conversation could not be closed; replacement chat was not opened to preserve the five-chat limit',
+      { retainedRetiredTabCount: failed.length },
+      { wakeCoordinator: false },
+    );
+    const error = new Error('Retired reviewer tabs could not be closed; no replacement chat was opened');
+    error.code = 'RETIRED_REVIEWER_TABS_NOT_CLOSED';
+    error.cause = failed[0].error;
+    throw error;
+  }
+
+  if (retired.length) {
+    log(`B${requestedBucket}: closed ${retired.length} retired reviewer tab(s) before rotation`);
+  }
+}
+
+function latestSetupAction(bucket) {
+  return Object.values(state.actions || {})
+    .filter(action => Number(action?.bucket) === Number(bucket)
+      && action?.kind === 'PROTOCOL_SETUP'
+      && ['PREPARED', 'DRAFTED', 'SENT'].includes(action?.status))
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0] || null;
+}
+
+async function closeUnsentReviewerPage(page, bucketState, bucket) {
+  bucketState.newChatCreation = null;
+  saveState();
+  if (!page) return;
+  try {
+    if (!page.isClosed()) await page.close();
+  } catch (error) {
+    log('B' + bucket + ': unable to close unsent reviewer tab: ' + (error.message || error));
+  }
+}
+
 async function createReviewer(context, bucket) {
   assertControlRunning();
   if (isSchedulingBlockedBucket(bucket)) return;
   const bucketState = state.buckets[String(bucket)];
-  log(`B${bucket}: creating a new reviewer chat`);
-  const page = await context.newPage();
-  await page.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-
-  if (await isGenerating(page)) {
-    recordIncident('NEW_CHAT_BUSY', bucket, 'new project chat unexpectedly shows an active generation');
+  if (bucketState.newChatCreation?.status) {
+    if (bucketState.phase !== 'HOLD') {
+      recordIncident(
+        'NEW_CHAT_CREATION_UNRESOLVED',
+        bucket,
+        'an earlier reviewer-chat creation is unresolved; automatic retry is disabled to avoid a duplicate conversation',
+        { creationStatus: bucketState.newChatCreation.status, actionId: bucketState.newChatCreation.actionId || null },
+        { wakeCoordinator: false },
+      );
+    }
+    return;
+  }
+  if (managedReviewerChatCount() >= MAX_REVIEWER_CHAT_TABS) {
+    recordIncident(
+      'REVIEWER_CHAT_CAP_REACHED',
+      bucket,
+      'the five-chat bucket rotation is full; no additional reviewer chat was opened',
+      { maxReviewerChatTabs: MAX_REVIEWER_CHAT_TABS },
+      { wakeCoordinator: false },
+    );
     return;
   }
 
-  assertControlRunning();
+  await closeRetiredReviewerTabs(context, bucket);
+
+  bucketState.newChatCreation = { status: 'OPENING', startedAt: now(), actionId: null };
+  saveState();
+  log('B' + bucket + ': opening a reviewer chat (' + managedReviewerChatCount() + '/' + MAX_REVIEWER_CHAT_TABS + ' bucket chats allocated)');
+
+  let page = null;
+  try {
+    page = await context.newPage();
+    await page.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    bucketState.newChatCreation.status = 'READY_TO_SEND';
+    saveState();
+  } catch (error) {
+    await closeUnsentReviewerPage(page, bucketState, bucket);
+    throw error;
+  }
+
+  if (await isGenerating(page)) {
+    bucketState.newChatCreation.status = 'BUSY';
+    recordIncident(
+      'NEW_CHAT_BUSY',
+      bucket,
+      'new project chat unexpectedly shows an active generation; no setup prompt was sent',
+      { creationStatus: 'BUSY' },
+      { wakeCoordinator: false },
+    );
+    return;
+  }
+
+  try {
+    assertControlRunning();
+  } catch (error) {
+    await closeUnsentReviewerPage(page, bucketState, bucket);
+    throw error;
+  }
+
+  bucketState.newChatCreation.status = 'SENDING';
+  saveState();
   let id;
   try {
     id = await sendAction(page, bucket, 'PROTOCOL_SETUP', setupPrompt(bucket), '');
   } catch (error) {
-    if (error.code !== 'SEND_NOT_OBSERVED') throw error;
-    bucketState.phase = 'PENDING';
-    bucketState.lastAction = 'new-chat-send-not-observed';
-    bucketState.awaitingResponseAt = null;
-    bucketState.awaitingActionId = null;
-    bucketState.responseBaselineHash = null;
-    saveState();
-    try { await page.close(); } catch {}
-    log(`B${bucket}: setup send was not observed; closed draft tab and will retry next cycle`);
+    if (['CONTROL_PAUSED', 'CONTROL_STOPPED', 'CHAT_ROLLOVER_REQUIRED', 'REVIEWER_MODEL_UNAVAILABLE'].includes(error.code)) {
+      await closeUnsentReviewerPage(page, bucketState, bucket);
+      throw error;
+    }
+
+    const action = latestSetupAction(bucket);
+    const creationStatus = error.code === 'SEND_NOT_OBSERVED' ? 'SEND_UNCONFIRMED' : 'UNRESOLVED';
+    bucketState.newChatCreation = {
+      status: creationStatus,
+      startedAt: bucketState.newChatCreation?.startedAt || now(),
+      actionId: action?.id || null,
+      errorCode: error.code || 'UNKNOWN',
+    };
+    recordIncident(
+      creationStatus === 'SEND_UNCONFIRMED' ? 'NEW_CHAT_SEND_UNCONFIRMED' : 'NEW_CHAT_CREATION_UNRESOLVED',
+      bucket,
+      'reviewer-chat setup delivery is ambiguous; the tab is preserved and automatic retry is disabled to avoid duplicate conversations',
+      { creationStatus, actionId: action?.id || null },
+      { wakeCoordinator: false },
+    );
     return;
   }
+
+  bucketState.newChatCreation = {
+    status: 'SENT_WAITING_FOR_ID',
+    startedAt: bucketState.newChatCreation?.startedAt || now(),
+    actionId: id,
+  };
+  saveState();
   const deadline = Date.now() + 45000;
-  let chatId = null;
   while (Date.now() < deadline) {
     const url = page.url();
     const match = url.match(/\/c\/([0-9a-f-]{20,})/i);
     if (match) {
-      chatId = match[1];
+      const chatId = match[1];
       bucketState.chatId = chatId;
       bucketState.chatUrl = url.split('?')[0];
+      bucketState.newChatCreation = null;
       resetPerChatObservationState(bucketState);
       bucketState.setupVerified = false;
       bucketState.setupVerifiedChatId = null;
       bucketState.phase = 'SETUP_WAIT';
-      bucketState.lastAction = `setup-sent:${id}`;
+      bucketState.lastAction = 'setup-sent:' + id;
       saveState();
-      log(`B${bucket}: new reviewer chat ${chatId}`);
+      log('B' + bucket + ': new reviewer chat ID captured');
       return;
     }
     await sleep(1000);
   }
 
-  recordIncident('NEW_CHAT_ID_TIMEOUT', bucket, 'protocol setup was sent but the new conversation ID was not observed within 45 seconds');
+  bucketState.newChatCreation.status = 'ID_UNRESOLVED';
+  saveState();
+  recordIncident(
+    'NEW_CHAT_ID_TIMEOUT',
+    bucket,
+    'protocol setup was sent but the new conversation ID was not observed within 45 seconds; tab preserved and retry disabled',
+    { actionId: id, creationStatus: 'ID_UNRESOLVED' },
+    { wakeCoordinator: false },
+  );
 }
 
 async function rolloverReviewer(context, bucket, reason) {
@@ -1840,28 +2020,49 @@ function recoverUnavailableSourcePackHolds() {
   if (recovered) saveState();
 }
 
-function recoverRetryableNewChatHolds() {
-  let recovered = false;
+function preserveUnresolvedNewChatHolds() {
+  let changed = false;
   for (const [bucket, bucketState] of Object.entries(state.buckets)) {
-    if (isSchedulingBlockedBucket(bucket)) continue;
+    const creation = bucketState.newChatCreation;
+    if (!bucketState.chatUrl
+      && (bucketState.lastAction === 'new-chat-send-not-observed'
+        || String(bucketState.lastAction || '').startsWith('startup-new-chat-retry:'))) {
+      const action = latestSetupAction(bucket);
+      recordIncident(
+        'NEW_CHAT_SEND_UNCONFIRMED',
+        bucket,
+        'legacy controller state shows an unconfirmed setup send; automatic retry is disabled to avoid a duplicate conversation',
+        { actionId: action?.id || bucketState.lastMessageSentActionId || null },
+        { wakeCoordinator: false },
+      );
+      changed = true;
+      continue;
+    }
+    if (creation?.status && bucketState.chatUrl) {
+      bucketState.newChatCreation = null;
+      changed = true;
+      continue;
+    }
+    if (creation?.status && bucketState.phase !== 'HOLD') {
+      recordIncident(
+        'NEW_CHAT_CREATION_UNRESOLVED',
+        bucket,
+        'startup found an incomplete reviewer-chat creation (' + creation.status + '); it remains held to prevent a duplicate conversation',
+        { creationStatus: creation.status, actionId: creation.actionId || null },
+        { wakeCoordinator: false },
+      );
+      changed = true;
+      continue;
+    }
     if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
     const incidentId = String(bucketState.lastAction).slice('incident:'.length);
     const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
     const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
-    if (incident?.kind !== 'NEW_CHAT_ID_TIMEOUT') continue;
-
-    bucketState.chatId = null;
-    bucketState.chatUrl = null;
-    bucketState.phase = 'PENDING';
-    bucketState.awaitingResponseAt = null;
-    bucketState.awaitingActionId = null;
-    bucketState.responseBaselineHash = null;
-    resetPerChatObservationState(bucketState);
-    bucketState.lastAction = `startup-new-chat-retry:${incidentId}`;
-    recovered = true;
-    log(`B${bucket}: recovered new-chat timeout for retry; incident preserved ${incidentId}`);
+    if (incident?.kind === 'NEW_CHAT_ID_TIMEOUT' || incident?.kind === 'NEW_CHAT_SEND_UNCONFIRMED') {
+      log('B' + bucket + ': preserving unresolved chat creation; automatic retry disabled for ' + incident.kind);
+    }
   }
-  if (recovered) saveState();
+  if (changed) saveState();
 }
 
 function recoverRetryablePartialWriteHolds() {
@@ -3624,6 +3825,14 @@ function writeStatus(extra = {}) {
     controllerState: state.runState,
     control,
     maxActiveReviewers: MAX_ACTIVE_REVIEWERS,
+    maxReviewerChatTabs: MAX_REVIEWER_CHAT_TABS,
+    managedReviewerChatCount: managedReviewerChatCount(),
+    reviewerModelPolicy: {
+      model: REQUIRED_REVIEWER_MODEL,
+      effort: REQUIRED_REVIEWER_EFFORT,
+      verifiedBeforeEverySend: true,
+      fallbackAllowed: false,
+    },
     maxReviewerGenerations: operations.maxReviewerGenerations,
     liveReviewerGenerations: operations.liveReviewerGenerations,
     productiveReviewerCount: operations.productiveReviewerCount,
@@ -3672,6 +3881,8 @@ function writeStatus(extra = {}) {
             phase: value.phase,
             operationalState: ops.operationalState || null,
             workflowPhase: value.phase,
+            reviewerModelVerification: value.reviewerModelVerification || null,
+            newChatCreationStatus: value.newChatCreation?.status || null,
             liveGeneration: ops.liveGeneration ?? false,
             chatId: value.chatId,
             chatUrl: value.chatUrl,
@@ -3766,7 +3977,7 @@ async function main() {
   recoverLegacyInterruptedWriteRecoveryRollovers();
   recoverLegacyInterruptedAdvisoryAnomalyRollovers();
   recoverUnavailableSourcePackHolds();
-  recoverRetryableNewChatHolds();
+  preserveUnresolvedNewChatHolds();
   recoverRetryablePartialWriteHolds();
   recoverRetryableExactPackHolds();
   recoverAdvisoryCoordinatorHolds();

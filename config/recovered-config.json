@@ -1,42 +1,33 @@
 {
-  "project": {
-    "name": "R4.3.3 Audit Controller",
-    "localRoot": "C:\\Users\\javi_\\.codex\\Apps\\R433AuditController",
-    "uiUrl": "http://127.0.0.1:9350/",
-    "auditablePopulation": 65720,
-    "bucketCount": 6,
-    "ownershipRule": "int(stable_id, 16) % 6",
-    "maxActiveReviewers": 2,
-    "postGenerationStallMinutes": 90
+  "_exampleOnly": true,
+  "_note": "Sanitized shape reference. Replace null placeholders using the private local config; do not commit runtime values.",
+  "version": null,
+  "projectUrl": null,
+  "registryId": null,
+  "auditablePopulation": null,
+  "bucketCount": 6,
+  "maxActiveReviewers": 2,
+  "schedulingBlockedBuckets": [],
+  "cdpPort": 9333,
+  "dashboardPort": 9350,
+  "pollSeconds": null,
+  "turnTimeoutMinutes": null,
+  "generationFallbackTimeoutMinutes": null,
+  "postGenerationStallMinutes": null,
+  "writeRecoveryGenerationTimeoutMinutes": null,
+  "setupAckTimeoutMinutes": null,
+  "conversationRolloverEnabled": null,
+  "conversationRolloverLimitDetection": null,
+  "buckets": {
+    "0": { "complete": null, "conversationId": null },
+    "1": { "complete": null, "conversationId": null },
+    "2": { "complete": null, "conversationId": null },
+    "3": { "complete": null, "conversationId": null },
+    "4": { "complete": null, "conversationId": null },
+    "5": { "complete": null, "conversationId": null }
   },
-  "registry": {
-    "spreadsheetId": "1N1JyWple9cs3-P-lWdGBIeZEUD0SlEsLNYC60AEvKuw",
-    "terminalClassifications": ["PASS", "MINOR", "FAIL", "SOURCE_UNAVAILABLE", "TECHNICAL_REVIEW_FAILURE"],
-    "shards": [
-      {"bucket": 0, "tab": "R433_AUDIT_SHARD_0", "sheetId": 2074776203},
-      {"bucket": 1, "tab": "R433_AUDIT_SHARD_1", "sheetId": 1364935991},
-      {"bucket": 2, "tab": "R433_AUDIT_SHARD_2", "sheetId": 1230691417},
-      {"bucket": 3, "tab": "R433_AUDIT_SHARD_3", "sheetId": 1702779998},
-      {"bucket": 4, "tab": "R433_AUDIT_SHARD_4", "sheetId": 1695624695},
-      {"bucket": 5, "tab": "R433_AUDIT_SHARD_5", "sheetId": 1400921643}
-    ]
-  },
-  "sourcePacks": {
-    "driveRootFolderId": "12U6uVYHyWzwD6fAV24r0v6LAaCDb1RO4",
-    "uploadReadyFolderId": "1zAkFwQzWePNpLjja5JcIzbRMoX4pdfZx",
-    "shards": [
-      {"bucket": 0, "historicalConfiguredStartPack": 51, "folderId": "1RcH8RlsKfuU_Az0HQZF6fTpzi_zM9P3t"},
-      {"bucket": 1, "historicalConfiguredStartPack": 50, "folderId": "1Iuk_HValMXjtkEMjLSX1qf0J-e8u0jTH"},
-      {"bucket": 2, "historicalConfiguredStartPack": 49, "folderId": "1bJw77Eog_l6DdHbrPeuREnzX7QtjR5y_"},
-      {"bucket": 3, "historicalConfiguredStartPack": 53, "folderId": "1IT8g_IwIvoGkhFuyNoKVYYQ5wpxhk8by"},
-      {"bucket": 4, "historicalConfiguredStartPack": 18, "folderId": "1gUp74kctnt4QTce7Uucs9omc5ze9PFPO"},
-      {"bucket": 5, "historicalConfiguredStartPack": 8, "folderId": "1d7ajaUPfnq9ntVXJotSn8oNjiSP1_EYE"}
-    ]
-  },
-  "completion": {
-    "requiresFullCorpusReconciliation": true,
-    "packExhaustionIsCompletion": false,
-    "completionEvidence": {"FULL_CORPUS_RECONCILED": "YES", "FULL_CORPUS_AUDITABLE_POPULATION": 65720, "OWNED_PENDING_CASES": 0}
-  },
-  "recoveryMetadata": {"recoveredFromPriorProjectContext": true, "originalLocalSourceBodiesRecovered": false, "lastDatedOperationalEvidence": "2026-09-18"}
+  "codexCoordinator": {
+    "enabled": false,
+    "model": null
+  }
 }
