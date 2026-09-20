@@ -1,6 +1,6 @@
 {
-  "recordedAtUtc": "2026-09-20T02:31:30Z",
-  "sourceRevision": "See pull request head",
+  "recordedAtUtc": "2026-09-20T02:35:22Z",
+  "sourceRevision": "4ea43accfd3fae13986457c6fbb7b7133f2586b8",
   "policy": {
     "maxConcurrentGenerations": 2,
     "maxManagedBucketChats": 5,

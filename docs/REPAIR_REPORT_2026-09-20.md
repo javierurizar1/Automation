@@ -21,6 +21,8 @@ An action already in flight completed at Instant before this repair. Its existin
 
 The controller is RUNNING and connected. It holds the two-generation and five-managed-chat limits. Five tracked reviewer pages were read back at GPT-5.6 Sol / High; the retired tab was closed before replacement. The fresh B3 `INITIAL_AUDIT` was verified at that model and reasoning effort, and one generation was active at capture. The local dashboard returned HTTP 200 and displays the required policy and per-bucket model checks.
 
+Validated implementation commit: `4ea43accfd3fae13986457c6fbb7b7133f2586b8`.
+
 One pre-existing source-pack boundary still prevents using the second live slot. This repair does not claim two simultaneous reviews or alter that source state.
 
 ## Validation
