@@ -363,7 +363,7 @@ export function isRecoverableRegistryWriteFooter(footer) {
   if (!footer || footer.status !== 'ERROR') return false;
   if (!['NO', 'PARTIAL'].includes(String(footer.writesVerified || '').toUpperCase())) return false;
   const blocker = String(footer.blocker || '').trim().toUpperCase();
-  return /^(REGISTRY_WRITE_NOT_COMPLETED|REGISTRY_WRITE_INCOMPLETE|REGISTRY_READBACK_REQUIRED|WRITE_VERIFICATION_REQUIRED|REGISTRY_WRITE_BLOCKED_BY_CONNECTOR_GUARD)$/.test(blocker);
+  return /^(?:REGISTRY_WRITE_NOT_COMPLETED|REGISTRY_WRITE_INCOMPLETE|REGISTRY_READBACK_REQUIRED|WRITE_VERIFICATION_REQUIRED|REGISTRY_WRITE_BLOCKED_BY_CONNECTOR_GUARD|ROWS_\d+_\d+_WRITE_ISSUED_READBACK_UNVERIFIED)$/.test(blocker);
 }
 
 export function recoverablePackNumberFromFooter(footer) {

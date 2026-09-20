@@ -341,6 +341,18 @@ test('known registry write failures are recoverable but arbitrary errors are not
   }), true);
   assert.equal(isRecoverableRegistryWriteFooter({
     status: 'ERROR',
+    writesVerified: 'PARTIAL',
+    blocker: 'ROWS_10924_10928_WRITE_ISSUED_READBACK_UNVERIFIED',
+    triggerCoordinator: 'NO',
+  }), true);
+  assert.equal(isRecoverableRegistryWriteFooter({
+    status: 'ERROR',
+    writesVerified: 'PARTIAL',
+    blocker: 'ROWS_10924_10928_WRITE_ISSUED_READBACK_UNVERIFIED_EXTRA',
+    triggerCoordinator: 'NO',
+  }), false);
+  assert.equal(isRecoverableRegistryWriteFooter({
+    status: 'ERROR',
     writesVerified: 'NO',
     blocker: 'REGISTRY_MAPPING_AMBIGUOUS',
     triggerCoordinator: 'YES',
