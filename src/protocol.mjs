@@ -438,6 +438,16 @@ export function isValidSourcePackNumber(bucket, packNumber) {
   );
 }
 
+export function isSourcePackBeyondInventory(packNumber, inventoryLastPack) {
+  const target = Number(packNumber);
+  const lastAvailable = Number(inventoryLastPack);
+  return Number.isInteger(target)
+    && target > 0
+    && Number.isInteger(lastAvailable)
+    && lastAvailable > 0
+    && target > lastAvailable;
+}
+
 export function parseSourcePackNumber(value, bucket = null) {
   if (value === null || value === undefined || value === '') return null;
   const parsed = Number(value);
@@ -590,10 +600,15 @@ export function resolveNextSourcePackTargetNumber(bucket, {
     }
   }
 
+  const sourcePackBoundaryKnown = incident?.kind === 'NEXT_SOURCE_PACKS_REQUIRED'
+    || isSourcePackBoundaryFooter(incident?.footer)
+    || String(bucketState.lastProcessedBlocker || '').trim().toUpperCase() === 'NEXT_SOURCE_PACKS_REQUIRED';
   const neverConsumed = lastConsumed === null
     && !bucketState.sourcePackLastDeliveredAt
     && parseSourcePackNumber(bucketState.sourcePackLastDeliveredNumber, bucket) === null
-    && Number(bucketState.casesReported || 0) === 0;
+    && !bucketState.sourcePackLastDeliveredIncidentId
+    && !bucketState.sourcePackLastDeliveredActionId
+    && (Number(bucketState.casesReported || 0) === 0 || sourcePackBoundaryKnown);
   if (neverConsumed && isValidSourcePackNumber(bucket, shard.startPack)) {
     return { targetNumber: shard.startPack, reason: 'start-pack-never-consumed', lastConsumed: null };
   }

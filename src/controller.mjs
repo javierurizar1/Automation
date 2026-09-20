@@ -61,6 +61,7 @@ import {
   sourcePackContinuationAlreadySent,
   sourcePackFilename,
   sourcePackShardFolderUrl,
+  isSourcePackBeyondInventory,
   SOURCE_PACK_SHARDS,
 } from './protocol.mjs';
 import {
@@ -452,8 +453,55 @@ function sourcePackContinuationPrompt(bucket, source) {
   return buildSourcePackContinuationPrompt(bucket, source);
 }
 
+function sourcePackInventoryLastNumber(bucket) {
+  const marker = loadJson(SOURCE_PACK_READY_PATH, null);
+  if (String(marker?.status || '').toUpperCase() !== 'UPLOADED') return null;
+  const ranges = marker?.shards;
+  const configuredBuckets = Object.keys(SOURCE_PACK_SHARDS);
+  if (!ranges || Object.keys(ranges).length !== configuredBuckets.length) return null;
+
+  let totalPackCount = 0;
+  for (const key of configuredBuckets) {
+    const shard = SOURCE_PACK_SHARDS[key];
+    const range = ranges[key];
+    const startPack = Number(range?.startPack);
+    const lastPack = Number(range?.lastPack);
+    const packCount = Number(range?.packCount);
+    if (!shard
+      || !Number.isInteger(startPack)
+      || startPack !== shard.startPack
+      || !Number.isInteger(lastPack)
+      || lastPack < startPack
+      || !Number.isInteger(packCount)
+      || packCount !== lastPack - startPack + 1) return null;
+    totalPackCount += packCount;
+  }
+
+  if (!Number.isInteger(Number(marker.packCount)) || totalPackCount !== Number(marker.packCount)) return null;
+  return Number(ranges[String(Number(bucket))]?.lastPack);
+}
+
+function latestSourcePackBoundaryIncident(bucket) {
+  const bucketNumber = Number(bucket);
+  const prefix = `INC-B${bucketNumber}-`;
+  const records = Object.values(state.incidents)
+    .filter(record => String(record?.id || '').startsWith(prefix) && record.path)
+    .sort((a, b) => String(b.id).localeCompare(String(a.id)));
+  for (const record of records) {
+    const incident = loadJson(record.path, null);
+    if (incident?.kind === 'NEXT_SOURCE_PACKS_REQUIRED'
+      && Number(incident.bucket) === bucketNumber) return { record, incident };
+  }
+  return null;
+}
+
 function corpusReconciliationPrompt(bucket) {
-  return `Your prior response reported STATUS: COMPLETE for Bucket ${bucket}. Treat that only as a completion candidate, not as authorization to stop. Reconcile R433_AUDIT_SHARD_${bucket} against the full authoritative R4.3.3 finalized-summary population of ${config.auditablePopulation} cases, using permanent ownership int(stable_id, 16) % 6 == ${bucket}. Current source-pack exhaustion is not sufficient. If any owned stable_id lacks a terminal registry result, continue reviewing if its source pack is available; if the required later packs are not available, return STATUS: NORMAL with BLOCKER: NEXT_SOURCE_PACKS_REQUIRED and TRIGGER_COORDINATOR: YES. Only if full-population reconciliation proves zero owned pending stable_ids and there are no unresolved writes may you return STATUS: COMPLETE. In that case, immediately before the six-line footer include these exact evidence lines:\nFULL_CORPUS_RECONCILED: YES\nFULL_CORPUS_AUDITABLE_POPULATION: ${config.auditablePopulation}\nOWNED_PENDING_CASES: 0\nThen end with the strict six-line AUDIT_TURN_STATUS footer.`;
+  const shard = SOURCE_PACK_SHARDS[Number(bucket)];
+  const lastPack = sourcePackInventoryLastNumber(bucket);
+  const inventoryHint = shard && Number.isInteger(lastPack)
+    ? `The uploaded inventory snapshot spans ${sourcePackFilename(shard.startPack, Number(bucket))} through ${sourcePackFilename(lastPack, Number(bucket))}. Re-list and paginate the exact shard folder at ${sourcePackShardFolderUrl(shard.folderId)} to verify whether a newer pack exists before requesting one.`
+    : 'Re-list and paginate the exact shard folder before requesting another pack.';
+  return `The previous response is a completion or source-pack boundary candidate for Bucket ${bucket}; neither proves completion. ${inventoryHint} Reconcile R433_AUDIT_SHARD_${bucket} against the full authoritative R4.3.3 finalized-summary population of ${config.auditablePopulation} cases, using permanent ownership int(stable_id, 16) % 6 == ${bucket}. Pack exhaustion alone is not completion. If any owned stable_id lacks a terminal registry result, continue only with an exact source pack confirmed available in the shard folder, skipping every valid terminal row and readback-verifying every new write. If owned cases remain but no later exact pack exists, return STATUS: NORMAL with BLOCKER: NEXT_SOURCE_PACKS_REQUIRED and TRIGGER_COORDINATOR: YES. Only if full-population reconciliation proves zero owned pending stable_ids and there are no unresolved writes may you return STATUS: COMPLETE. In that case, immediately before the six-line footer include these exact evidence lines:\nFULL_CORPUS_RECONCILED: YES\nFULL_CORPUS_AUDITABLE_POPULATION: ${config.auditablePopulation}\nOWNED_PENDING_CASES: 0\nThen end with the strict six-line AUDIT_TURN_STATUS footer.`;
 }
 
 function malformedRecoveryPrompt(bucket) {
@@ -2310,6 +2358,53 @@ async function sendPendingSourcePackContinuations(context) {
       || bucketState.phase === 'HOLD'
       || bucketState.writeRecoveryResumePending) continue;
     if (bucketState.awaitingResponseAt || bucketState.awaitingActionId) continue;
+
+    const currentTarget = parseSourcePackNumber(bucketState.sourcePackTargetNumber, Number(bucket));
+    const inventoryLastPack = sourcePackInventoryLastNumber(bucket);
+    if (isSourcePackBeyondInventory(currentTarget, inventoryLastPack)) {
+      assertControlRunning();
+      if (!bucketState.chatUrl) continue;
+      const page = await ensurePage(context, bucketState);
+      if (!page || await isGenerating(page)) continue;
+      if (isAuthenticationPage(page)) {
+        bucketState.lastAction = 'waiting-for-browser-auth';
+        saveState();
+        continue;
+      }
+
+      const composer = page.locator(COMPOSER_LOCATOR_SELECTOR).first();
+      let composerVisible = false;
+      try {
+        composerVisible = await composer.count() > 0 && await composer.isVisible();
+      } catch {}
+      if (!composerVisible) {
+        bucketState.lastAction = 'waiting-for-chat-composer';
+        saveState();
+        continue;
+      }
+
+      const latestAssistant = await latestMessage(page, 'assistant');
+      const responseHash = latestAssistant ? sha16(latestAssistant) : (bucketState.processedHash || bucketState.lastHash || '');
+      const actionIdSent = await sendAction(
+        page,
+        Number(bucket),
+        'CORPUS_RECONCILE',
+        corpusReconciliationPrompt(Number(bucket)),
+        responseHash,
+      );
+      bucketState.sourcePackResumePending = false;
+      bucketState.phase = 'ACTIVE';
+      bucketState.lastAction = `corpus-reconcile-sent-after-pack-inventory-end:${inventoryLastPack}`;
+      saveState();
+      log(`B${bucket}: source-pack inventory ends at ${inventoryLastPack}; full-corpus reconciliation sent (${actionIdSent})`);
+      recordActivityEvent(state, {
+        bucket,
+        kind: 'CORPUS_RECONCILE',
+        summary: `full-corpus reconciliation after verified source-pack inventory end (${actionIdSent})`,
+      });
+      continue;
+    }
+
     if (!sourcePackRetryReady(bucketState)) continue;
     assertControlRunning();
 
@@ -2667,6 +2762,20 @@ async function processActive(page, bucket, bucketState, text, responseHash, opti
     bucketState.lastAction = 'corpus-reconcile-sent';
     saveState();
     log(`B${bucket}: COMPLETE observed; full-corpus reconciliation requested instead of retiring bucket`);
+    return;
+  }
+
+  if (responseAction?.kind === 'CORPUS_RECONCILE' && footer.writesVerified === 'YES') {
+    bucketState.sourcePackResumePending = false;
+    bucketState.sourcePackRetryNotBefore = null;
+    saveState();
+    const inventoryLastPack = sourcePackInventoryLastNumber(bucket);
+    recordIncident(
+      'CORPUS_RECONCILE_UNRESOLVED',
+      bucket,
+      `full-corpus reconciliation did not prove completion; STATUS=${footer.status}; BLOCKER=${footer.blocker}; verified source inventory last pack=${inventoryLastPack ?? 'unknown'}`,
+      { footer, evidence: parseCorpusCompletionEvidence(text) },
+    );
     return;
   }
 
@@ -3195,11 +3304,20 @@ function recoverFalseSourcePackBoundaryAdvances() {
     const priorFilename = sourcePackFilename(priorTarget, bucketNumber);
     if (!priorFilename) continue;
 
-    const incidentId = bucketState.sourcePackResumeIncidentId;
-    const incidentRecord = incidentId
+    let incidentId = bucketState.sourcePackResumeIncidentId;
+    let incidentRecord = incidentId
       ? Object.values(state.incidents).find(entry => entry.id === incidentId)
       : null;
-    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    let incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    if ((!incident || incident.kind !== 'NEXT_SOURCE_PACKS_REQUIRED')
+      && String(bucketState.lastProcessedBlocker || '').trim().toUpperCase() === 'NEXT_SOURCE_PACKS_REQUIRED') {
+      const latestBoundary = latestSourcePackBoundaryIncident(bucketNumber);
+      if (latestBoundary) {
+        incidentId = latestBoundary.incident.id;
+        incidentRecord = latestBoundary.record;
+        incident = latestBoundary.incident;
+      }
+    }
     if (incident?.kind !== 'NEXT_SOURCE_PACKS_REQUIRED') continue;
 
     const boundaryText = String(bucketState.sourcePackBoundaryResponsePreview || '');
@@ -3350,11 +3468,20 @@ async function recoverInvalidSourcePackCursors(context) {
       } catch {}
     }
 
-    const incidentId = bucketState.sourcePackResumeIncidentId;
-    const incidentRecord = incidentId
+    let incidentId = bucketState.sourcePackResumeIncidentId;
+    let incidentRecord = incidentId
       ? Object.values(state.incidents).find(entry => entry.id === incidentId)
       : null;
-    const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    let incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+    if ((!incident || incident.kind !== 'NEXT_SOURCE_PACKS_REQUIRED')
+      && String(bucketState.lastProcessedBlocker || '').trim().toUpperCase() === 'NEXT_SOURCE_PACKS_REQUIRED') {
+      const latestBoundary = latestSourcePackBoundaryIncident(bucketNumber);
+      if (latestBoundary) {
+        incidentId = latestBoundary.incident.id;
+        incidentRecord = latestBoundary.record;
+        incident = latestBoundary.incident;
+      }
+    }
 
     const resolved = resolveNextSourcePackTargetNumber(bucketNumber, {
       bucketState,

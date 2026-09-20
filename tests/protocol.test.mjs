@@ -22,6 +22,7 @@ import {
   isRecoverableTurnBoundaryFooter,
   isRecoverableUnavailableSourcePackFooter,
   isSourcePackBoundaryFooter,
+  isSourcePackBeyondInventory,
   isSourcePackAccessVerified,
   isVerifiedCorpusCompletion,
   markSourcePackAccessVerified,
@@ -926,17 +927,44 @@ test('already-consumed pack is not replayed when explicit target remains valid',
   assert.equal(resolved.reason, 'explicit-target');
 });
 
-test('unresolved conflicting cursor state returns SOURCE_PACK_CURSOR_UNRESOLVED', () => {
+test('legacy case totals do not block the configured first pack after a source-pack boundary', () => {
+  const resolved = resolveNextSourcePackTargetNumber(2, {
+    bucketState: {
+      sourcePackTargetNumber: null,
+      sourcePackLastConsumedNumber: null,
+      sourcePackLastVisibleNumber: null,
+      sourcePackLastDeliveredNumber: null,
+      sourcePackLastDeliveredAt: null,
+      sourcePackLastDeliveredIncidentId: null,
+      sourcePackLastDeliveredActionId: null,
+      casesReported: 4175,
+    },
+    incident: { kind: 'NEXT_SOURCE_PACKS_REQUIRED' },
+  });
+  assert.equal(resolved.targetNumber, SOURCE_PACK_SHARDS[2].startPack);
+  assert.equal(resolved.reason, 'start-pack-never-consumed');
+});
+
+test('delivery evidence keeps a lost source-pack cursor unresolved', () => {
   const resolved = resolveNextSourcePackTargetNumber(1, {
     bucketState: {
       sourcePackTargetNumber: null,
       sourcePackLastDeliveredNumber: null,
       casesReported: 7,
+      sourcePackLastDeliveredAt: '2026-09-19T00:00:00.000Z',
+      sourcePackLastDeliveredIncidentId: 'INC-B1-prior',
     },
     incident: { kind: 'NEXT_SOURCE_PACKS_REQUIRED' },
   });
   assert.equal(resolved.targetNumber, null);
   assert.equal(resolved.reason, 'SOURCE_PACK_CURSOR_UNRESOLVED');
+});
+
+test('inventory boundary is distinct from numeric source-pack validity', () => {
+  assert.equal(isSourcePackBeyondInventory(7, 7), false);
+  assert.equal(isSourcePackBeyondInventory(8, 7), true);
+  assert.equal(isSourcePackBeyondInventory(null, 7), false);
+  assert.equal(isSourcePackBeyondInventory(8, null), false);
 });
 
 test('filename generation rejects invalid pack numbers', () => {

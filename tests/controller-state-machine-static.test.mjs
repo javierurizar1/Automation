@@ -476,3 +476,19 @@ test('reviewer rotation is capped at five chats and ambiguous creation never ret
   assert.match(recovery, /startup-new-chat-retry:/);
   assert.doesNotMatch(controller, /recoverRetryableNewChatHolds/);
 });
+
+test('pack inventory exhaustion reconciles the corpus instead of retrying a phantom pack', () => {
+  const continuation = controller.slice(
+    controller.indexOf('async function sendPendingSourcePackContinuations'),
+    controller.indexOf('function updateReceivedMessage'),
+  );
+  assert.ok(continuation.indexOf('isSourcePackBeyondInventory') >= 0);
+  assert.ok(continuation.indexOf('isSourcePackBeyondInventory') < continuation.indexOf('sourcePackRetryReady'));
+  assert.match(continuation, /'CORPUS_RECONCILE'/);
+  const cursorRecovery = controller.slice(
+    controller.indexOf('async function recoverInvalidSourcePackCursors'),
+    controller.indexOf('function stageRecoverableSourcePackHold'),
+  );
+  assert.match(cursorRecovery, /lastProcessedBlocker/);
+  assert.match(cursorRecovery, /latestSourcePackBoundaryIncident/);
+});

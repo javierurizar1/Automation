@@ -6,6 +6,8 @@
 - Permit at most two simultaneous reviewer generations.
 - Keep at most five managed bucket conversations in the rotation.
 - Treat each source pack as an input boundary, not proof that a bucket or the full population is complete.
+- If a source-pack cursor is absent, initialize from the configured first pack only after an explicit `NEXT_SOURCE_PACKS_REQUIRED` boundary and when no pack delivery was recorded. Historical case totals do not identify a source-pack cursor; the reviewer must still skip all valid terminal registry rows.
+- If the next target is beyond the verified uploaded pack inventory, request full-population reconciliation instead of retrying a nonexistent filename. If reconciliation finds pending owned records but no exact later pack, hold the bucket and surface the unresolved source requirement.
 
 ## Review and writes
 
