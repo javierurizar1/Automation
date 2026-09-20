@@ -1071,6 +1071,15 @@ async function reconcileOutstandingResponses(context, liveGeneratingByBucket) {
         if (liveRecoveryStall) {
           const stopped = await stopLiveGeneration(page);
           if (stopped) {
+            if (await isGenerating(page)) {
+              log(`B${bucket}: fail-closed WRITE_RECOVERY stall recovery; generation remains live after Stop`);
+              continue;
+            }
+            const completedAfterStop = await latestAssistantAfterActionMarker(page, responseActionId);
+            if (completedAfterStop.attributed && completedAfterStop.text) {
+              log(`B${bucket}: WRITE_RECOVERY stall recovery deferred; completed response ${responseActionId} is available for reconciliation`);
+              continue;
+            }
             recordIncident(
               'WRITE_RECOVERY_GENERATION_STALL',
               bucket,
@@ -1142,11 +1151,14 @@ async function reconcileOutstandingResponses(context, liveGeneratingByBucket) {
       }
     } catch (error) {
       if (error?.code === 'PAGE_PROBE_STALLED' && !isSchedulingBlockedBucket(bucket)) {
-        log(`B${bucket}: reviewer page probe stalled; rolling over unusable chat while preserving authoritative work state`);
-        await rolloverReviewer(
+        const reason = `reviewer page failed ${error.timeoutCount || PAGE_PROBE_STALL_THRESHOLD} consecutive live-generation probes`;
+        log(`B${bucket}: reviewer page probe stalled; checking the managed chat before recovery`);
+        await recoverStalledReviewerGeneration(
           context,
-          Number(bucket),
-          `reviewer page failed ${error.timeoutCount || PAGE_PROBE_STALL_THRESHOLD} consecutive live-generation probes`,
+          bucket,
+          bucketState,
+          reason,
+          'runtime',
         );
         continue;
       }
@@ -1858,7 +1870,57 @@ function stageReviewerStallRecovery(bucket, bucketState, reason, lastActionPrefi
   return true;
 }
 
-function recoverReviewerStallHolds() {
+async function recoverStalledReviewerGeneration(context, bucket, bucketState, reason, lastActionPrefix) {
+  if (!bucketState.chatUrl) {
+    log(`B${bucket}: fail-closed reviewer stall recovery; no managed chat URL is available to verify generation`);
+    return false;
+  }
+
+  let page;
+  let isLive;
+  try {
+    page = await ensurePage(context, bucketState);
+    if (!page || isAuthenticationPage(page)) {
+      log(`B${bucket}: fail-closed reviewer stall recovery; managed chat is unavailable or requires authentication`);
+      return false;
+    }
+
+    isLive = await isGenerating(page);
+    if (isLive) {
+      const stopped = await stopLiveGeneration(page);
+      if (!stopped) {
+        log(`B${bucket}: fail-closed reviewer stall recovery; live generation could not be stopped`);
+        return false;
+      }
+      isLive = await isGenerating(page);
+      if (isLive) {
+        log(`B${bucket}: fail-closed reviewer stall recovery; generation remains live after Stop`);
+        return false;
+      }
+    }
+
+    const actionId = bucketState.awaitingActionId;
+    if (actionId) {
+      const attributed = await latestAssistantAfterActionMarker(page, actionId);
+      if (attributed.attributed && attributed.text) {
+        log(`B${bucket}: reviewer stall recovery deferred; completed response ${actionId} is available for reconciliation`);
+        return false;
+      }
+    }
+  } catch (error) {
+    log(`B${bucket}: fail-closed reviewer stall recovery; generation could not be verified (${error.message || error})`);
+    return false;
+  }
+
+  if (bucketState.sourcePackResumePending) {
+    return stageReviewerStallRecovery(bucket, bucketState, reason, lastActionPrefix);
+  }
+
+  await rolloverReviewer(context, Number(bucket), `reviewer stall recovery: ${reason}`);
+  return true;
+}
+
+async function recoverReviewerStallHolds(context) {
   let recovered = false;
   for (const [bucket, bucketState] of Object.entries(state.buckets)) {
     if (isSchedulingBlockedBucket(bucket)) continue;
@@ -1868,7 +1930,13 @@ function recoverReviewerStallHolds() {
     const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
     if (incident?.kind !== 'REVIEWER_STALL') continue;
 
-    if (stageReviewerStallRecovery(bucket, bucketState, incidentId, 'startup')) recovered = true;
+    if (await recoverStalledReviewerGeneration(
+      context,
+      bucket,
+      bucketState,
+      incidentId,
+      'startup',
+    )) recovered = true;
   }
   if (recovered) saveState();
 }
@@ -2006,7 +2074,7 @@ function recoverLegacyInterruptedAdvisoryAnomalyRollovers() {
   return recovered;
 }
 
-function recoverStaleAwaitingReviewers() {
+async function recoverStaleAwaitingReviewers(context) {
   let recovered = false;
   for (const [bucket, bucketState] of Object.entries(state.buckets)) {
     if (isSchedulingBlockedBucket(bucket)) continue;
@@ -2014,7 +2082,13 @@ function recoverStaleAwaitingReviewers() {
     const stall = turnStallReason(bucketState);
     if (!stall) continue;
 
-    if (stageReviewerStallRecovery(bucket, bucketState, stall, 'runtime')) recovered = true;
+    if (await recoverStalledReviewerGeneration(
+      context,
+      bucket,
+      bucketState,
+      stall,
+      'runtime',
+    )) recovered = true;
   }
   if (recovered) saveState();
 }
@@ -3178,10 +3252,12 @@ async function processBucket(context, bucket) {
       return;
     }
     if (error.code === 'PAGE_PROBE_STALLED') {
-      await rolloverReviewer(
+      await recoverStalledReviewerGeneration(
         context,
         bucket,
+        bucketState,
         `reviewer page failed ${error.timeoutCount || PAGE_PROBE_STALL_THRESHOLD} consecutive live-generation probes`,
+        'runtime',
       );
       return;
     }
@@ -3969,6 +4045,7 @@ function writeStatus(extra = {}) {
     scheduledReviewers: lastLiveReviewerOccupancy.scheduledReviewers,
     liveGeneratingBuckets: operations.liveGeneratingBuckets,
     dispatchStartBuckets: lastLiveReviewerOccupancy.dispatchStartBuckets,
+    awaitingResponseBuckets: lastLiveReviewerOccupancy.awaitingResponseBuckets,
     availableReviewerSlots: operations.availableReviewerSlots,
     desiredActiveReviewers: operations.desiredLiveReviewers,
     desiredLiveReviewers: operations.desiredLiveReviewers,
@@ -4100,7 +4177,6 @@ function isBrowserDisconnectedError(error) {
 async function main() {
   recoverInvalidLegacyChatRehydration();
   recoverTimeoutHolds();
-  recoverReviewerStallHolds();
   recoverLegacyInterruptedWriteRecoveryRollovers();
   recoverLegacyInterruptedAdvisoryAnomalyRollovers();
   recoverUnavailableSourcePackHolds();
@@ -4111,7 +4187,6 @@ async function main() {
   recoverRetryableTurnBoundaryHolds();
   recoverSourcePackHolds();
   recoverFalseSourcePackBoundaryAdvances();
-  recoverStaleAwaitingReviewers();
   recoverStaleSourcePackBoundaryState();
   resetSetupWaitObservationState();
   recoverLostAwaitingState();
@@ -4141,11 +4216,12 @@ async function main() {
         if (!context) throw new Error('Chrome CDP connected but no browser context exists');
       }
 
+      await recoverReviewerStallHolds(context);
       recoverLostAwaitingState();
       recoverSourcePackHolds();
       recoverFalseSourcePackBoundaryAdvances();
       recoverRecoverableHoldsForScheduling();
-      recoverStaleAwaitingReviewers();
+      await recoverStaleAwaitingReviewers(context);
       recoverStaleSourcePackBoundaryState();
       let liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
       await reconcileOutstandingResponses(context, liveGeneratingByBucket);

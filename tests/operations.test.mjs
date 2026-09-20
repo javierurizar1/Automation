@@ -150,6 +150,7 @@ test('scheduling-blocked ACTIVE bucket does not count as reviewer or progress ca
 
 test('available slot + runnable bucket → schedulerUnderutilized=true until activation', () => {
   const state = makeState();
+  state.buckets[1].complete = true;
   const liveGeneratingByBucket = { 0: true };
   const occupancy = buildLiveReviewerOccupancy({
     bucketStates: state.buckets,
@@ -206,6 +207,8 @@ test('available slot + no runnable bucket → schedulerUnderutilized=false', () 
   });
   assert.equal(health.schedulerUnderutilized, false);
   assert.match(String(health.idleCapacityReason || ''), /B1 waiting for unresolved response/);
+  assert.equal(health.idleReviewerCapacity, 0);
+  assert.deepEqual(health.awaitingResponseBuckets, [1]);
 });
 
 test('unresolved awaiting action does not count as live generation', () => {

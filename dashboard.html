@@ -117,13 +117,14 @@
         `<div class="heroBlock"><div class="label">Reviewer model</div><div class="value">${esc(requiredModel)}</div><div class="detail">Required effort: ${esc(requiredEffort)}. Verified before every send; unavailable holds the bucket without downgrading. Managed bucket chats: ${esc(managedChats)} / ${esc(maxReviewerChats)}.</div></div>`,
         `<div class="heroBlock"><div class="label">Progress</div><div class="value">${esc(s.newCasesLast15m ?? 0)} cases / 15m</div><div class="detail">5m: ${esc(s.newCasesLast5m ?? 0)} · 60m: ${esc(s.newCasesLast60m ?? 0)} · Productive buckets (15m): ${productive15}<br>Last global progress: ${esc(fmtTime(s.lastGlobalProgressAt ?? m.lastProgressAt))} (${esc(fmtMinutes(s.minutesSinceLastGlobalProgress))} ago)</div></div>`,
         `<div class="heroBlock"><div class="label">Corpus observed*</div><div class="value">${esc(controllerObserved)}</div><div class="detail">Remaining estimate: ${esc(s.casesRemainingEstimate ?? m.casesRemaining ?? '—')} of ${esc(m.auditablePopulation ?? 'not configured')}<br>Rate*: ${esc(m.processingRatePerHour ?? 0)} cases/hr · ETA*: ${esc(fmtDuration(m.etaSeconds))}</div></div>`,
-        `<div class="${s.schedulerUnderutilized ? 'heroBlock underutil' : 'heroBlock'}"><div class="label">Capacity</div><div class="value">${s.schedulerUnderutilized ? 'UNDERUTILIZED' : 'OK'}</div><div class="detail">${s.idleReviewerCapacity > 0 ? `Idle reviewer capacity: ${esc(s.idleReviewerCapacity)}<br>Reason: ${esc(s.idleCapacityReason || 'none')}` : 'Both reviewer slots productively occupied or legitimately blocked.'}</div></div>`,
+        `<div class="${s.schedulerUnderutilized ? 'heroBlock underutil' : 'heroBlock'}"><div class="label">Capacity</div><div class="value">${s.schedulerUnderutilized ? 'UNDERUTILIZED' : 'OK'}</div><div class="detail">${s.idleReviewerCapacity > 0 ? `Idle reviewer capacity: ${esc(s.idleReviewerCapacity)}<br>Reason: ${esc(s.idleCapacityReason || 'none')}` : 'No idle capacity. Slots may be held by live generations or unresolved responses.'}</div></div>`,
       ].join('');
 
       $('metrics').innerHTML = [
         ['Live generating buckets', (s.liveGeneratingBuckets || []).map(b => `B${b}`).join(', ') || 'none'],
         ['Productive reviewer count', productiveLive],
         ['Dispatch-start reservations', (s.dispatchStartBuckets || []).map(b => `B${b}`).join(', ') || 'none'],
+        ['Awaiting-response reservations', (s.awaitingResponseBuckets || []).map(b => `B${b}`).join(', ') || 'none'],
         ['Verified writes 5m', s.verifiedWritesLast5m ?? 0],
         ['Verified writes 15m', s.verifiedWritesLast15m ?? 0],
         ['Verified writes 60m', s.verifiedWritesLast60m ?? 0],

@@ -34,7 +34,7 @@ test('phase ACTIVE with live generation occupies one reviewer slot', () => {
   assert.equal(occupancy.scheduledReviewers, 1);
 });
 
-test('phase ACTIVE with awaitingActionId and no live generation does not consume a live reviewer slot', () => {
+test('unresolved action stays outside live count but reserves scheduler capacity', () => {
   const bucketState = {
     complete: false,
     awaitingResponseAt: '2026-09-17T22:02:17.158Z',
@@ -53,7 +53,9 @@ test('phase ACTIVE with awaitingActionId and no live generation does not consume
     bucketCount: 6,
   });
   assert.equal(occupancy.activeReviewers, 1);
-  assert.equal(occupancy.availableSlots, 1);
+  assert.equal(occupancy.scheduledReviewers, 2);
+  assert.equal(occupancy.availableSlots, 0);
+  assert.deepEqual(occupancy.awaitingResponseBuckets, [1]);
 });
 
 test('unresolved awaitingActionId blocks duplicate dispatch for the same bucket', () => {
@@ -111,7 +113,7 @@ test('newly dispatched prompt temporarily reserves one slot until generation bec
   assert.equal(bucketOccupiesLiveReviewerSlot(bucketState, { isLiveGenerating: false, nowMs, graceMs }), true);
 });
 
-test('once generation was observed and then ends, slot becomes available even if response reconciliation is pending', () => {
+test('live-only helper reports generation ended while unresolved action remains a scheduler reservation', () => {
   const bucketState = {
     complete: false,
     awaitingResponseAt: '2026-09-17T22:02:17.158Z',
@@ -216,7 +218,7 @@ test('scheduling-blocked bucket with awaiting is excluded from live occupancy bu
   assert.equal(occupancy.scheduledReviewers, 0);
 });
 
-test('B0 live + B1 awaiting/non-live + B3 runnable yields one occupied slot and one available slot', () => {
+test('B0 live + B1 unresolved/non-live + B3 runnable keeps the stale generation slot reserved', () => {
   const buckets = {
     0: {
       complete: false,
@@ -253,7 +255,9 @@ test('B0 live + B1 awaiting/non-live + B3 runnable yields one occupied slot and 
     bucketCount: 6,
   });
   assert.equal(occupancy.activeReviewers, 1);
-  assert.equal(occupancy.availableSlots, 1);
+  assert.equal(occupancy.scheduledReviewers, 2);
+  assert.equal(occupancy.availableSlots, 0);
+  assert.deepEqual(occupancy.awaitingResponseBuckets, [1]);
   assert.deepEqual(selectReviewerSlotCandidates(buckets, blocked), ['3']);
 });
 

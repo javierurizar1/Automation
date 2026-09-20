@@ -210,6 +210,7 @@ export function buildLiveReviewerOccupancy({
   const excluded = new Set(Array.from(excludedBuckets, value => String(value)));
   const liveGeneratingBuckets = [];
   const dispatchStartBuckets = [];
+  const awaitingResponseBuckets = [];
 
   for (const [bucket, bucketState] of Object.entries(bucketStates || {})) {
     if (excluded.has(String(bucket)) || !bucketIsUnfinished(bucketState)) continue;
@@ -220,24 +221,26 @@ export function buildLiveReviewerOccupancy({
     }
     if (bucketHasDispatchStartReservation(bucketState, { nowMs, graceMs, isLiveGenerating: false })) {
       dispatchStartBuckets.push(Number(bucket));
+      continue;
     }
+    if (bucketHasUnresolvedAwaitingAction(bucketState)) awaitingResponseBuckets.push(Number(bucket));
   }
 
   const activeReviewers = liveGeneratingBuckets.length;
-  const scheduledReviewers = activeReviewers + dispatchStartBuckets.length;
   const desiredActiveReviewers = computeDesiredActiveReviewers(
     bucketStates,
     maxActive,
     excludedBuckets,
     bucketCount,
   );
-  const rawScheduled = activeReviewers + dispatchStartBuckets.length;
+  const rawScheduled = activeReviewers + dispatchStartBuckets.length + awaitingResponseBuckets.length;
   const occupiedSlots = Math.min(desiredActiveReviewers, rawScheduled);
   const availableSlots = Math.max(0, desiredActiveReviewers - occupiedSlots);
 
   return {
     liveGeneratingBuckets,
     dispatchStartBuckets,
+    awaitingResponseBuckets,
     activeReviewers,
     scheduledReviewers: rawScheduled,
     occupiedSlots,

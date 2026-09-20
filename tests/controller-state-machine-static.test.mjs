@@ -408,6 +408,44 @@ test('explicit connection interruption rolls over even when the stop button stil
   assert.match(processBucket, /await rolloverReviewer\(context, bucket, explicitRolloverReason\)/);
 });
 
+test('stalled reviewer recovery stops and verifies a live generation before releasing its slot', () => {
+  const recovery = controller.slice(
+    controller.indexOf('async function recoverStalledReviewerGeneration'),
+    controller.indexOf('async function recoverReviewerStallHolds'),
+  );
+  const liveCheckAt = recovery.indexOf('isLive = await isGenerating(page)');
+  const stopAt = recovery.indexOf('await stopLiveGeneration(page)');
+  const recheckAt = recovery.indexOf('isLive = await isGenerating(page)', liveCheckAt + 1);
+  const rolloverAt = recovery.indexOf('await rolloverReviewer(context, Number(bucket)');
+  assert.ok(liveCheckAt >= 0 && stopAt > liveCheckAt && recheckAt > stopAt && rolloverAt > recheckAt);
+  assert.match(recovery, /fail-closed reviewer stall recovery/);
+  assert.match(recovery, /latestAssistantAfterActionMarker\(page, actionId\)/);
+
+  const main = controller.slice(controller.indexOf('async function main()'));
+  const connectAt = main.indexOf('await connectBrowserWithRetry()');
+  const holdRecoveryAt = main.indexOf('await recoverReviewerStallHolds(context)');
+  const staleRecoveryAt = main.indexOf('await recoverStaleAwaitingReviewers(context)');
+  assert.ok(connectAt >= 0 && holdRecoveryAt > connectAt && staleRecoveryAt > holdRecoveryAt);
+  assert.match(controller, /awaitingResponseBuckets: lastLiveReviewerOccupancy\.awaitingResponseBuckets/);
+
+  const reconcile = controller.slice(
+    controller.indexOf('async function reconcileOutstandingResponses'),
+    controller.indexOf('async function ensurePage'),
+  );
+  assert.match(reconcile, /if \(error\?\.code === 'PAGE_PROBE_STALLED'[\s\S]*?await recoverStalledReviewerGeneration/);
+  const liveWriteStart = reconcile.indexOf('const liveRecoveryStall =');
+  const liveWriteEnd = reconcile.indexOf('\n        continue;\n      }\n\n      const responseActionId', liveWriteStart);
+  const liveWriteRecovery = reconcile.slice(liveWriteStart, liveWriteEnd);
+  assert.ok(liveWriteRecovery.indexOf('await stopLiveGeneration(page)') < liveWriteRecovery.indexOf('if (await isGenerating(page))'));
+  assert.ok(liveWriteRecovery.indexOf('if (await isGenerating(page))') < liveWriteRecovery.indexOf('await rolloverReviewer'));
+
+  const processBucket = controller.slice(
+    controller.indexOf('async function processBucket'),
+    controller.indexOf('function rebalanceExistingReviewerSlots'),
+  );
+  assert.match(processBucket, /if \(error\.code === 'PAGE_PROBE_STALLED'[\s\S]*?await recoverStalledReviewerGeneration/);
+});
+
 test('source-pack unavailability has a persisted retry deadline', () => {
   assert.match(controller, /sourcePackRetryNotBefore = retryNotBefore/);
   assert.match(controller, /if \(!sourcePackRetryReady\(bucketState\)\) continue;/);

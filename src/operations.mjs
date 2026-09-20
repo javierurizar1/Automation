@@ -385,7 +385,9 @@ export function analyzeSchedulerHealth({
     bucketCount,
   );
   const dispatchStartCount = Number(occupancy.dispatchStartBuckets?.length || 0);
-  const dispatchStartExplainsGap = liveReviewerGenerations + dispatchStartCount >= desiredLiveReviewers;
+  const awaitingResponseBuckets = occupancy.awaitingResponseBuckets || [];
+  const scheduledCapacity = liveReviewerGenerations + dispatchStartCount + awaitingResponseBuckets.length;
+  const reservationsExplainGap = scheduledCapacity >= desiredLiveReviewers;
   const candidates = selectReviewerSlotCandidates(bucketStates, excludedBuckets);
   const runnableCandidates = candidates.filter((bucket) => {
     const bucketState = bucketStates[String(bucket)];
@@ -395,10 +397,15 @@ export function analyzeSchedulerHealth({
   let idleCapacityReason = null;
   let schedulerUnderutilized = false;
 
-  if (liveReviewerGenerations < desiredLiveReviewers && !dispatchStartExplainsGap) {
-    if (availableReviewerSlots <= 0) {
-      idleCapacityReason = 'capacity fully scheduled (live + dispatch-start reservations)';
-    } else if (!runnableCandidates.length) {
+  if (liveReviewerGenerations < desiredLiveReviewers && availableReviewerSlots <= 0) {
+    const waitingBuckets = awaitingResponseBuckets.map(bucket => `B${bucket} waiting for unresolved response`);
+    const dispatchBuckets = (occupancy.dispatchStartBuckets || []).map(bucket => `B${bucket} dispatch starting`);
+    const reservations = [...waitingBuckets, ...dispatchBuckets];
+    idleCapacityReason = reservations.length
+      ? `capacity fully scheduled (${reservations.join('; ')})`
+      : 'capacity fully scheduled';
+  } else if (liveReviewerGenerations < desiredLiveReviewers && !reservationsExplainGap) {
+    if (!runnableCandidates.length) {
       const blockers = [];
       for (const [bucket, bucketState] of Object.entries(bucketStates)) {
         if (isExcludedBucket(bucket, excludedBuckets) || !bucketIsUnfinished(bucketState)) continue;
@@ -424,10 +431,11 @@ export function analyzeSchedulerHealth({
     availableReviewerSlots,
     desiredLiveReviewers,
     schedulerUnderutilized,
-    idleReviewerCapacity: Math.max(0, maxReviewerGenerations - liveReviewerGenerations),
+    idleReviewerCapacity: availableReviewerSlots,
     idleCapacityReason,
     runnableCandidates: runnableCandidates.map(Number),
     dispatchStartBuckets: occupancy.dispatchStartBuckets || [],
+    awaitingResponseBuckets,
     liveGeneratingBuckets: occupancy.liveGeneratingBuckets || [],
   };
 }
