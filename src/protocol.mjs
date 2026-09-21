@@ -2,6 +2,68 @@ import crypto from 'node:crypto';
 
 export const REQUIRED_FOOTER_LINES = 6;
 
+export const HOLD_TYPES = Object.freeze(['TRANSIENT_EXTERNAL', 'INTEGRITY', 'ADVISORY', 'USER', 'COMPLETE']);
+const HOLD_RETRY_DELAYS_MS = Object.freeze([60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000, 60 * 60_000]);
+
+export function classifyHoldType(kind, footer = null, detail = '') {
+  const incidentKind = String(kind || '').toUpperCase();
+  const blocker = String(footer?.blocker || '').trim().toUpperCase();
+  const reason = `${incidentKind} ${blocker} ${detail}`.toUpperCase();
+  if (incidentKind === 'COMPLETE' || incidentKind === 'CORPUS_COMPLETE') return 'COMPLETE';
+  if (/TERMINAL_DUPLICATE_CLASSIFICATION_COLLISION|ADVISORY|ISOLATED_ANOMALY/.test(reason)) return 'ADVISORY';
+  if (/NEW_CHAT_ID_TIMEOUT|NEW_CHAT_SEND_UNCONFIRMED|NEW_CHAT_CREATION_UNRESOLVED|AUTH_REQUIRED|AUTHENTICATION_REQUIRED|REVIEWER_MODEL_UNAVAILABLE|REVIEWER_CHAT_CAP_REACHED|USER_ACTION/.test(reason)) return 'USER';
+  if (/SOURCE_PACK_UNAVAILABLE_OR_UNVERIFIED|PACK_\d{6}_(?:NOT_YET_RESOLVED|UNAVAILABLE|NOT_FOUND)|REGISTRY_(?:STRUCTURE|SHARD|ACCESS|SHEET).*(?:UNAVAILABLE|MISSING|NOT_FOUND|NOT_ACCESSIBLE|TIMEOUT)|(?:REGISTRY|SHEET|DRIVE).*(?:UNAVAILABLE|DISCONNECTED|ACCESS_DENIED)|TURN_TIMEOUT|REVIEWER_STALL|SETUP_ACK_TIMEOUT|NO_ASSISTANT_RESPONSE|BROWSER_DISCONNECTED/.test(reason)) return 'TRANSIENT_EXTERNAL';
+  return 'INTEGRITY';
+}
+
+export function holdValidationKind(kind, bucket, footer = null) {
+  const reason = `${String(kind || '')} ${String(footer?.blocker || '')}`.toUpperCase();
+  if (/REGISTRY|SHEET/.test(reason)) return { kind: 'REGISTRY_SHARD_AVAILABLE', bucket: Number(bucket) };
+  if (/SOURCE_PACK|DRIVE/.test(reason)) return { kind: 'SOURCE_PACK_FOLDER_LISTING', bucket: Number(bucket) };
+  if (/REVIEWER|CHAT|GENERATION|ASSISTANT/.test(reason)) return { kind: 'REVIEWER_CHAT_REACHABLE', bucket: Number(bucket) };
+  return null;
+}
+
+export function createHoldRecord({
+  type = 'INTEGRITY',
+  reason = 'UNCLASSIFIED_HOLD',
+  incidentId = null,
+  bucket = null,
+  createdAt = new Date().toISOString(),
+  retryCount = 0,
+  nextAttemptAt = null,
+  validation = null,
+  ...metadata
+} = {}) {
+  const safeType = HOLD_TYPES.includes(type) ? type : 'INTEGRITY';
+  const attempts = Math.max(0, Number(retryCount) || 0);
+  const retryDelay = HOLD_RETRY_DELAYS_MS[Math.min(HOLD_RETRY_DELAYS_MS.length - 1, attempts)];
+  const createdMs = Date.parse(createdAt);
+  const scheduledAt = Date.parse(nextAttemptAt || '');
+  const next = safeType === 'TRANSIENT_EXTERNAL'
+    ? (Number.isFinite(scheduledAt)
+      ? new Date(scheduledAt).toISOString()
+      : new Date((Number.isFinite(createdMs) ? createdMs : Date.now()) + retryDelay).toISOString())
+    : null;
+  return {
+    ...metadata,
+    type: safeType,
+    reason: String(reason || 'UNCLASSIFIED_HOLD').trim(),
+    incidentId: incidentId || null,
+    createdAt: Number.isFinite(createdMs) ? new Date(createdMs).toISOString() : new Date().toISOString(),
+    retryPolicy: safeType === 'TRANSIENT_EXTERNAL' ? 'REVALIDATE' : safeType === 'INTEGRITY' ? 'EVIDENCE_RECONCILIATION' : safeType === 'ADVISORY' ? 'ADVISORY_REVIEW' : safeType === 'COMPLETE' ? 'NONE' : 'USER_ACTION',
+    retryCount: attempts,
+    nextAttemptAt: next,
+    validation: validation || (safeType === 'TRANSIENT_EXTERNAL' ? holdValidationKind(reason, bucket) : null),
+  };
+}
+
+export function isHoldRetryDue(hold, nowMs = Date.now()) {
+  if (hold?.type !== 'TRANSIENT_EXTERNAL' || hold?.retryPolicy !== 'REVALIDATE' || !hold.nextAttemptAt) return false;
+  const nextAttempt = Date.parse(hold.nextAttemptAt);
+  return Number.isFinite(nextAttempt) && Number(nowMs) >= nextAttempt;
+}
+
 export function sha16(value) {
   return crypto.createHash('sha256').update(String(value ?? '')).digest('hex').slice(0, 16);
 }
@@ -39,12 +101,14 @@ export function parseCorpusCompletionEvidence(text) {
   const reconciled = source.match(/(?:^|\n)FULL_CORPUS_RECONCILED:\s*(YES|NO)\s*$/im);
   const population = source.match(/(?:^|\n)FULL_CORPUS_AUDITABLE_POPULATION:\s*(\d+)\s*$/im);
   const pending = source.match(/(?:^|\n)OWNED_PENDING_CASES:\s*(\d+)\s*$/im);
-  if (!reconciled || !population || !pending) return null;
+  const unresolved = source.match(/(?:^|\n)UNRESOLVED_WRITES:\s*(\d+)\s*$/im);
+  if (!reconciled || !population || !pending || !unresolved) return null;
 
   return {
     reconciled: reconciled[1].toUpperCase(),
     auditablePopulation: Number(population[1]),
     ownedPendingCases: Number(pending[1]),
+    unresolvedWrites: Number(unresolved[1]),
   };
 }
 
@@ -53,6 +117,7 @@ export function isVerifiedCorpusCompletion(evidence, expectedAuditablePopulation
     evidence
     && evidence.reconciled === 'YES'
     && evidence.ownedPendingCases === 0
+    && evidence.unresolvedWrites === 0
     && evidence.auditablePopulation === Number(expectedAuditablePopulation),
   );
 }
@@ -169,6 +234,19 @@ export function bucketHasUnresolvedAwaitingAction(bucketState) {
   return Boolean(bucketState?.awaitingActionId && bucketState?.awaitingResponseAt);
 }
 
+/**
+ * A bucket can be unfinished without being dispatchable. In particular, an
+ * outstanding action must first be reconciled and a held bucket must not
+ * consume a reviewer target slot. Source-pack retries become eligible only
+ * after their persisted backoff expires.
+ */
+export function bucketEligibleForScheduling(bucketState, nowMs = Date.now()) {
+  if (!bucketIsUnfinished(bucketState) || bucketState.phase === 'HOLD') return false;
+  if (bucketHasUnresolvedAwaitingAction(bucketState)) return false;
+  if (bucketState.sourcePackResumePending && !sourcePackRetryReady(bucketState, nowMs)) return false;
+  return true;
+}
+
 export function bucketHasDispatchStartReservation(
   bucketState,
   {
@@ -227,13 +305,19 @@ export function buildLiveReviewerOccupancy({
   }
 
   const activeReviewers = liveGeneratingBuckets.length;
+  const capacityBuckets = [...liveGeneratingBuckets, ...dispatchStartBuckets];
   const desiredActiveReviewers = computeDesiredActiveReviewers(
     bucketStates,
     maxActive,
     excludedBuckets,
     bucketCount,
+    nowMs,
+    capacityBuckets,
   );
-  const rawScheduled = activeReviewers + dispatchStartBuckets.length + awaitingResponseBuckets.length;
+  // Only credible active generations and short dispatch-start grace count
+  // against simultaneous generation capacity. An unresolved action is useful
+  // diagnostic state, but cannot reserve a reviewer forever by itself.
+  const rawScheduled = activeReviewers + dispatchStartBuckets.length;
   const occupiedSlots = Math.min(desiredActiveReviewers, rawScheduled);
   const availableSlots = Math.max(0, desiredActiveReviewers - occupiedSlots);
 
@@ -288,10 +372,23 @@ export function countUnblockedUnfinishedBuckets(bucketStates, excludedBuckets = 
   return count;
 }
 
-export function computeDesiredActiveReviewers(bucketStates, maxActive, excludedBuckets = [], bucketCount = 6) {
+export function computeDesiredActiveReviewers(
+  bucketStates,
+  maxActive,
+  excludedBuckets = [],
+  bucketCount = 6,
+  nowMs = Date.now(),
+  occupiedBuckets = [],
+) {
+  const excluded = new Set(Array.from(excludedBuckets, value => String(value)));
+  const occupied = new Set(Array.from(occupiedBuckets, value => String(value)));
+  const eligibleCount = Object.entries(bucketStates || {}).filter(([bucket, bucketState]) => (
+    !excluded.has(String(bucket))
+    && (occupied.has(String(bucket)) || bucketEligibleForScheduling(bucketState, nowMs))
+  )).length;
   return Math.min(
     Number(maxActive) || 1,
-    countUnblockedUnfinishedBuckets(bucketStates, excludedBuckets, bucketCount),
+    Math.min(eligibleCount, Number(bucketCount) || eligibleCount),
   );
 }
 
@@ -437,7 +534,7 @@ export function isValidSourcePackNumber(bucket, packNumber) {
   return Boolean(
     config
     && Number.isInteger(packNumber)
-    && packNumber >= config.startPack,
+    && packNumber > 0,
   );
 }
 
@@ -558,7 +655,9 @@ export function resolveNextSourcePackTargetNumber(bucket, {
 
   if (lastConsumed !== null) {
     const targetNumber = nextSourcePackNumber({
-      startPack: shard.startPack,
+      // The source-code example contains redacted/stale startPack values.
+      // Advance only from a durable or response-evidenced cursor.
+      startPack: lastConsumed,
       incidentId: resolvedIncidentId,
       lastDeliveredNumber: lastConsumed,
       lastDeliveredIncidentId: bucketState.sourcePackLastDeliveredIncidentId,
@@ -601,19 +700,6 @@ export function resolveNextSourcePackTargetNumber(bucket, {
     if (isValidSourcePackNumber(bucket, targetNumber)) {
       return { targetNumber, reason: 'highest-mentioned-pack', lastConsumed: highest };
     }
-  }
-
-  const sourcePackBoundaryKnown = incident?.kind === 'NEXT_SOURCE_PACKS_REQUIRED'
-    || isSourcePackBoundaryFooter(incident?.footer)
-    || String(bucketState.lastProcessedBlocker || '').trim().toUpperCase() === 'NEXT_SOURCE_PACKS_REQUIRED';
-  const neverConsumed = lastConsumed === null
-    && !bucketState.sourcePackLastDeliveredAt
-    && parseSourcePackNumber(bucketState.sourcePackLastDeliveredNumber, bucket) === null
-    && !bucketState.sourcePackLastDeliveredIncidentId
-    && !bucketState.sourcePackLastDeliveredActionId
-    && (Number(bucketState.casesReported || 0) === 0 || sourcePackBoundaryKnown);
-  if (neverConsumed && isValidSourcePackNumber(bucket, shard.startPack)) {
-    return { targetNumber: shard.startPack, reason: 'start-pack-never-consumed', lastConsumed: null };
   }
 
   return { targetNumber: null, reason: 'SOURCE_PACK_CURSOR_UNRESOLVED', lastConsumed };
@@ -897,12 +983,15 @@ export function sourcePackRetryReady(bucketState, nowMs = Date.now()) {
 }
 
 export function isSourcePackContinuationActionKind(kind) {
-  return ['SOURCE_PACK_CONTINUE', 'SOURCE_PACK_RETRY', 'WRITE_RECOVERY'].includes(String(kind || ''));
+  return ['SOURCE_PACK_CONTINUE', 'SOURCE_PACK_RETRY'].includes(String(kind || ''));
 }
 
 export function reviewerConfirmedSourcePackAccess(bucketState, footer, responseAction) {
   if (!bucketState || !footer || !responseAction) return false;
   if (!isSourcePackContinuationActionKind(responseAction.kind)) return false;
+  if (responseAction.status !== 'SENT' || responseAction.deliveryVerified !== true || !responseAction.id) return false;
+  if (String(bucketState.sourcePackLastDeliveredActionId || '') !== String(responseAction.id)) return false;
+  if (parseSourcePackNumber(bucketState.sourcePackLastDeliveredNumber) !== parseSourcePackNumber(bucketState.sourcePackTargetNumber)) return false;
   if (isRecoverableUnavailableSourcePackFooter(footer)) return false;
   if (!Number.isInteger(parseSourcePackNumber(bucketState.sourcePackTargetNumber))) return false;
   return true;

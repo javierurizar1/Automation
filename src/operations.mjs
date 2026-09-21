@@ -3,6 +3,7 @@ import {
   bucketHasDispatchStartReservation,
   bucketHasGenerationReservation,
   bucketHasUnresolvedAwaitingAction,
+  bucketEligibleForScheduling,
   bucketIsUnfinished,
   bucketNeedsReviewer,
   computeDesiredActiveReviewers,
@@ -295,7 +296,7 @@ export function buildBucketOperationsView({
   const generationMinutes = minutesSince(bucketState?.generationObservedAt, nowMs);
   let exactBlocker = 'none';
   if (schedulingBlocked) exactBlocker = 'scheduling-blocked';
-  else if (operationalState === 'HOLD') exactBlocker = `hold:${bucketState?.lastAction || 'incident'}`;
+  else if (operationalState === 'HOLD') exactBlocker = `hold:${bucketState?.hold?.type || 'INTEGRITY'}:${bucketState?.hold?.reason || bucketState?.lastAction || 'incident'}`;
   else if (operationalState === 'WAITING_RESPONSE') exactBlocker = `awaiting-response:${bucketState?.awaitingActionId || 'unknown'}`;
   else if (operationalState === 'WAITING_SOURCE_PACK') exactBlocker = 'source-pack-continuation-pending';
   else if (operationalState === 'STALLED') exactBlocker = 'no-recent-audit-progress';
@@ -308,6 +309,14 @@ export function buildBucketOperationsView({
     operationalState,
     workflowPhase: bucketState?.phase || null,
     liveGeneration: Boolean(isLiveGenerating),
+    actualGenerationDetected: Boolean(isLiveGenerating),
+    generationReserved: bucketHasGenerationReservation(bucketState),
+    eligibleForScheduling: bucketEligibleForScheduling(bucketState, nowMs),
+    holdType: bucketState?.hold?.type || null,
+    holdReason: bucketState?.hold?.reason || null,
+    holdSince: bucketState?.hold?.createdAt || null,
+    recoverable: bucketState?.hold?.type === 'TRANSIENT_EXTERNAL',
+    nextRecoveryAttemptAt: bucketState?.hold?.nextAttemptAt || null,
     currentActionId: bucketState?.awaitingActionId || bucketState?.lastMessageSentActionId || null,
     currentActionType: bucketState?.lastMessageSentKind || null,
     currentSourcePack: pack.currentSourcePack,
@@ -341,6 +350,9 @@ export function buildBucketOperationsView({
 }
 
 function candidateBlockReason(bucket, bucketState, liveGeneratingByBucket) {
+  if (bucketState?.hold) {
+    return `B${bucket} ${bucketState.hold.type || 'INTEGRITY'} hold: ${bucketState.hold.reason || bucketState.lastAction || 'incident'}`;
+  }
   if (bucketBlocksCandidateActivation(bucketState)) {
     return `B${bucket} waiting for unresolved response (${bucketState.awaitingActionId})`;
   }
@@ -383,10 +395,15 @@ export function analyzeSchedulerHealth({
     maxReviewerGenerations,
     excludedBuckets,
     bucketCount,
+    nowMs,
+    [
+      ...(occupancy.liveGeneratingBuckets || []),
+      ...(occupancy.dispatchStartBuckets || []),
+    ],
   );
   const dispatchStartCount = Number(occupancy.dispatchStartBuckets?.length || 0);
   const awaitingResponseBuckets = occupancy.awaitingResponseBuckets || [];
-  const scheduledCapacity = liveReviewerGenerations + dispatchStartCount + awaitingResponseBuckets.length;
+  const scheduledCapacity = liveReviewerGenerations + dispatchStartCount;
   const reservationsExplainGap = scheduledCapacity >= desiredLiveReviewers;
   const candidates = selectReviewerSlotCandidates(bucketStates, excludedBuckets);
   const runnableCandidates = candidates.filter((bucket) => {
@@ -398,9 +415,8 @@ export function analyzeSchedulerHealth({
   let schedulerUnderutilized = false;
 
   if (liveReviewerGenerations < desiredLiveReviewers && availableReviewerSlots <= 0) {
-    const waitingBuckets = awaitingResponseBuckets.map(bucket => `B${bucket} waiting for unresolved response`);
     const dispatchBuckets = (occupancy.dispatchStartBuckets || []).map(bucket => `B${bucket} dispatch starting`);
-    const reservations = [...waitingBuckets, ...dispatchBuckets];
+    const reservations = [...dispatchBuckets];
     idleCapacityReason = reservations.length
       ? `capacity fully scheduled (${reservations.join('; ')})`
       : 'capacity fully scheduled';
@@ -434,6 +450,16 @@ export function analyzeSchedulerHealth({
     idleReviewerCapacity: availableReviewerSlots,
     idleCapacityReason,
     runnableCandidates: runnableCandidates.map(Number),
+    bucketExclusions: Object.fromEntries(Object.entries(bucketStates || {})
+      .filter(([bucket, bucketState]) => !isExcludedBucket(bucket, excludedBuckets) && bucketIsUnfinished(bucketState))
+      .map(([bucket, bucketState]) => {
+        if (liveGeneratingByBucket[String(bucket)]) return [bucket, null];
+        if (bucketEligibleForScheduling(bucketState, nowMs)
+          && !liveGeneratingByBucket[String(bucket)]) {
+          return [bucket, candidates.includes(bucket) ? null : candidateBlockReason(bucket, bucketState, liveGeneratingByBucket)];
+        }
+        return [bucket, candidateBlockReason(bucket, bucketState, liveGeneratingByBucket)];
+      })),
     dispatchStartBuckets: occupancy.dispatchStartBuckets || [],
     awaitingResponseBuckets,
     liveGeneratingBuckets: occupancy.liveGeneratingBuckets || [],

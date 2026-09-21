@@ -18,8 +18,10 @@ GPT-5.6 Sol was the highest selectable option verified in the connected account 
 
 1. Install the pinned Node.js dependencies with npm ci.
 2. Create a private root config.json using config/recovered-config.json as a shape reference. Supply the local project, registry, bucket, and conversation settings. Do not commit the completed config.
-3. Start the controller with Start-Controller.ps1. It connects to the dedicated Chrome CDP session and serves the dashboard on the configured loopback port.
+3. On Windows, start the controller with Start-Controller.ps1. It connects to the configured persistent browser/CDP session and serves the dashboard on the configured loopback port.
 4. Open the dashboard locally. The default address is http://127.0.0.1:9350/.
+
+On Linux with systemd user services, run `scripts/install-systemd-user.sh` after Node.js, npm, dependencies, and private config.json are ready. It installs and starts the controller, dashboard, and bounded watchdog timer without root privileges. See [Linux user services](docs/LINUX_USER_SERVICE.md).
 
 The example config contains placeholders and is not runnable as-is. Never publish chat IDs, service identifiers, cookies, tokens, browser profiles, case data, or runtime state. This review copy also replaces private source-shard folder IDs and operational pack offsets with placeholders; it is not a production checkout.
 
@@ -33,6 +35,7 @@ Run npm test for protocol parsing, bucket scheduling, new-chat recovery, model e
 - src/reviewer-model.mjs: required model and reasoning-effort selection with fail-closed verification.
 - src/reviewer-tabs.mjs: match retired tracked tabs without selecting unrelated pages.
 - dashboard.html and src/dashboard.mjs: local status and per-bucket model verification.
+- src/watchdog.mjs and systemd/user/: bounded Linux service recovery and reboot autostart.
 - src/protocol.mjs and src/operations.mjs: review protocol and dashboard metrics.
 - tests/: controller and protocol regression coverage.
 - docs/: sanitized project context, repair summary, and evidence.

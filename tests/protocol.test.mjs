@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  HOLD_TYPES,
   actionResponseKey,
   actionId,
   assistantAfterActionMarker,
@@ -9,11 +10,16 @@ import {
   bucketOccupiesReviewerSlot,
   bucketReclaimableIdleSlot,
   buildLiveReviewerOccupancy,
+  bucketEligibleForScheduling,
   computeDesiredActiveReviewers,
+  classifyHoldType,
   conversationRolloverReasonFromText,
   countOccupiedReviewerSlots,
   exactSourcePackFilenameMatches,
+  createHoldRecord,
   getBucketState,
+  holdValidationKind,
+  isHoldRetryDue,
   isExactSetupAck,
   isRecoverableAdvisoryCoordinatorFooter,
   isRecoverableReadbackFooter,
@@ -89,11 +95,12 @@ TRIGGER_COORDINATOR: NO`);
 });
 
 test('parses full-corpus completion evidence', () => {
-  const evidence = parseCorpusCompletionEvidence(`Full reconciliation complete.\nFULL_CORPUS_RECONCILED: YES\nFULL_CORPUS_AUDITABLE_POPULATION: 123\nOWNED_PENDING_CASES: 0\n\nAUDIT_TURN_STATUS\nSTATUS: COMPLETE\nNEW_CASES: 0\nWRITES_VERIFIED: YES\nBLOCKER: NONE\nTRIGGER_COORDINATOR: NO`);
+  const evidence = parseCorpusCompletionEvidence(`Full reconciliation complete.\nFULL_CORPUS_RECONCILED: YES\nFULL_CORPUS_AUDITABLE_POPULATION: 123\nOWNED_PENDING_CASES: 0\nUNRESOLVED_WRITES: 0\n\nAUDIT_TURN_STATUS\nSTATUS: COMPLETE\nNEW_CASES: 0\nWRITES_VERIFIED: YES\nBLOCKER: NONE\nTRIGGER_COORDINATOR: NO`);
   assert.deepEqual(evidence, {
     reconciled: 'YES',
     auditablePopulation: 123,
     ownedPendingCases: 0,
+    unresolvedWrites: 0,
   });
   assert.equal(isVerifiedCorpusCompletion(evidence, 123), true);
 });
@@ -105,6 +112,61 @@ test('rejects pack exhaustion as full-corpus completion', () => {
     ownedPendingCases: 1,
   }, 123), false);
   assert.equal(isVerifiedCorpusCompletion(null, 123), false);
+});
+
+test('completion evidence requires exactly the authoritative 65,720 population', () => {
+  const completeEvidence = {
+    reconciled: 'YES',
+    auditablePopulation: 65_720,
+    ownedPendingCases: 0,
+    unresolvedWrites: 0,
+  };
+  assert.equal(isVerifiedCorpusCompletion(completeEvidence, 65_720), true);
+  assert.equal(isVerifiedCorpusCompletion({ ...completeEvidence, auditablePopulation: 65_719 }, 65_720), false);
+  assert.equal(isVerifiedCorpusCompletion({ ...completeEvidence, ownedPendingCases: 1 }, 65_720), false);
+  assert.equal(isVerifiedCorpusCompletion({ ...completeEvidence, unresolvedWrites: 1 }, 65_720), false);
+  assert.equal(isVerifiedCorpusCompletion({ ...completeEvidence, unresolvedWrites: undefined }, 65_720), false);
+});
+
+test('typed transient registry holds carry a revalidation policy and bounded backoff', () => {
+  assert.deepEqual(HOLD_TYPES, ['TRANSIENT_EXTERNAL', 'INTEGRITY', 'ADVISORY', 'USER', 'COMPLETE']);
+  assert.equal(classifyHoldType('REGISTRY_STRUCTURE_UNAVAILABLE'), 'TRANSIENT_EXTERNAL');
+  assert.deepEqual(holdValidationKind('REGISTRY_STRUCTURE_UNAVAILABLE', 2), {
+    kind: 'REGISTRY_SHARD_AVAILABLE',
+    bucket: 2,
+  });
+
+  const hold = createHoldRecord({
+    type: 'TRANSIENT_EXTERNAL',
+    reason: 'REGISTRY_STRUCTURE_UNAVAILABLE',
+    bucket: 2,
+    createdAt: '2026-09-18T10:00:00.000Z',
+  });
+  assert.equal(hold.retryPolicy, 'REVALIDATE');
+  assert.equal(hold.nextAttemptAt, '2026-09-18T10:01:00.000Z');
+  assert.deepEqual(hold.validation, { kind: 'REGISTRY_SHARD_AVAILABLE', bucket: 2 });
+  assert.equal(isHoldRetryDue(hold, Date.parse('2026-09-18T10:00:59.999Z')), false);
+  assert.equal(isHoldRetryDue(hold, Date.parse('2026-09-18T10:01:00.000Z')), true);
+
+  const heldBucket = { complete: false, phase: 'HOLD', hold };
+  assert.equal(bucketEligibleForScheduling(heldBucket, Date.parse('2026-09-18T10:02:00.000Z')), false);
+  heldBucket.hold = null;
+  heldBucket.phase = 'ACTIVE';
+  assert.equal(bucketEligibleForScheduling(heldBucket, Date.parse('2026-09-18T10:02:00.000Z')), true);
+});
+
+test('integrity holds do not enter the timed transient-release path', () => {
+  assert.equal(classifyHoldType('REGISTRY_MAPPING_AMBIGUOUS'), 'INTEGRITY');
+  const hold = createHoldRecord({
+    type: 'INTEGRITY',
+    reason: 'ACTION_LEDGER_DISAGREEMENT',
+    createdAt: '2026-09-18T10:00:00.000Z',
+    nextAttemptAt: '2026-09-18T10:01:00.000Z',
+  });
+  assert.equal(hold.retryPolicy, 'EVIDENCE_RECONCILIATION');
+  assert.equal(hold.nextAttemptAt, null);
+  assert.equal(isHoldRetryDue(hold, Number.MAX_SAFE_INTEGER), false);
+  assert.equal(bucketEligibleForScheduling({ complete: false, phase: 'HOLD', hold }, Number.MAX_SAFE_INTEGER), false);
 });
 
 test('rejects nonstandard status', () => {
@@ -732,6 +794,8 @@ test('reviewer access is confirmed only from continuation responses, not control
     sourcePackTargetNumber: 4,
     sourcePackTargetFilename: 'pack_000004.jsonl',
     sourcePackResumeIncidentId: 'INC-B3',
+    sourcePackLastDeliveredNumber: 4,
+    sourcePackLastDeliveredActionId: 'A-test',
   };
   const footer = {
     status: 'NORMAL',
@@ -742,13 +806,27 @@ test('reviewer access is confirmed only from continuation responses, not control
   assert.equal(reviewerConfirmedSourcePackAccess(bucketState, footer, {
     kind: 'SOURCE_PACK_CONTINUE',
     id: 'A-test',
+    status: 'SENT',
+    deliveryVerified: true,
   }), true);
   assert.equal(reviewerConfirmedSourcePackAccess(bucketState, {
     status: 'ERROR',
     writesVerified: 'YES',
     blocker: 'SOURCE_PACK_UNAVAILABLE_OR_UNVERIFIED',
     triggerCoordinator: 'YES',
-  }, { kind: 'SOURCE_PACK_CONTINUE', id: 'A-test' }), false);
+  }, { kind: 'SOURCE_PACK_CONTINUE', id: 'A-test', status: 'SENT', deliveryVerified: true }), false);
+  assert.equal(reviewerConfirmedSourcePackAccess(bucketState, footer, {
+    kind: 'SOURCE_PACK_CONTINUE',
+    id: 'A-other',
+    status: 'SENT',
+    deliveryVerified: true,
+  }), false, 'response attributed to a different action cannot prove delivery');
+  assert.equal(reviewerConfirmedSourcePackAccess(bucketState, footer, {
+    kind: 'SOURCE_PACK_CONTINUE',
+    id: 'A-test',
+    status: 'SENT',
+    deliveryVerified: false,
+  }), false, 'unverified delivery cannot prove reviewer access');
 });
 
 test('continuation already sent when awaiting reviewer response', () => {
@@ -766,6 +844,31 @@ test('continuation already sent when awaiting reviewer response', () => {
     'A-test': { status: 'SENT', kind: 'SOURCE_PACK_CONTINUE', sentAt: '2026-09-17T20:00:00.000Z' },
   };
   assert.equal(sourcePackContinuationAlreadySent(bucketState, actions, 4, 'INC-B3'), true);
+});
+
+test('controller restart does not resubmit an already submitted source-pack continuation', () => {
+  const persisted = {
+    bucketState: {
+      sourcePackResumePending: true,
+      sourcePackTargetNumber: 4,
+      sourcePackResumeIncidentId: 'INC-B3',
+      sourcePackLastDeliveredNumber: 4,
+      sourcePackLastDeliveredIncidentId: 'INC-B3',
+      sourcePackLastDeliveredActionId: 'A-restarted',
+      awaitingActionId: 'A-restarted',
+      sourcePackAccessVerified: false,
+    },
+    actions: {
+      'A-restarted': { status: 'SENT', kind: 'SOURCE_PACK_CONTINUE', sentAt: '2026-09-17T20:00:00.000Z' },
+    },
+  };
+  const restored = JSON.parse(JSON.stringify(persisted));
+  assert.equal(sourcePackContinuationAlreadySent(
+    restored.bucketState,
+    restored.actions,
+    4,
+    'INC-B3',
+  ), true);
 });
 
 test('verified reviewer access permits continuation dedupe after response', () => {
@@ -849,6 +952,8 @@ test('null cursor never coerces to pack 0', () => {
   assert.equal(parseSourcePackNumber(null, 1), null);
   assert.equal(parseSourcePackNumber(undefined, 1), null);
   assert.equal(parseSourcePackNumber('', 1), null);
+  assert.equal(parseSourcePackNumber(Number.NaN, 1), null);
+  assert.equal(parseSourcePackNumber('not-a-pack', 1), null);
   const resolved = resolveNextSourcePackTargetNumber(1, {
     bucketState: { sourcePackTargetNumber: null, casesReported: 7 },
     incident: { kind: 'NEXT_SOURCE_PACKS_REQUIRED', footer: { status: 'NORMAL', writesVerified: 'YES', blocker: 'NEXT_SOURCE_PACKS_REQUIRED', triggerCoordinator: 'NO' } },
@@ -927,7 +1032,7 @@ test('already-consumed pack is not replayed when explicit target remains valid',
   assert.equal(resolved.reason, 'explicit-target');
 });
 
-test('legacy case totals do not block the configured first pack after a source-pack boundary', () => {
+test('legacy case totals and unproven shard start values cannot bootstrap a source-pack cursor', () => {
   const resolved = resolveNextSourcePackTargetNumber(2, {
     bucketState: {
       sourcePackTargetNumber: null,
@@ -941,8 +1046,8 @@ test('legacy case totals do not block the configured first pack after a source-p
     },
     incident: { kind: 'NEXT_SOURCE_PACKS_REQUIRED' },
   });
-  assert.equal(resolved.targetNumber, SOURCE_PACK_SHARDS[2].startPack);
-  assert.equal(resolved.reason, 'start-pack-never-consumed');
+  assert.equal(resolved.targetNumber, null);
+  assert.equal(resolved.reason, 'SOURCE_PACK_CURSOR_UNRESOLVED');
 });
 
 test('delivery evidence keeps a lost source-pack cursor unresolved', () => {
@@ -967,10 +1072,11 @@ test('inventory boundary is distinct from numeric source-pack validity', () => {
   assert.equal(isSourcePackBeyondInventory(8, null), false);
 });
 
-test('filename generation rejects invalid pack numbers', () => {
+test('filename generation rejects invalid cursors and never emits pack zero', () => {
   assert.equal(sourcePackFilename(0, 1), null);
-  assert.equal(sourcePackFilename(1, 1), null);
-  assert.equal(sourcePackFilename(2, 1), 'pack_000002.jsonl');
+  assert.equal(sourcePackFilename(Number.NaN, 1), null);
+  assert.equal(sourcePackFilename('not-a-pack', 1), null);
+  assert.equal(sourcePackFilename(1, 1), 'pack_000001.jsonl');
   assert.equal(packNumberFromFilename('pack_000000.jsonl', 1), null);
 });
 

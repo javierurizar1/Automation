@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the R4.3.3 controller watchdog periodically
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=5s
+RandomizedDelaySec=3s
+Persistent=true
+Unit=r433-audit-watchdog.service
+
+[Install]
+WantedBy=timers.target

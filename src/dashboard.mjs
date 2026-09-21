@@ -1,14 +1,18 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/(.:)/, '$1')), '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const execFileAsync = promisify(execFile);
 const CONFIG_PATH = path.join(ROOT, 'config.json');
 const DATA_DIR = path.join(ROOT, 'data');
 const STATUS_PATH = path.join(DATA_DIR, 'status.json');
 const STATE_PATH = path.join(DATA_DIR, 'state.json');
 const CONTROL_PATH = path.join(DATA_DIR, 'control.json');
+const WATCHDOG_STATUS_PATH = path.join(DATA_DIR, 'watchdog-state.json');
 const COORDINATOR_STATUS_PATH = path.join(DATA_DIR, 'coordinator-status.json');
 const TRACKER_SNAPSHOT_PATH = path.join(DATA_DIR, 'tracker-snapshot.json');
 const INCIDENT_DIR = path.join(DATA_DIR, 'incidents');
@@ -16,6 +20,8 @@ const DASHBOARD_PID_PATH = path.join(DATA_DIR, 'dashboard.pid');
 const DASHBOARD_HTML_PATH = path.join(ROOT, 'dashboard.html');
 const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8').replace(/^\uFEFF/, ''));
 const port = Number(config.dashboardPort || 9350);
+const controllerServiceName = String(config.controllerServiceName || 'r433-audit-controller.service');
+const dashboardStartedAt = new Date().toISOString();
 
 function now() {
   return new Date().toISOString();
@@ -30,8 +36,8 @@ function readJson(file, fallback = null) {
 }
 
 function writeJsonAtomic(file, value) {
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(tmp, file);
 }
 
@@ -70,24 +76,38 @@ function snapshot() {
   const rawStatus = readJson(STATUS_PATH, {
     updatedAt: null,
     connected: false,
-    runState: 'UNKNOWN',
+    runState: 'RECONCILIATION_ONLY',
+    controllerState: 'RECONCILIATION_ONLY',
+    dispatchEnabled: false,
     maxActiveReviewers: 2,
     activeReviewers: 0,
     buckets: {},
   });
   const state = readJson(STATE_PATH, {});
-  const control = readJson(CONTROL_PATH, { desiredState: 'RUNNING' });
+  const control = readJson(CONTROL_PATH, {
+    desiredState: 'RECONCILIATION_ONLY',
+    reason: 'CONTROL_FILE_ABSENT_OR_UNREADABLE',
+  });
   const status = {
     ...rawStatus,
     maxActiveReviewers: Math.min(2, Math.max(1, Number(config.maxActiveReviewers || 2))),
-    runState: rawStatus.runState || control.desiredState || 'UNKNOWN',
+    controllerState: rawStatus.controllerState || rawStatus.runState || control.desiredState || 'RECONCILIATION_ONLY',
+    runState: rawStatus.runState || control.desiredState || 'RECONCILIATION_ONLY',
+    dispatchEnabled: rawStatus.dispatchEnabled === true,
   };
   const coordinator = readJson(COORDINATOR_STATUS_PATH, null);
   const tracker = readJson(TRACKER_SNAPSHOT_PATH, null);
+  const watchdog = readJson(WATCHDOG_STATUS_PATH, {
+    state: 'UNKNOWN',
+    updatedAt: null,
+    issue: 'No watchdog status has been published yet.',
+  });
   return {
     serverTime: now(),
+    dashboard: { pid: process.pid, startedAt: dashboardStartedAt },
     status,
     control,
+    watchdog,
     state: {
       startedAt: state.startedAt || null,
       runStartedAt: state.runStartedAt || null,
@@ -102,14 +122,51 @@ function snapshot() {
   };
 }
 
-function spawnPowerShell(scriptName) {
+async function runPowerShell(scriptName) {
   const script = path.join(ROOT, scriptName);
-  const child = spawn(
-    'powershell.exe',
-    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', script],
-    { detached: true, stdio: 'ignore', windowsHide: true },
-  );
-  child.unref();
+  await execFileAsync('powershell.exe', [
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', script,
+  ], { encoding: 'utf8', timeout: 60_000, maxBuffer: 32_000, windowsHide: true });
+}
+
+async function runSystemctl(args) {
+  return execFileAsync('systemctl', ['--user', ...args], {
+    encoding: 'utf8',
+    timeout: 60000,
+    maxBuffer: 32000,
+    windowsHide: true,
+  });
+}
+
+async function controlController(action) {
+  if (process.platform === 'win32') {
+    if (action === 'stop') {
+      await runPowerShell('Stop-Controller.ps1');
+    } else {
+      await runPowerShell('Stop-Controller.ps1');
+      await runPowerShell('Start-Controller.ps1');
+    }
+    return;
+  }
+  if (process.platform !== 'linux') {
+    throw new Error(`Controller controls are not configured for ${process.platform}.`);
+  }
+
+  if (action === 'stop') {
+    await runSystemctl(['stop', controllerServiceName]);
+    return;
+  }
+
+  const { stdout = '' } = await runSystemctl([
+    'show', controllerServiceName, '--property=ActiveState', '--value',
+  ]);
+  const activeState = stdout.trim();
+  if (activeState === 'active' || activeState === 'activating' || activeState === 'deactivating') {
+    await runSystemctl(['restart', controllerServiceName]);
+  } else {
+    await runSystemctl(['reset-failed', controllerServiceName]);
+    await runSystemctl(['start', controllerServiceName]);
+  }
 }
 
 function setControl(desiredState, requestedBy = 'dashboard') {
@@ -163,25 +220,26 @@ async function handle(req, res) {
         return;
       }
       setControl(states[action]);
-      if (action === 'stop') spawnPowerShell('Stop-Controller.ps1');
-      if (action === 'start') spawnPowerShell('Start-Controller.ps1');
+      await controlController(action);
       writeResponse(res, 202, 'application/json; charset=utf-8', JSON.stringify({ accepted: true, action, desiredState: states[action] }));
     } catch (error) {
-      writeResponse(res, 400, 'application/json; charset=utf-8', JSON.stringify({ error: error.message }));
+      writeResponse(res, 503, 'application/json; charset=utf-8', JSON.stringify({
+        error: error.code === 'ETIMEDOUT' ? 'controller control command timed out' : error.message,
+      }));
     }
     return;
   }
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    writeResponse(res, 200, 'application/json; charset=utf-8', JSON.stringify({ ok: true, time: now() }));
+    writeResponse(res, 200, 'application/json; charset=utf-8', JSON.stringify({ ok: true, time: now(), pid: process.pid }));
     return;
   }
 
   writeResponse(res, 404, 'text/plain; charset=utf-8', 'Not found');
 }
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.writeFileSync(DASHBOARD_PID_PATH, String(process.pid), 'ascii');
+fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+fs.writeFileSync(DASHBOARD_PID_PATH, String(process.pid), { encoding: 'ascii', mode: 0o600 });
 const server = http.createServer((req, res) => {
   handle(req, res).catch(error => writeResponse(res, 500, 'application/json; charset=utf-8', JSON.stringify({ error: error.message })));
 });

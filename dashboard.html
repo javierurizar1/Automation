@@ -3,195 +3,207 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
   <title>R4.3.3 Audit Controller — Operations</title>
   <style>
-    :root { color-scheme: dark; font-family: Segoe UI, system-ui, sans-serif; background: #10151c; color: #e8eef6; }
-    body { margin: 0; padding: 24px; max-width: 1600px; margin-inline: auto; }
-    h1, h2 { margin: 0 0 12px; font-weight: 600; }
-    h1 { font-size: 24px; } h2 { font-size: 16px; color: #a9bdd2; }
-    .toolbar, .hero, .metrics, .messages, .panel { background: #18212b; border: 1px solid #2a3948; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-    button { border: 0; border-radius: 7px; padding: 9px 15px; color: #071018; background: #7dd3fc; cursor: pointer; font-weight: 600; }
-    button:hover { filter: brightness(1.1); } button:disabled { opacity: .45; cursor: wait; }
-    button.warn { background: #fbbf24; } button.stop { background: #fb7185; } button.neutral { background: #94a3b8; }
-    #runState { font-size: 18px; font-weight: 700; margin-right: auto; }
-    .subtle { color: #91a4b8; font-size: 12px; }
-    .hero { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
-    .heroBlock { background: #111923; border-radius: 10px; padding: 14px; }
-    .heroBlock .label { color: #91a4b8; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
-    .heroBlock .value { font-size: 28px; font-weight: 700; margin-top: 6px; }
-    .heroBlock .detail { margin-top: 8px; color: #cbd5e1; font-size: 13px; line-height: 1.45; }
-    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
-    .metric { padding: 12px; background: #111923; border-radius: 9px; }
-    .metric .label { color: #91a4b8; font-size: 12px; } .metric .value { font-size: 18px; margin-top: 5px; }
-    .messages { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; }
-    .message { background: #111923; border-radius: 9px; padding: 12px; min-height: 56px; }
-    .message .title { color: #7dd3fc; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
-    .message .body { margin-top: 7px; word-break: break-word; }
-    table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    th, td { padding: 8px 6px; border-bottom: 1px solid #293744; text-align: left; vertical-align: top; }
-    th { color: #91a4b8; font-weight: 500; position: sticky; top: 0; background: #18212b; }
-    td.action { max-width: 260px; word-break: break-word; }
-    a { color: #7dd3fc; }
-    .state { font-weight: 700; letter-spacing: .02em; }
-    .GENERATING { color: #86efac; } .RECENT_PROGRESS { color: #67e8f9; } .WAITING_RESPONSE { color: #fbbf24; }
-    .WAITING_SOURCE_PACK { color: #fbbf24; } .SETUP, .ROLLOVER { color: #c4b5fd; } .STALLED { color: #fb7185; }
-    .BLOCKED { color: #94a3b8; } .RUNNABLE_IDLE { color: #cbd5e1; } .IDLE { color: #64748b; }
-    .error { border-left: 3px solid #fb7185; padding: 8px 10px; margin: 7px 0; background: #211b23; }
-    .error .meta { color: #fda4af; font-size: 12px; } .error .detail { margin-top: 4px; word-break: break-word; }
-    .ok { color: #86efac; } .bad { color: #fb7185; } .warnText { color: #fbbf24; }
-    .activity { font-family: Consolas, monospace; font-size: 12px; line-height: 1.5; }
-    .activity div { padding: 4px 0; border-bottom: 1px solid #223041; }
-    .underutil { border: 1px solid #fbbf24; background: #2a2318; }
-    @media (max-width: 900px) { body { padding: 12px; } .panel { overflow-x: auto; } }
+    :root { color-scheme: dark; font: 14px/1.45 system-ui, sans-serif; background: #0d141c; color: #e7edf4; }
+    * { box-sizing: border-box; }
+    body { margin: 0 auto; padding: 22px; max-width: 1720px; }
+    h1,h2,h3,p { margin: 0; }
+    h1 { font-size: 23px; letter-spacing: .01em; }
+    h2 { font-size: 15px; color: #a9bfd1; margin-bottom: 12px; }
+    h3 { font-size: 14px; }
+    .toolbar,.panel,.card,.metric { border: 1px solid #293b4b; border-radius: 10px; background: #17212c; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; padding: 14px 16px; margin-bottom: 14px; }
+    .title { min-width: 250px; margin-right: auto; }
+    .subtle { color: #93a8ba; font-size: 12px; }
+    #runState { font-size: 14px; font-weight: 700; }
+    button { border: 0; border-radius: 6px; padding: 9px 13px; background: #7dd3fc; color: #071018; font-weight: 700; cursor: pointer; }
+    button:hover { filter: brightness(1.08); } button:disabled { opacity: .5; cursor: wait; }
+    button.stop { background: #fb7185; } button.neutral { background: #94a3b8; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(245px,1fr)); gap: 10px; margin-bottom: 14px; }
+    .card { padding: 13px; min-width: 0; }
+    .card h3 { margin-bottom: 7px; color: #b9c9d7; }
+    .big { font-size: 21px; font-weight: 750; overflow-wrap: anywhere; }
+    .detail { margin-top: 6px; color: #c2cfdb; font-size: 12px; overflow-wrap: anywhere; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit,minmax(125px,1fr)); gap: 8px; margin-bottom: 14px; }
+    .metric { padding: 10px 12px; }
+    .metric .label { font-size: 11px; color: #93a8ba; }
+    .metric .value { font-size: 18px; font-weight: 700; margin-top: 4px; overflow-wrap: anywhere; }
+    .panel { padding: 14px; margin-bottom: 14px; }
+    .slots,.buckets { display: grid; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); gap: 9px; }
+    .kv { display: grid; grid-template-columns: minmax(105px,auto) 1fr; gap: 3px 8px; font-size: 12px; }
+    .kv .key { color: #93a8ba; }
+    .bucket { border-left: 3px solid #41576b; }
+    .bucket.complete { border-left-color: #4ade80; }
+    .bucket.held { border-left-color: #fbbf24; }
+    .bucket.failed { border-left-color: #fb7185; }
+    .bucket h3 { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .badge { border-radius: 999px; padding: 2px 7px; background: #263747; font-size: 10px; white-space: nowrap; }
+    .ok { color: #86efac; } .warn { color: #fbbf24; } .bad { color: #fb7185; }
+    .mono { font-family: ui-monospace,SFMono-Regular,Consolas,monospace; font-size: 11px; overflow-wrap: anywhere; }
+    .incident { padding: 9px 0; border-bottom: 1px solid #293b4b; }
+    .incident:last-child { border-bottom: 0; }
+    .empty { color: #93a8ba; }
+    @media (max-width: 650px) { body { padding: 10px; } .toolbar { gap: 8px; } .title { width: 100%; } button { flex: 1; } }
   </style>
 </head>
 <body>
-  <div class="toolbar">
-    <div><h1>R4.3.3 Audit Controller</h1><div class="subtle">Operations view · max 2 simultaneous reviewers · 5 bucket chats · GPT-5.6 Sol High</div></div>
-    <div id="runState">Loading…</div>
+  <header class="toolbar">
+    <div class="title"><h1>R4.3.3 Audit Controller</h1><div class="subtle">Local operations · 6 buckets · 2 reusable reviewer slots · 3 automation tabs maximum</div></div>
+    <div id="runState">Loading controller status…</div>
     <button class="stop" data-action="stop">STOP AUTOMATION</button>
     <button data-action="start">RESTART AUTOMATION</button>
-    <button class="neutral" id="refresh">Refresh</button>
-  </div>
+    <button class="neutral" id="refresh">REFRESH</button>
+  </header>
 
-  <div class="hero" id="hero"></div>
-  <div class="metrics" id="metrics"></div>
-
-  <div class="messages">
-    <div class="message"><div class="title">Registry tracker</div><div class="body" id="tracker">—</div></div>
-    <div class="message"><div class="title">Scheduler health</div><div class="body" id="schedulerHealth">—</div></div>
-    <div class="message"><div class="title">Recent activity</div><div class="body activity" id="activity">—</div></div>
-    <div class="message"><div class="title">Coordinator delivery</div><div class="body" id="coordinator">—</div></div>
-  </div>
-
-  <section class="panel"><h2>Bucket operations</h2><div id="buckets">Loading…</div></section>
-  <section class="panel"><h2>Error log and coordinator incidents</h2><div id="errors">No incidents found.</div></section>
+  <section class="grid" id="runtime"></section>
+  <section class="panel"><h2>Reviewer slots</h2><div class="slots" id="reviewerSlots"></div></section>
+  <section class="metrics" id="metrics"></section>
+  <section class="panel"><h2>Scheduler exclusions</h2><div id="scheduler"></div></section>
+  <section class="panel"><h2>Buckets B0–B5</h2><div class="buckets" id="buckets"></div></section>
+  <section class="grid" id="operations"></section>
+  <section class="panel"><h2>Recent incidents</h2><div id="incidents" class="empty">No incidents recorded.</div></section>
 
   <script>
     const $ = id => document.getElementById(id);
-    const buttons = [...document.querySelectorAll('[data-action]')];
-    const fmtTime = value => value ? new Date(value).toLocaleString() : '—';
-    const fmtShort = value => value ? new Date(value).toLocaleTimeString() : '—';
-    const fmtDuration = seconds => {
-      if (seconds == null || !Number.isFinite(Number(seconds))) return 'unknown';
-      seconds = Math.max(0, Math.round(Number(seconds)));
-      const d = Math.floor(seconds / 86400); seconds %= 86400;
-      const h = Math.floor(seconds / 3600); seconds %= 3600;
-      const m = Math.floor(seconds / 60); const s = seconds % 60;
-      return `${d ? d + 'd ' : ''}${h ? h + 'h ' : ''}${m ? m + 'm ' : ''}${s}s`;
-    };
-    const fmtMinutes = value => value == null || !Number.isFinite(Number(value)) ? '—' : `${Math.round(Number(value))}m`;
-    const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    const controls = [...document.querySelectorAll('[data-action]')];
+    const esc = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const time = value => value ? (Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : esc(value)) : '—';
+    const shortTime = value => value ? (Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleTimeString() : esc(value)) : '—';
+    const ageSeconds = value => { const t = value ? Date.parse(value) : NaN; return Number.isFinite(t) ? Math.max(0, Math.floor((Date.now()-t)/1000)) : null; };
+    const val = (value, fallback='—') => value == null || value === '' ? fallback : value;
+    const yesNo = value => value === true ? '<span class="ok">YES</span>' : value === false ? '<span class="bad">NO</span>' : '<span class="subtle">UNKNOWN</span>';
+    const shortId = value => value ? String(value).slice(0, 10) : '—';
+    const slotName = slot => String(slot?.slotId || slot?.slot || '');
 
     function render(data) {
       const s = data.status || {};
-      const m = s.metrics || {};
+      const metrics = s.metrics || {};
       const tracker = data.tracker || {};
-      const trackerBaseline = Number(tracker.controllerCasesReportedBaseline);
-      const controllerObserved = Number(s.casesProcessedTotal ?? m.casesProcessed ?? 0);
-      const trackerDelta = Number.isFinite(trackerBaseline) ? Math.max(0, controllerObserved - trackerBaseline) : 0;
-      const verifiedTerminal = tracker.canonicalTerminalRecords == null ? null : Number(tracker.canonicalTerminalRecords);
-      const liveTerminal = verifiedTerminal == null ? null : verifiedTerminal + trackerDelta;
-      const liveRemaining = liveTerminal == null || tracker.finalizedPopulation == null
-        ? null
-        : Math.max(0, Number(tracker.finalizedPopulation) - liveTerminal);
-      const desired = (data.control?.desiredState || s.runState || 'UNKNOWN').toUpperCase();
-      const statusAge = s.updatedAt ? Math.round((Date.now() - new Date(s.updatedAt).getTime()) / 1000) : null;
-      const health = statusAge != null && statusAge > 120 ? 'STALE' : (s.connected ? 'CONNECTED' : 'OFFLINE');
-      const live = Number(s.liveReviewerGenerations ?? s.activeReviewers ?? 0);
-      const maxLive = Number(s.maxReviewerGenerations ?? s.maxActiveReviewers ?? 2);
-      const productiveLive = Number(s.productiveReviewerCount ?? s.substantiveAuditGenerations ?? 0);
-      const productive15 = Array.isArray(s.progressingBuckets15m) ? s.progressingBuckets15m.length : 0;
-      const modelPolicy = s.reviewerModelPolicy || {};
-      const requiredModel = modelPolicy.model || 'GPT-5.6 Sol';
-      const requiredEffort = modelPolicy.effort || 'High';
-      const managedChats = s.managedReviewerChatCount ?? '—';
-      const maxReviewerChats = s.maxReviewerChatTabs ?? 5;
+      const watchdog = data.watchdog || {};
+      const build = s.build || {};
+      const buckets = s.buckets || {};
+      const heartbeatAt = s.heartbeatAt || s.updatedAt;
+      const heartbeatAge = ageSeconds(heartbeatAt);
+      const controllerState = s.controllerState || s.runState || 'UNKNOWN';
+      const health = heartbeatAge == null ? 'UNKNOWN' : heartbeatAge > 120 ? 'STALE' : (s.browserConnected === false ? 'DEGRADED' : 'HEALTHY');
+      const desired = String(data.control?.desiredState || controllerState).toUpperCase();
+      $('runState').innerHTML = `${esc(controllerState)} · ${health} <span class="subtle">· heartbeat ${heartbeatAge == null ? 'unknown' : `${heartbeatAge}s ago`}</span>`;
 
-      $('runState').innerHTML = `${esc(desired)} <span class="subtle">· ${esc(health)}${statusAge != null ? ` · heartbeat ${statusAge}s ago` : ''}</span>`;
-
-      const underutilClass = s.schedulerUnderutilized ? 'heroBlock underutil' : 'heroBlock';
-      $('hero').innerHTML = [
-        `<div class="${underutilClass}"><div class="label">Reviewers live (CDP)</div><div class="value">${live} / ${maxLive}</div><div class="detail">Substantive audit generations: ${esc(productiveLive)} · Scheduled slots: ${esc(s.scheduledReviewers ?? live)} · Available: ${esc(s.availableReviewerSlots ?? 0)} · Desired: ${esc(s.desiredLiveReviewers ?? s.desiredActiveReviewers ?? maxLive)}</div></div>`,
-        `<div class="heroBlock"><div class="label">Reviewer model</div><div class="value">${esc(requiredModel)}</div><div class="detail">Required effort: ${esc(requiredEffort)}. Verified before every send; unavailable holds the bucket without downgrading. Managed bucket chats: ${esc(managedChats)} / ${esc(maxReviewerChats)}.</div></div>`,
-        `<div class="heroBlock"><div class="label">Progress</div><div class="value">${esc(s.newCasesLast15m ?? 0)} cases / 15m</div><div class="detail">5m: ${esc(s.newCasesLast5m ?? 0)} · 60m: ${esc(s.newCasesLast60m ?? 0)} · Productive buckets (15m): ${productive15}<br>Last global progress: ${esc(fmtTime(s.lastGlobalProgressAt ?? m.lastProgressAt))} (${esc(fmtMinutes(s.minutesSinceLastGlobalProgress))} ago)</div></div>`,
-        `<div class="heroBlock"><div class="label">Corpus observed*</div><div class="value">${esc(controllerObserved)}</div><div class="detail">Remaining estimate: ${esc(s.casesRemainingEstimate ?? m.casesRemaining ?? '—')} of ${esc(m.auditablePopulation ?? 'not configured')}<br>Rate*: ${esc(m.processingRatePerHour ?? 0)} cases/hr · ETA*: ${esc(fmtDuration(m.etaSeconds))}</div></div>`,
-        `<div class="${s.schedulerUnderutilized ? 'heroBlock underutil' : 'heroBlock'}"><div class="label">Capacity</div><div class="value">${s.schedulerUnderutilized ? 'UNDERUTILIZED' : 'OK'}</div><div class="detail">${s.idleReviewerCapacity > 0 ? `Idle reviewer capacity: ${esc(s.idleReviewerCapacity)}<br>Reason: ${esc(s.idleCapacityReason || 'none')}` : 'No idle capacity. Slots may be held by live generations or unresolved responses.'}</div></div>`,
+      const automationTabs = s.automationTabCount ?? ((s.coordinatorTabPresent ? 1 : 0) + Number(s.reviewerTabCount || 0));
+      const canonical = s.canonicalRegistry || tracker.canonicalRegistry || {};
+      const canonicalVerified = canonical.status === 'AVAILABLE'
+        && canonical.acceptedTerminalCount != null
+        && canonical.remainingAuditableCases != null
+        && Number.isFinite(Number(canonical.acceptedTerminalCount))
+        && Number.isFinite(Number(canonical.remainingAuditableCases))
+        && Boolean(canonical.reconciledAt);
+      const terminal = canonicalVerified ? Number(canonical.acceptedTerminalCount).toLocaleString() : 'Unavailable';
+      const remaining = canonicalVerified ? Number(canonical.remainingAuditableCases).toLocaleString() : 'Unavailable';
+      const localCases = s.casesProcessedTotal ?? metrics.casesProcessed ?? '—';
+      const localRemaining = s.casesRemainingEstimate ?? metrics.casesRemaining ?? '—';
+      const integrityAt = tracker.reconciledAt || tracker.updatedAt || tracker.snapshotAt || null;
+      const integrityTimestamped = tracker.sanitized === true
+        && Boolean(integrityAt && Number.isFinite(Date.parse(integrityAt)));
+      const integritySummary = integrityTimestamped
+        ? `Latest sanitized snapshot ${time(integrityAt)} (may be stale): conflicts ${esc(val(tracker.conflictingTerminalRows))} · misowned ${esc(val(tracker.ownershipMismatches))}`
+        : 'Integrity conflict and misowned counts unavailable; no timestamped sanitized snapshot is loaded.';
+      const buildSha = build.gitSha || s.gitSha || 'unavailable';
+      const sourceHash = build.sourceHash || 'unavailable';
+      const loadedHash = build.loadedSourceHash || sourceHash;
+      const diskHash = build.diskSourceHash || sourceHash;
+      const endpoint = s.cdpEndpoint || '—';
+      $('runtime').innerHTML = [
+        `<article class="card"><h3>Controller</h3><div class="big">${esc(controllerState)}</div><div class="detail">Desired: ${esc(desired)} · PID: ${esc(s.controllerPid ?? '—')}<br>Started: ${esc(time(s.startedAt))}<br>Heartbeat: ${esc(time(heartbeatAt))}</div></article>`,
+        `<article class="card"><h3>Build fingerprint</h3><div class="big mono">${esc(buildSha)}</div><div class="detail">Source: ${esc(sourceHash)}<br>Loaded: ${esc(loadedHash)}<br>On disk: ${esc(diskHash)}<br>Process started: ${esc(time(build.startedAt || s.startedAt))}</div></article>`,
+        `<article class="card"><h3>Browser and CDP</h3><div class="big">${s.browserConnected === true ? '<span class="ok">CONNECTED</span>' : s.browserConnected === false ? '<span class="bad">DISCONNECTED</span>' : 'UNKNOWN'}</div><div class="detail">${esc(s.browserExecutable || 'Browser unknown')} · PID ${esc(s.browserPid ?? '—')}<br>CDP: ${esc(endpoint)}<br>Coordinator page: ${yesNo(s.coordinatorTabPresent)} · Reviewer pages: ${esc(s.reviewerTabCount ?? '—')}<br>Automation tabs: ${esc(automationTabs)} / 3</div></article>`,
+        `<article class="card"><h3>Canonical registry population</h3><div class="big">${esc(terminal)} terminal · ${esc(remaining)} remaining</div><div class="detail">Registry reconciliation: ${esc(canonical.status || 'UNAVAILABLE')} · checked ${esc(time(canonical.reconciledAt))}<br>Population: ${esc(canonical.auditablePopulation ?? metrics.auditablePopulation ?? s.auditablePopulation ?? '65,720')}<br>${integritySummary}<br>Last controller progress: ${esc(time(s.lastGlobalProgressAt || metrics.lastProgressAt))}</div></article>`,
+        `<article class="card"><h3>Coordinator</h3><div class="big">${esc(s.coordinatorState || data.coordinator?.status || 'UNKNOWN')}</div><div class="detail">Coordinator tab: ${yesNo(s.coordinatorTabPresent)}<br>Coordinator status updated: ${esc(time(data.coordinator?.updatedAt || data.coordinator?.startedAt))}</div></article>`,
       ].join('');
 
+      const slotSource = Array.isArray(s.reviewerSlots) ? s.reviewerSlots : Object.values(s.reviewerSlots || {});
+      const slotCards = [1,2].map(index => {
+        const expected = `reviewer-${index}`;
+        const slot = slotSource.find(item => slotName(item) === expected || slotName(item) === String(index)) || {};
+        const bucketEntry = Object.values(buckets).find(b => Number(b.reviewerSlot) === index || b.reviewerSlot === expected);
+        const bucket = slot.bucket ?? bucketEntry?.bucket;
+        const generation = slot.actualGeneration ?? bucketEntry?.actualGenerationDetected;
+        const assigned = slot.present === true || bucket != null;
+        return `<article class="card"><h3>Reviewer slot ${index} <span class="badge">${assigned ? 'REUSABLE SLOT' : 'AVAILABLE'}</span></h3><div class="kv"><span class="key">Page present</span><span>${yesNo(slot.present ?? assigned)}</span><span class="key">Health</span><span>${esc(slot.health || (assigned ? 'UNKNOWN' : 'EMPTY'))}</span><span class="key">Bucket</span><span>${bucket == null ? '—' : `B${esc(bucket)}`}</span><span class="key">Generation active</span><span>${yesNo(generation)}</span><span class="key">Page</span><span>${esc(slot.pageUrl ? (() => { try { return new URL(slot.pageUrl).hostname; } catch { return 'present'; } })() : '—')}</span><span class="key">Conversation</span><span>${esc(shortId(slot.reviewerConversationId || bucketEntry?.reviewerConversationId))}</span><span class="key">Reason</span><span>${esc(slot.reason || '—')}</span></div></article>`;
+      });
+      $('reviewerSlots').innerHTML = slotCards.join('');
+
       $('metrics').innerHTML = [
-        ['Live generating buckets', (s.liveGeneratingBuckets || []).map(b => `B${b}`).join(', ') || 'none'],
-        ['Productive reviewer count', productiveLive],
-        ['Dispatch-start reservations', (s.dispatchStartBuckets || []).map(b => `B${b}`).join(', ') || 'none'],
-        ['Awaiting-response reservations', (s.awaitingResponseBuckets || []).map(b => `B${b}`).join(', ') || 'none'],
-        ['Verified writes 5m', s.verifiedWritesLast5m ?? 0],
-        ['Verified writes 15m', s.verifiedWritesLast15m ?? 0],
-        ['Verified writes 60m', s.verifiedWritesLast60m ?? 0],
-        ['Progressing buckets 5m', (s.progressingBuckets5m || []).map(b => `B${b}`).join(', ') || 'none'],
-        ['Progressing buckets 60m', (s.progressingBuckets60m || []).map(b => `B${b}`).join(', ') || 'none'],
-        ['Time working', fmtDuration(Number(m.workingElapsedMs || 0) / 1000)],
-        ['Live terminal', liveTerminal ?? '—'],
-        ['Live remaining', liveRemaining ?? '—'],
-      ].map(([label, value]) => `<div class="metric"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join('');
+        ['Live generations', `${esc(s.liveReviewerGenerations ?? s.activeReviewers ?? 0)} / 2`],
+        ['Cases · 5 min', esc(s.newCasesLast5m ?? 0)], ['Cases · 15 min', esc(s.newCasesLast15m ?? 0)], ['Cases · 60 min', esc(s.newCasesLast60m ?? 0)],
+        ['Verified writes · 5 min', esc(s.verifiedWritesLast5m ?? 0)], ['Verified writes · 15 min', esc(s.verifiedWritesLast15m ?? 0)], ['Verified writes · 60 min', esc(s.verifiedWritesLast60m ?? 0)],
+        ['Scheduler eligible buckets', (s.eligibleBuckets || []).map(b => `B${b}`).join(', ') || '—'],
+      ].map(([label,value]) => `<div class="metric"><div class="label">${label}</div><div class="value">${value}</div></div>`).join('');
 
-      if (tracker.canonicalTerminalRecords != null) {
-        const pending = Object.entries(tracker.pendingByBucket || {}).map(([bucket, count]) => `B${bucket}: ${count}`).join(' · ') || 'none';
-        $('tracker').innerHTML = `<b>${esc(liveTerminal)}</b> live terminal of <b>${esc(tracker.finalizedPopulation)}</b> finalized · <b>${esc(liveRemaining)}</b> remaining<br><span class="subtle">registry verified ${esc(tracker.canonicalTerminalRecords)} at ${esc(fmtTime(tracker.verifiedAt))} · +${esc(trackerDelta)} controller-terminalized since verification · pending re-review ${esc(tracker.pendingReReview ?? '—')} (${esc(pending)})</span>`;
-      } else {
-        $('tracker').innerHTML = '<span class="bad">Tracker snapshot unavailable.</span>';
-      }
+      const exclusions = s.scheduler?.bucketExclusions || s.schedulerExclusions || {};
+      $('scheduler').innerHTML = `<div class="kv">${Array.from({length:6},(_,i) => {
+        const b = buckets[String(i)] || buckets[i] || {};
+        const reason = b.schedulerExclusionReason || exclusions[String(i)] || exclusions[i] || '—';
+        const eligible = b.eligibleForScheduling;
+        return `<span class="key">B${i}</span><span>${eligible === true ? '<span class="ok">ELIGIBLE</span>' : eligible === false ? '<span class="warn">EXCLUDED</span>' : '<span class="subtle">UNKNOWN</span>'} · ${esc(reason)}</span>`;
+      }).join('')}</div>`;
 
-      $('schedulerHealth').innerHTML = `<b>Desired live:</b> ${esc(s.desiredLiveReviewers ?? '—')} · <b>Live:</b> ${esc(live)} · <b>Underutilized:</b> ${s.schedulerUnderutilized ? '<span class="warnText">YES</span>' : '<span class="ok">NO</span>'}<br><span class="subtle">${esc(s.idleCapacityReason || 'No idle capacity issue detected.')}</span>`;
+      $('buckets').innerHTML = Array.from({length:6},(_,i) => {
+        const b = buckets[String(i)] || buckets[i] || {};
+        const phase = b.phase || b.workflowPhase || b.operationalState || 'UNKNOWN';
+        const holdType = b.holdType || (b.complete ? 'COMPLETE' : '—');
+        const hold = b.holdReason || b.exactBlocker || '—';
+        const statusClass = b.complete ? 'complete' : b.holdType && b.holdType !== 'ADVISORY' ? 'held' : (b.phase === 'ERROR' ? 'failed' : '');
+        return `<article class="card bucket ${statusClass}"><h3>B${i}<span class="badge">${b.complete ? 'COMPLETE' : esc(phase)}</span></h3><div class="kv">
+          <span class="key">Phase</span><span>${esc(phase)} · complete ${yesNo(b.complete)}</span>
+          <span class="key">Hold</span><span>${esc(holdType)} · ${esc(hold)}<br><span class="subtle">since ${esc(time(b.holdSince))} · recoverable ${esc(val(b.recoverable))} · retry ${esc(time(b.nextRecoveryAttemptAt))}</span></span>
+          <span class="key">Scheduler</span><span>${b.eligibleForScheduling === true ? '<span class="ok">ELIGIBLE</span>' : b.eligibleForScheduling === false ? '<span class="warn">EXCLUDED</span>' : 'UNKNOWN'} · ${esc(b.schedulerExclusionReason || '—')}</span>
+          <span class="key">Reviewer</span><span>slot ${esc(b.reviewerSlot ?? '—')} · reserved ${yesNo(b.generationReserved)} · active ${yesNo(b.actualGenerationDetected)}<br><span class="subtle">conversation ${esc(shortId(b.reviewerConversationId))}</span></span>
+          <span class="key">Action</span><span>${esc(b.currentActionKind || b.currentActionType || '—')} · ${esc(b.currentActionId || '—')}<br><span class="subtle">awaiting ${esc(time(b.awaitingResponseAt))}</span></span>
+          <span class="key">Packs</span><span>current ${esc(b.currentPack || b.currentSourcePack || '—')} · last ${esc(b.lastConsumedPack || b.lastConsumedSourcePack || '—')} · target ${esc(b.targetPack || '—')}</span>
+          <span class="key">Progress</span><span>${esc(time(b.lastProgressAt))} · registry write ${esc(time(b.lastRegistryWriteAt))}<br><span class="subtle">write readback ${yesNo(b.lastRegistryWriteVerified)}</span></span>
+        </div></article>`;
+      }).join('');
 
-      const activity = s.recentActivity || s.operations?.recentActivity || [];
-      $('activity').innerHTML = activity.length
-        ? activity.slice(0, 20).map(item => `<div>${esc(fmtShort(item.at))} ${item.bucket == null ? '' : `B${esc(item.bucket)} `}${esc(item.kind || 'EVENT')}: ${esc(item.summary || '')}</div>`).join('')
-        : '<span class="subtle">No recent controller events recorded yet.</span>';
+      const service = watchdog.controllerService || {};
+      $('operations').innerHTML = [
+        `<article class="card"><h3>Watchdog</h3><div class="big">${esc(watchdog.state || 'UNKNOWN')}</div><div class="detail">Updated: ${esc(time(watchdog.updatedAt))}<br>Issue: ${esc(watchdog.issue || 'none')}<br>Attempts in window: ${esc(watchdog.attemptsInWindow ?? 0)} / ${esc(watchdog.maxRecoveryAttempts ?? 3)}<br>Next attempt: ${esc(time(watchdog.nextAttemptAt))}<br>Last action: ${esc(watchdog.lastActionResult || '—')}</div></article>`,
+        `<article class="card"><h3>Controller service</h3><div class="big">${esc(service.activeState || 'UNKNOWN')} / ${esc(service.subState || 'UNKNOWN')}</div><div class="detail">Unit: ${esc(watchdog.controllerUnit || 'r433-audit-controller.service')}<br>PID: ${esc(service.mainPid ?? '—')} · Restart count: ${esc(service.nRestarts ?? '—')}<br>Last exit: ${esc(service.lastExitStatus ?? '—')}<br>Suppressed: ${esc(watchdog.suppressedState || 'none')}</div></article>`,
+        `<article class="card"><h3>Controller telemetry and write verification</h3><div class="big">Last progress ${esc(time(s.lastGlobalProgressAt || metrics.lastProgressAt))}</div><div class="detail">Verified write: ${esc(time(s.lastRegistryWriteAt))} · readback ${yesNo(s.lastRegistryWriteVerified)}<br>Local cases reported: ${esc(localCases)} · local remaining estimate: ${esc(localRemaining)}<br><span class="subtle">Controller telemetry is not canonical registry evidence.</span></div></article>`,
+        `<article class="card"><h3>Coordinator activity</h3><div class="big">${esc(data.coordinator?.status || s.coordinatorState || 'IDLE')}</div><div class="detail">Incident: ${esc(shortId(data.coordinator?.incidentId))}<br>Queued ${esc(time(data.coordinator?.queuedAt))} · started ${esc(time(data.coordinator?.startedAt))}<br>Finished ${esc(time(data.coordinator?.completedAt))}</div></article>`,
+      ].join('');
 
-      const c = data.coordinator;
-      $('coordinator').innerHTML = c ? `<b>${esc(c.status || 'UNKNOWN')}</b> · ${esc(c.incidentId || 'no incident')}<br><span class="subtle">queued ${esc(fmtTime(c.queuedAt))} · started ${esc(fmtTime(c.startedAt))} · finished ${esc(fmtTime(c.completedAt))}</span>` : 'No coordinator activity recorded.';
-
-      const buckets = Object.entries(s.buckets || {}).sort((a,b) => Number(a[0]) - Number(b[0]));
-      $('buckets').innerHTML = `<table><thead><tr>
-        <th>Bucket</th><th>Operational</th><th>Workflow</th><th>Live</th><th>Model check</th><th>Current pack</th><th>Pack staging</th><th>Last progress</th><th>Cases 15m/60m</th><th>Action</th><th>Blocker</th><th>Chat</th>
-      </tr></thead><tbody>${buckets.map(([bucket, b]) => `<tr>
-        <td>B${esc(bucket)}</td>
-        <td class="state ${esc(b.operationalState || 'IDLE')}">${esc(b.operationalState || '—')}</td>
-        <td>${esc(b.workflowPhase || b.phase || '—')}</td>
-        <td>${b.liveGeneration ? '<span class="ok">YES</span>' : 'NO'}</td>
-        <td>${b.reviewerModelVerification
-          ? `<span class="${b.reviewerModelVerification.model === requiredModel && b.reviewerModelVerification.effort === requiredEffort ? 'ok' : 'bad'}">${esc(b.reviewerModelVerification.model)} · ${esc(b.reviewerModelVerification.effort)}</span><br><span class="subtle">verified ${esc(fmtTime(b.reviewerModelVerification.verifiedAt))}</span>`
-          : '<span class="warnText">checked before next send</span>'}
-          ${b.newChatCreationStatus ? `<br><span class="warnText">chat creation: ${esc(b.newChatCreationStatus)}</span>` : ''}</td>
-        <td>${esc(b.currentSourcePack || '—')}<br><span class="subtle">last ${esc(b.lastConsumedSourcePack || '—')}</span></td>
-        <td>${b.sourcePackResumePending ? `<span class="warnText">pending ${esc(b.nextStagedSourcePack || '?')}</span>` : (b.sourcePackAccessVerified ? 'verified' : '—')}</td>
-        <td>${esc(fmtTime(b.lastProgressAt))}<br><span class="subtle">${esc(fmtMinutes(b.minutesSinceLastProgress))} ago · last +${esc(b.lastProgressNewCases ?? '—')}</span></td>
-        <td>${esc(b.recentCases15m ?? 0)} / ${esc(b.recentCases60m ?? 0)}</td>
-        <td class="action">${esc(b.currentActionType || '—')}<br><span class="subtle">${esc(b.currentActionId || b.lastAction || '')}</span>${b.awaitingResponse ? '<br><span class="warnText">awaiting response</span>' : ''}</td>
-        <td>${esc(b.exactBlocker || (b.schedulingBlocked ? 'scheduling-blocked' : 'none'))}</td>
-        <td>${b.chatUrl ? `<a href="${esc(b.chatUrl)}" target="_blank" rel="noreferrer">open</a><br><span class="subtle">${esc((b.chatId || '').slice(0, 8))}</span>` : '—'}</td>
-      </tr>`).join('')}</tbody></table>`;
-
-      $('errors').innerHTML = (data.incidents || []).length ? data.incidents.map(i => `<div class="error"><div class="meta">${esc(fmtTime(i.detectedAt))} · ${esc(i.kind)}${i.bucket == null ? '' : ` · B${esc(i.bucket)}`}</div><div class="detail">${esc(i.detail)}</div>${i.requiredAction ? `<div class="subtle">Next: ${esc(i.requiredAction)}</div>` : ''}</div>`).join('') : '<span class="ok">No incidents found.</span>';
+      const incidents = data.incidents || s.incidents || [];
+      $('incidents').innerHTML = incidents.length ? incidents.slice(0,30).map(item => `<div class="incident"><b>${esc(time(item.detectedAt))} · ${esc(item.kind || 'INCIDENT')}${item.bucket == null ? '' : ` · B${esc(item.bucket)}`}</b><div>${esc(item.detail || item.requiredAction || 'No details provided.')}</div><div class="subtle">${esc(item.requiredAction || '')}</div></div>`).join('') : '<span class="ok">No incidents recorded.</span>';
     }
 
     async function refresh() {
-      try { render(await (await fetch('/api/status', { cache: 'no-store' })).json()); }
-      catch (error) { $('runState').textContent = `DASHBOARD ERROR: ${error.message}`; }
+      try {
+        const response = await fetch('/api/status', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`status request failed (${response.status})`);
+        render(await response.json());
+      } catch (error) {
+        $('runState').innerHTML = `<span class="bad">DASHBOARD ERROR: ${esc(error.message)}</span>`;
+      }
     }
     async function control(action) {
-      buttons.forEach(button => button.disabled = true);
+      controls.forEach(button => button.disabled = true);
       try {
-        const response = await fetch('/api/control', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ action }) });
-        if (!response.ok) throw new Error((await response.json()).error || `control request failed (${response.status})`);
+        const response = await fetch('/api/control', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action}) });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `control request failed (${response.status})`);
+      } catch (error) {
+        $('runState').innerHTML = `<span class="bad">CONTROL ERROR: ${esc(error.message)}</span>`;
+      } finally {
+        controls.forEach(button => button.disabled = false);
+        await refresh();
       }
-      catch (error) { $('runState').textContent = `CONTROL ERROR: ${error.message}`; }
-      finally { buttons.forEach(button => button.disabled = false); await refresh(); }
     }
-    buttons.forEach(button => button.addEventListener('click', () => control(button.dataset.action)));
+    controls.forEach(button => button.addEventListener('click', () => control(button.dataset.action)));
     $('refresh').addEventListener('click', refresh);
-    refresh(); setInterval(refresh, 2000);
+    refresh();
+    setInterval(refresh, 2000);
   </script>
 </body>
 </html>

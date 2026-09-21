@@ -206,9 +206,48 @@ test('available slot + no runnable bucket → schedulerUnderutilized=false', () 
     graceMs,
   });
   assert.equal(health.schedulerUnderutilized, false);
-  assert.match(String(health.idleCapacityReason || ''), /B1 waiting for unresolved response/);
+  assert.match(String(health.bucketExclusions?.['1'] || ''), /B1 waiting for unresolved response/);
   assert.equal(health.idleReviewerCapacity, 0);
   assert.deepEqual(health.awaitingResponseBuckets, [1]);
+});
+
+test('operations status exposes typed transient and integrity holds with scheduler exclusions', () => {
+  const transientHold = {
+    type: 'TRANSIENT_EXTERNAL',
+    reason: 'REGISTRY_STRUCTURE_UNAVAILABLE',
+    createdAt: '2026-09-18T10:00:00.000Z',
+    retryPolicy: 'REVALIDATE',
+    nextAttemptAt: '2026-09-18T10:05:00.000Z',
+    validation: { kind: 'REGISTRY_SHARD_AVAILABLE', bucket: 1 },
+  };
+  const integrityHold = {
+    type: 'INTEGRITY',
+    reason: 'ACTION_LEDGER_DISAGREEMENT',
+    createdAt: '2026-09-18T10:01:00.000Z',
+    retryPolicy: 'EVIDENCE_RECONCILIATION',
+  };
+  const state = makeState({ buckets: {
+    1: { complete: false, chatUrl: 'u1', phase: 'HOLD', hold: transientHold },
+    3: { complete: false, chatUrl: 'u3', phase: 'HOLD', hold: integrityHold },
+  } });
+  const status = buildOperationsStatus({
+    state,
+    excludedBuckets: blocked,
+    maxActive: 2,
+    nowMs,
+  });
+
+  assert.equal(status.buckets[1].holdType, 'TRANSIENT_EXTERNAL');
+  assert.equal(status.buckets[1].holdReason, 'REGISTRY_STRUCTURE_UNAVAILABLE');
+  assert.equal(status.buckets[1].recoverable, true);
+  assert.equal(status.buckets[1].nextRecoveryAttemptAt, transientHold.nextAttemptAt);
+  assert.equal(status.buckets[1].eligibleForScheduling, false);
+  assert.match(status.bucketExclusions['1'], /TRANSIENT_EXTERNAL hold: REGISTRY_STRUCTURE_UNAVAILABLE/);
+
+  assert.equal(status.buckets[3].holdType, 'INTEGRITY');
+  assert.equal(status.buckets[3].recoverable, false);
+  assert.equal(status.buckets[3].eligibleForScheduling, false);
+  assert.match(status.bucketExclusions['3'], /INTEGRITY hold: ACTION_LEDGER_DISAGREEMENT/);
 });
 
 test('unresolved awaiting action does not count as live generation', () => {

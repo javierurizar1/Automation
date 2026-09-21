@@ -34,7 +34,7 @@ test('phase ACTIVE with live generation occupies one reviewer slot', () => {
   assert.equal(occupancy.scheduledReviewers, 1);
 });
 
-test('unresolved action stays outside live count but reserves scheduler capacity', () => {
+test('stale unresolved action stays outside live and capacity counts after dispatch grace', () => {
   const bucketState = {
     complete: false,
     awaitingResponseAt: '2026-09-17T22:02:17.158Z',
@@ -53,7 +53,7 @@ test('unresolved action stays outside live count but reserves scheduler capacity
     bucketCount: 6,
   });
   assert.equal(occupancy.activeReviewers, 1);
-  assert.equal(occupancy.scheduledReviewers, 2);
+  assert.equal(occupancy.scheduledReviewers, 1);
   assert.equal(occupancy.availableSlots, 0);
   assert.deepEqual(occupancy.awaitingResponseBuckets, [1]);
 });
@@ -218,7 +218,7 @@ test('scheduling-blocked bucket with awaiting is excluded from live occupancy bu
   assert.equal(occupancy.scheduledReviewers, 0);
 });
 
-test('B0 live + B1 unresolved/non-live + B3 runnable keeps the stale generation slot reserved', () => {
+test('B0 live + B1 stale unresolved/non-live still lets runnable B3 fill the free slot', () => {
   const buckets = {
     0: {
       complete: false,
@@ -255,8 +255,8 @@ test('B0 live + B1 unresolved/non-live + B3 runnable keeps the stale generation 
     bucketCount: 6,
   });
   assert.equal(occupancy.activeReviewers, 1);
-  assert.equal(occupancy.scheduledReviewers, 2);
-  assert.equal(occupancy.availableSlots, 0);
+  assert.equal(occupancy.scheduledReviewers, 1);
+  assert.equal(occupancy.availableSlots, 1);
   assert.deepEqual(occupancy.awaitingResponseBuckets, [1]);
   assert.deepEqual(selectReviewerSlotCandidates(buckets, blocked), ['3']);
 });

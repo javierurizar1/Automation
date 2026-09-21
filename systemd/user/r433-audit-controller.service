@@ -1,0 +1,23 @@
+[Unit]
+Description=R4.3.3 Audit Controller
+After=network-online.target
+StartLimitIntervalSec=30min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=@APP_ROOT@
+Environment="PATH=@NODE_BIN_DIR@:/usr/local/bin:/usr/bin:/bin"
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/env node src/controller.mjs
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=120s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

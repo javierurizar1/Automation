@@ -1,10 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { chromium } from 'playwright-core';
+import { spawn, execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import {
   actionResponseKey,
   actionId,
+  classifyHoldType,
+  createHoldRecord,
   advanceSourcePackAfterBoundary,
   assistantAfterActionMarker,
   bucketBlocksCandidateActivation,
@@ -30,7 +32,6 @@ import {
   isSourcePackBoundaryFooter,
   isVerifiedCorpusCompletion,
   markSourcePackAccessVerified,
-  nextSourcePackNumber,
   normalizeBucketId,
   parseSourcePackNumber,
   packNumberFromFilename,
@@ -62,7 +63,8 @@ import {
   sourcePackFilename,
   sourcePackShardFolderUrl,
   isSourcePackBeyondInventory,
-  SOURCE_PACK_SHARDS,
+  isHoldRetryDue,
+  holdValidationKind,
 } from './protocol.mjs';
 import {
   buildOperationsStatus,
@@ -72,7 +74,8 @@ import {
   recordSourcePackTransition,
 } from './operations.mjs';
 import { ensureHighestReviewerModel, REQUIRED_REVIEWER_EFFORT, REQUIRED_REVIEWER_MODEL } from './reviewer-model.mjs';
-import { listRetiredReviewerTabs } from './reviewer-tabs.mjs';
+import { classifyReviewerHealth, ensureBrowserPageBudget, findActualGeneration } from './reviewer-tabs.mjs';
+import { cleanupAutomationProfileEphemeral, connectOrLaunchBrowser } from './browser-runtime.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/(.:)/, '$1')), '..');
 const CONFIG_PATH = path.join(ROOT, 'config.json');
@@ -94,8 +97,50 @@ function dispatchStartGraceMs() {
 }
 
 const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8').replace(/^\uFEFF/, ''));
-const MAX_ACTIVE_REVIEWERS = Math.min(2, Math.max(1, Number(config.maxActiveReviewers || 2)));
-const MAX_REVIEWER_CHAT_TABS = 5;
+const MAX_ACTIVE_REVIEWERS = 2;
+const MAX_REVIEWER_TABS = 2;
+const MAX_AUTOMATION_TABS = 3;
+function sourcePackShardMappingStatus() {
+  const mapping = config.sourcePackShards;
+  const missingBuckets = [];
+  const placeholderBuckets = [];
+  for (let bucket = 0; bucket < 6; bucket += 1) {
+    const folderId = String(mapping?.[String(bucket)]?.folderId || '').trim();
+    if (!folderId) missingBuckets.push(bucket);
+    else if (/^(?:LOCAL_ONLY|PLACEHOLDER|REPLACE_ME|UNKNOWN)/i.test(folderId)) placeholderBuckets.push(bucket);
+  }
+  return {
+    ready: missingBuckets.length === 0 && placeholderBuckets.length === 0,
+    missingBuckets,
+    placeholderBuckets,
+  };
+}
+
+function configuredSourcePackShard(bucket) {
+  const key = String(Number(bucket));
+  const status = sourcePackShardMappingStatus();
+  if (status.missingBuckets.includes(Number(key)) || status.placeholderBuckets.includes(Number(key))) return null;
+  const folderId = String(config.sourcePackShards?.[key]?.folderId || '').trim();
+  return folderId ? { folderId } : null;
+}
+
+function browserLaunchProfile() {
+  const userConfigRoot = process.env.HOME || process.env.USERPROFILE || '';
+  const braveUserDataDir = userConfigRoot
+    ? path.join(userConfigRoot, '.config', 'BraveSoftware', 'Brave-Browser')
+    : null;
+  const braveDefaultProfile = braveUserDataDir && path.join(braveUserDataDir, 'Default');
+  const hasExistingBraveProfile = Boolean(braveDefaultProfile && fs.existsSync(braveDefaultProfile));
+  return {
+    profileDir: config.browserProfileDir
+      || (hasExistingBraveProfile ? braveUserDataDir : path.join(ROOT, 'chrome-profile')),
+    preferredExecutable: config.browserExecutable
+      || config.browserPath
+      || config.chromeExecutable
+      || (hasExistingBraveProfile ? 'brave-browser' : null),
+  };
+}
+
 const SCHEDULING_BLOCKED_BUCKETS = new Set(
   (Array.isArray(config.schedulingBlockedBuckets) ? config.schedulingBlockedBuckets : [])
     .map(Number)
@@ -134,9 +179,13 @@ function loadJson(file, fallback) {
 
 function readControl() {
   const control = loadJson(CONTROL_PATH, null);
-  const desiredState = String(control?.desiredState || 'RUNNING').toUpperCase();
+  const present = Boolean(control && typeof control === 'object' && !Array.isArray(control));
+  const desiredState = String(control?.desiredState || 'RECONCILIATION_ONLY').toUpperCase();
   return {
-    desiredState: ['RUNNING', 'PAUSED', 'STOPPED'].includes(desiredState) ? desiredState : 'RUNNING',
+    desiredState: ['RUNNING', 'PAUSED', 'STOPPED', 'RECONCILIATION_ONLY'].includes(desiredState)
+      ? desiredState
+      : 'RECONCILIATION_ONLY',
+    present,
     requestedAt: control?.requestedAt || null,
     requestedBy: control?.requestedBy || null,
   };
@@ -154,6 +203,11 @@ function assertControlRunning() {
   if (control.desiredState === 'STOPPED') {
     const error = new Error('controller was stopped before sending a new action');
     error.code = 'CONTROL_STOPPED';
+    throw error;
+  }
+  if (control.desiredState !== 'RUNNING' || !preDispatchReady) {
+    const error = new Error('controller is reconciling startup state; new actions remain disabled until pre-dispatch evidence is ready');
+    error.code = 'CONTROL_RECONCILIATION_ONLY';
     throw error;
   }
 }
@@ -185,6 +239,23 @@ function projectConversationUrl(conversationId) {
   return `${config.projectUrl}/c/${conversationId}`;
 }
 
+function deferTransientHold(bucketState, reason, at = Date.now()) {
+  const hold = bucketState?.hold;
+  if (!hold || hold.type !== 'TRANSIENT_EXTERNAL') return false;
+  const retryCount = Number(hold.retryCount || 0) + 1;
+  const nextAttemptAt = new Date(at + [60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000, 60 * 60_000][Math.min(4, retryCount)]).toISOString();
+  bucketState.transientHoldRetryCount = retryCount;
+  bucketState.hold = createHoldRecord({
+    ...hold,
+    reason: reason || hold.reason,
+    lastAttemptAt: new Date(at).toISOString(),
+    nextAttemptAt,
+    retryCount,
+    validation: hold.validation,
+  });
+  return true;
+}
+
 function defaultBucketState(bucket) {
   const initial = config.buckets[String(bucket)] ?? {};
   const conversationId = initial.conversationId || null;
@@ -198,6 +269,8 @@ function defaultBucketState(bucket) {
     newChatCreation: null,
     reviewerModelVerification: null,
     phase: complete ? 'COMPLETE' : conversationId ? 'ACTIVE' : 'PENDING',
+    hold: complete ? { type: 'COMPLETE', reason: 'FULL_CORPUS_RECONCILED', retryPolicy: 'NONE', nextAttemptAt: null } : null,
+    transientHoldRetryCount: 0,
     lastHash: null,
     processedHash: null,
     processedResponseKey: null,
@@ -250,6 +323,9 @@ function defaultBucketState(bucket) {
     sourcePackLastDeliveredIncidentId: null,
     sourcePackLastDeliveredAt: null,
     sourcePackLastDeliveredActionId: null,
+    sourcePackCursorEvidence: null,
+    sourcePackCursorReconciliationRequired: true,
+    sourcePackDeferredHold: null,
     sourcePackAccessVerified: false,
     sourcePackAccessVerifiedAt: null,
     sourcePackRequestActionId: null,
@@ -261,6 +337,9 @@ function defaultBucketState(bucket) {
     lastProgressNewCases: null,
     lastProgressWritesVerified: null,
     lastProgressPack: null,
+    lastRegistryWriteAt: null,
+    lastRegistryWriteVerified: null,
+    reviewerSlotId: null,
     lastSourcePackTransitionAt: null,
     lastSourcePackTransitionFrom: null,
     lastSourcePackTransitionTo: null,
@@ -269,6 +348,13 @@ function defaultBucketState(bucket) {
 
 function normalizeState(raw) {
   const state = raw && typeof raw === 'object' ? raw : {};
+  const storedVersion = state.version;
+  if (storedVersion !== undefined
+    && (!Number.isInteger(storedVersion) || storedVersion < 1 || storedVersion > 3)) {
+    const error = new Error(`unsupported durable state schema version: ${String(storedVersion)}`);
+    error.code = 'DURABLE_STATE_SCHEMA_UNSUPPORTED';
+    throw error;
+  }
   state.version = 3;
   state.startedAt ||= now();
   state.buckets ||= {};
@@ -301,6 +387,7 @@ function normalizeState(raw) {
     if (!merged.reviewerModelVerification || typeof merged.reviewerModelVerification !== 'object') merged.reviewerModelVerification = null;
     if (!Array.isArray(merged.chatHistory)) merged.chatHistory = [];
     merged.rolloverCount = Number(merged.rolloverCount || 0);
+    merged.transientHoldRetryCount = Math.max(0, Number(merged.transientHoldRetryCount || 0));
     merged.casesSinceChatStart = Number(merged.casesSinceChatStart || 0);
     merged.generationSeenSinceAction = Boolean(merged.generationSeenSinceAction);
     merged.writeRecoveryResumePending = Boolean(merged.writeRecoveryResumePending);
@@ -319,6 +406,11 @@ function normalizeState(raw) {
     merged.sourcePackLastConsumedNumber = parseSourcePackNumber(merged.sourcePackLastConsumedNumber, Number(key));
     merged.sourcePackLastVisibleNumber = parseSourcePackNumber(merged.sourcePackLastVisibleNumber, Number(key));
     merged.sourcePackAccessVerified = Boolean(merged.sourcePackAccessVerified);
+    if (!merged.sourcePackCursorEvidence || typeof merged.sourcePackCursorEvidence !== 'object'
+      || Array.isArray(merged.sourcePackCursorEvidence)) merged.sourcePackCursorEvidence = null;
+    merged.sourcePackCursorReconciliationRequired = merged.sourcePackCursorReconciliationRequired !== false;
+    if (!merged.sourcePackDeferredHold || typeof merged.sourcePackDeferredHold !== 'object'
+      || Array.isArray(merged.sourcePackDeferredHold)) merged.sourcePackDeferredHold = null;
     if (clearStaleControllerSideSourcePackVerification(merged)) {
       merged.sourcePackAccessVerified = false;
     }
@@ -333,12 +425,34 @@ function normalizeState(raw) {
 
     if (merged.complete) {
       merged.phase = 'COMPLETE';
+      merged.hold = merged.hold?.type === 'COMPLETE'
+        ? merged.hold
+        : { type: 'COMPLETE', reason: 'FULL_CORPUS_RECONCILED', retryPolicy: 'NONE', nextAttemptAt: null };
     } else if (merged.phase === 'COMPLETE') {
       merged.phase = merged.chatUrl ? 'ACTIVE' : 'PENDING';
-    } else if (!merged.chatUrl && merged.phase !== 'HOLD') {
+      merged.hold = null;
+    }
+    if (!merged.complete && !merged.chatUrl && merged.phase !== 'HOLD') {
       merged.phase = 'PENDING';
-    } else if (merged.chatUrl && !['SETUP_WAIT', 'ACTIVE', 'HOLD', 'PAUSED'].includes(merged.phase)) {
+    } else if (!merged.complete && merged.chatUrl && !['SETUP_WAIT', 'ACTIVE', 'HOLD', 'PAUSED'].includes(merged.phase)) {
       merged.phase = 'ACTIVE';
+    }
+    if (merged.phase === 'HOLD' && !merged.hold) {
+      const incidentId = String(merged.lastAction || '').startsWith('incident:')
+        ? String(merged.lastAction).slice('incident:'.length)
+        : null;
+      const incidentRecord = incidentId
+        ? Object.values(state.incidents).find(entry => entry?.id === incidentId)
+        : null;
+      const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+      merged.hold = createHoldRecord({
+        type: incident ? classifyHoldType(incident.kind, incident.footer, incident.detail) : 'INTEGRITY',
+        reason: incident?.footer?.blocker || incident?.kind || 'LEGACY_HOLD_REQUIRES_RECONCILIATION',
+        incidentId,
+        bucket: Number(key),
+        createdAt: incident?.detectedAt || now(),
+        retryCount: merged.transientHoldRetryCount,
+      });
     }
     state.buckets[key] = merged;
   }
@@ -346,7 +460,78 @@ function normalizeState(raw) {
   return state;
 }
 
-const state = normalizeState(loadJson(STATE_PATH, null));
+function readDurableState() {
+  try {
+    const text = fs.readFileSync(STATE_PATH, 'utf8').replace(/^\uFEFF/, '');
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      const error = new Error('durable state root must be a JSON object');
+      error.code = 'DURABLE_STATE_INVALID';
+      throw error;
+    }
+    return parsed;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    error.code ||= 'DURABLE_STATE_INVALID';
+    throw error;
+  }
+}
+
+let startupStateError = null;
+let state;
+try {
+  state = normalizeState(readDurableState());
+} catch (error) {
+  startupStateError = error;
+  state = normalizeState(null);
+}
+
+const controllerStartedAt = now();
+const previousRuntimeStatus = loadJson(STATUS_PATH, null);
+function previousControllerStale(status, currentTimeMs = Date.now()) {
+  if (!status || Number(status.controllerPid) === process.pid) return false;
+  const wasRunning = ['RUNNING', 'RECOVERING', 'DEGRADED'].includes(String(status.controllerState || status.runState || '').toUpperCase());
+  if (!wasRunning) return false;
+  const heartbeatAt = Date.parse(status.heartbeatAt || status.updatedAt || '');
+  const staleAfterMs = Math.max(10_000, Number(config.heartbeatStaleSeconds || 90) * 1000);
+  let pidAlive = false;
+  const pid = Number(status.controllerPid);
+  if (Number.isInteger(pid) && pid > 0) {
+    try {
+      process.kill(pid, 0);
+      pidAlive = true;
+    } catch (error) {
+      pidAlive = error?.code === 'EPERM';
+    }
+  }
+  return !pidAlive || !Number.isFinite(heartbeatAt) || currentTimeMs - heartbeatAt > staleAfterMs;
+}
+
+function sourceHashFromDisk() {
+  const files = ['src/controller.mjs', 'src/protocol.mjs', 'src/operations.mjs', 'src/reviewer-tabs.mjs', 'src/browser-runtime.mjs'];
+  const hash = crypto.createHash('sha256');
+  for (const relativePath of files) {
+    try {
+      hash.update(relativePath).update('\0').update(fs.readFileSync(path.join(ROOT, relativePath))).update('\0');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      hash.update(relativePath).update('\0MISSING\0');
+    }
+  }
+  return hash.digest('hex');
+}
+
+function readGitSha() {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8', timeout: 1500 }).trim();
+  } catch {
+    return null;
+  }
+}
+
+const loadedSourceHash = sourceHashFromDisk();
+const loadedGitSha = readGitSha();
+let controllerLifecycleState = startupStateError ? 'ERROR' : 'RECOVERING';
 state.controllerSessionStartedAt = now();
 state.responseMonitoringStartedAt = state.controllerSessionStartedAt;
 
@@ -358,8 +543,69 @@ let lastLiveReviewerOccupancy = buildLiveReviewerOccupancy({
   bucketCount: config.bucketCount,
 });
 let lastLiveGeneratingByBucket = {};
+let browserRuntimeStatus = {
+  browserConnected: false,
+  browserExecutable: null,
+  browserPid: null,
+  cdpEndpoint: null,
+  chatgptReady: false,
+  authenticationRequired: false,
+  coordinatorHealth: null,
+  coordinatorTabPresent: false,
+  reviewerTabCount: 0,
+  automationTabCount: 0,
+  liveReviewerGenerations: 0,
+  reviewerSlots: [],
+};
+let preDispatchReady = false;
+let preDispatchEvidence = {
+  ready: false,
+  checkedAt: null,
+  blockers: ['STARTUP_RECONCILIATION_PENDING'],
+  eligibleBuckets: [],
+};
+let startupReconciliationComplete = false;
+let browserContextRef = null;
+let coordinatorPageRef = null;
+let reviewerSlotRegistry = new Map();
+let ownedBrowserProfile = {
+  launched: false,
+  pid: null,
+  profileDir: null,
+  profileDirectoryName: 'Default',
+};
+
+function cleanupOwnedBrowserProfileIfStopped() {
+  if (!ownedBrowserProfile.launched || !ownedBrowserProfile.profileDir) return [];
+  if (ownedBrowserProfile.pid) {
+    try {
+      process.kill(Number(ownedBrowserProfile.pid), 0);
+      return [];
+    } catch (error) {
+      if (error.code !== 'ESRCH') return [];
+    }
+  }
+  try {
+    const removed = cleanupAutomationProfileEphemeral(ownedBrowserProfile);
+    if (removed.length) log(`cleaned ${removed.length} stale owned browser profile lock file(s)`);
+    ownedBrowserProfile.launched = false;
+    return removed;
+  } catch (error) {
+    log(`unable to clean owned browser profile locks: ${error.message || error}`);
+    return [];
+  }
+}
 
 function saveState() {
+  for (const bucketState of Object.values(state.buckets || {})) {
+    if (['INTEGRITY', 'USER'].includes(bucketState.hold?.type) && bucketState.phase !== 'COMPLETE') {
+      bucketState.phase = 'HOLD';
+      continue;
+    }
+    if (bucketState.phase !== 'HOLD'
+      && bucketState.phase !== 'COMPLETE'
+      && !bucketHasUnresolvedAwaitingAction(bucketState)) bucketState.hold = null;
+  }
   normalizeOperationsState(state);
   saveJsonAtomic(STATE_PATH, state);
 }
@@ -399,9 +645,16 @@ function workingElapsedMs() {
 function trimActionLedger() {
   const entries = Object.entries(state.actions);
   if (entries.length <= 2500) return;
+  const protectedIds = new Set(Object.values(state.buckets || {}).flatMap(bucket => [
+    bucket?.sourcePackCursorEvidence?.sourceActionId,
+    bucket?.sourcePackCursorEvidence?.responseActionId,
+    bucket?.awaitingActionId,
+    bucket?.sourcePackLastDeliveredActionId,
+  ].filter(Boolean)));
   entries
     .sort((a, b) => String(a[1]?.updatedAt ?? '').localeCompare(String(b[1]?.updatedAt ?? '')))
     .slice(0, entries.length - 2000)
+    .filter(([key]) => !protectedIds.has(key))
     .forEach(([key]) => delete state.actions[key]);
 }
 
@@ -449,6 +702,16 @@ function continuationPrompt(bucket) {
   return `Continue the source-summary audit from the current authoritative registry state for Bucket ${bucket}. Review as many additional eligible cases in your assigned bucket as this turn can possibly complete. There is no voluntary case quota. Do not redo completed cases. Persist and readback-verify each result according to the existing protocol and continue across pack/group/run boundaries until the turn itself can no longer proceed, the full-corpus bucket is genuinely complete, or a real global blocker prevents further work. Exhaustion of currently visible packs is not completion; when that happens with owned cases still pending, use STATUS: NORMAL with BLOCKER: NEXT_SOURCE_PACKS_REQUIRED. STATUS: COMPLETE requires full-population reconciliation against all ${config.auditablePopulation} finalized summaries. End with the required strict six-line AUDIT_TURN_STATUS footer.`;
 }
 
+function registryPrerequisiteRevalidationPrompt(bucket) {
+  const tab = `R433_AUDIT_SHARD_${bucket}`;
+  return `AUTOMATIC PREREQUISITE REVALIDATION for Bucket ${bucket}. A prior turn could not access the canonical registry structure. Use the connected Google Sheets capability to open spreadsheet ${config.registryId} and the exact tab ${tab}. Verify that the tab exists and is readable by listing/reading its header and enough rows to establish access. Do not create, rename, edit, or write any registry cells. Reconcile any outstanding submitted action against the canonical registry so no prior write is repeated. If and only if the exact tab is available, include the exact line REGISTRY_SHARD_AVAILABLE: YES and return the required footer with STATUS: NORMAL, NEW_CASES: 0, WRITES_VERIFIED: YES, BLOCKER: NONE, TRIGGER_COORDINATOR: NO. If access is still unavailable, include REGISTRY_SHARD_AVAILABLE: NO and return STATUS: ERROR, NEW_CASES: 0, WRITES_VERIFIED: YES, BLOCKER: REGISTRY_STRUCTURE_UNAVAILABLE, TRIGGER_COORDINATOR: YES. Do not begin substantive case review in this validation turn. End with exactly the six-line AUDIT_TURN_STATUS footer.`;
+}
+
+function registryAvailabilityBlocker(footer = null) {
+  const blocker = String(footer?.blocker || '').trim().toUpperCase();
+  return /^(?:REGISTRY_STRUCTURE_UNAVAILABLE|REGISTRY_SHARD_UNAVAILABLE|REGISTRY_ACCESS_UNAVAILABLE|REGISTRY_TAB_NOT_FOUND|REGISTRY_STRUCTURE_NOT_FOUND|REGISTRY_ACCESS_DENIED)$/.test(blocker);
+}
+
 function sourcePackContinuationPrompt(bucket, source) {
   return buildSourcePackContinuationPrompt(bucket, source);
 }
@@ -457,19 +720,21 @@ function sourcePackInventoryLastNumber(bucket) {
   const marker = loadJson(SOURCE_PACK_READY_PATH, null);
   if (String(marker?.status || '').toUpperCase() !== 'UPLOADED') return null;
   const ranges = marker?.shards;
-  const configuredBuckets = Object.keys(SOURCE_PACK_SHARDS);
+  const mapping = config.sourcePackShards;
+  const configuredBuckets = Array.from({ length: 6 }, (_, index) => String(index));
   if (!ranges || Object.keys(ranges).length !== configuredBuckets.length) return null;
 
   let totalPackCount = 0;
   for (const key of configuredBuckets) {
-    const shard = SOURCE_PACK_SHARDS[key];
+    const shard = configuredSourcePackShard(key);
     const range = ranges[key];
     const startPack = Number(range?.startPack);
     const lastPack = Number(range?.lastPack);
     const packCount = Number(range?.packCount);
     if (!shard
+      || !mapping?.[key]
       || !Number.isInteger(startPack)
-      || startPack !== shard.startPack
+      || startPack < 1
       || !Number.isInteger(lastPack)
       || lastPack < startPack
       || !Number.isInteger(packCount)
@@ -496,12 +761,14 @@ function latestSourcePackBoundaryIncident(bucket) {
 }
 
 function corpusReconciliationPrompt(bucket) {
-  const shard = SOURCE_PACK_SHARDS[Number(bucket)];
+  const shard = configuredSourcePackShard(bucket);
   const lastPack = sourcePackInventoryLastNumber(bucket);
+  const inventoryRange = loadJson(SOURCE_PACK_READY_PATH, null)?.shards?.[String(Number(bucket))];
+  const firstPack = Number(inventoryRange?.startPack);
   const inventoryHint = shard && Number.isInteger(lastPack)
-    ? `The uploaded inventory snapshot spans ${sourcePackFilename(shard.startPack, Number(bucket))} through ${sourcePackFilename(lastPack, Number(bucket))}. Re-list and paginate the exact shard folder at ${sourcePackShardFolderUrl(shard.folderId)} to verify whether a newer pack exists before requesting one.`
+    ? `The uploaded inventory snapshot spans ${sourcePackFilename(firstPack, Number(bucket))} through ${sourcePackFilename(lastPack, Number(bucket))}. Re-list and paginate the exact shard folder at ${sourcePackShardFolderUrl(shard.folderId)} to verify whether a newer pack exists before requesting one.`
     : 'Re-list and paginate the exact shard folder before requesting another pack.';
-  return `The previous response is a completion or source-pack boundary candidate for Bucket ${bucket}; neither proves completion. ${inventoryHint} Reconcile R433_AUDIT_SHARD_${bucket} against the full authoritative R4.3.3 finalized-summary population of ${config.auditablePopulation} cases, using permanent ownership int(stable_id, 16) % 6 == ${bucket}. Pack exhaustion alone is not completion. If any owned stable_id lacks a terminal registry result, continue only with an exact source pack confirmed available in the shard folder, skipping every valid terminal row and readback-verifying every new write. If owned cases remain but no later exact pack exists, return STATUS: NORMAL with BLOCKER: NEXT_SOURCE_PACKS_REQUIRED and TRIGGER_COORDINATOR: YES. Only if full-population reconciliation proves zero owned pending stable_ids and there are no unresolved writes may you return STATUS: COMPLETE. In that case, immediately before the six-line footer include these exact evidence lines:\nFULL_CORPUS_RECONCILED: YES\nFULL_CORPUS_AUDITABLE_POPULATION: ${config.auditablePopulation}\nOWNED_PENDING_CASES: 0\nThen end with the strict six-line AUDIT_TURN_STATUS footer.`;
+  return `The previous response is a completion or source-pack boundary candidate for Bucket ${bucket}; neither proves completion. ${inventoryHint} Reconcile R433_AUDIT_SHARD_${bucket} against the full authoritative R4.3.3 finalized-summary population of ${config.auditablePopulation} cases, using permanent ownership int(stable_id, 16) % 6 == ${bucket}. Pack exhaustion alone is not completion. If any owned stable_id lacks a terminal registry result, continue only with an exact source pack confirmed available in the shard folder, skipping every valid terminal row and readback-verifying every new write. If owned cases remain but no later exact pack exists, return STATUS: NORMAL with BLOCKER: NEXT_SOURCE_PACKS_REQUIRED and TRIGGER_COORDINATOR: YES. Only if full-population reconciliation proves zero owned pending stable_ids and there are no unresolved writes may you return STATUS: COMPLETE. In that case, immediately before the six-line footer include these exact evidence lines:\nFULL_CORPUS_RECONCILED: YES\nFULL_CORPUS_AUDITABLE_POPULATION: ${config.auditablePopulation}\nOWNED_PENDING_CASES: 0\nUNRESOLVED_WRITES: 0\nThen end with the strict six-line AUDIT_TURN_STATUS footer.`;
 }
 
 function malformedRecoveryPrompt(bucket) {
@@ -891,6 +1158,9 @@ async function sendAction(page, bucket, kind, prompt, responseHash = '') {
       kind,
       status: 'DRAFTED',
       updatedAt: now(),
+      sourcePackTargetFilename: kind === 'SOURCE_PACK_CONTINUE'
+        ? bucketState.sourcePackTargetFilename || null
+        : existingAction?.sourcePackTargetFilename || null,
     };
     saveState();
     assertControlRunning();
@@ -905,6 +1175,9 @@ async function sendAction(page, bucket, kind, prompt, responseHash = '') {
       updatedAt: now(),
       responseHash,
       marker,
+      sourcePackTargetFilename: kind === 'SOURCE_PACK_CONTINUE'
+        ? bucketState.sourcePackTargetFilename || null
+        : existingAction?.sourcePackTargetFilename || null,
     };
     saveState();
 
@@ -959,19 +1232,25 @@ async function sendAction(page, bucket, kind, prompt, responseHash = '') {
 }
 
 async function inspectLiveGeneratingByBucket(context) {
-  const liveGeneratingByBucket = {};
-  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
-    if (isSchedulingBlockedBucket(bucket) || bucketState.complete || !bucketState.chatUrl) continue;
+  await ensureBrowserSlots(context);
+  const liveGeneratingByBucket = Object.fromEntries(
+    Object.keys(state.buckets).map(bucket => [String(bucket), false]),
+  );
+  for (const slot of reviewerSlotRegistry.values()) {
+    if (!slot.bucket || isSchedulingBlockedBucket(slot.bucket)) continue;
     try {
-      const page = await ensurePage(context, bucketState);
-      liveGeneratingByBucket[String(bucket)] = page ? await isGenerating(page) : false;
-    } catch (error) {
-      // A persistently unprobeable reviewer must remain slot-occupied until
-      // reconciliation rolls the dead chat over. This prevents a third live
-      // generation from being started during recovery.
-      liveGeneratingByBucket[String(bucket)] = error?.code === 'PAGE_PROBE_STALLED';
+      const generation = await findActualGeneration(slot.page, { timeoutMs: 2500 });
+      const actualGeneration = Boolean(generation.active);
+      slot.health = await classifyReviewerHealth(slot.page, { timeoutMs: 2500 });
+      liveGeneratingByBucket[slot.bucket] = actualGeneration;
+    } catch {
+      // An unprobeable slot is not proof of a live generation. The health
+      // classifier exposes the broken state and bounded recovery can roll it
+      // over without reserving capacity forever.
+      liveGeneratingByBucket[slot.bucket] = false;
     }
   }
+  await refreshReviewerSlotStatus();
   return liveGeneratingByBucket;
 }
 
@@ -995,6 +1274,271 @@ function bucketUsesLiveReviewerSlot(bucket, liveGeneratingByBucket) {
     isLiveGenerating: Boolean(liveGeneratingByBucket[String(bucket)]),
     graceMs: dispatchStartGraceMs(),
   });
+}
+
+function currentPageUrl(page) {
+  try { return String(page?.url?.() || ''); } catch { return ''; }
+}
+
+function isProjectPage(page) {
+  const url = currentPageUrl(page);
+  if (url === 'about:blank') return true;
+  try {
+    const pageHost = new URL(url).hostname.toLowerCase();
+    const projectHost = new URL(config.projectUrl).hostname.toLowerCase();
+    return pageHost === projectHost || pageHost.endsWith('.chatgpt.com') || pageHost.endsWith('.openai.com');
+  } catch {
+    return false;
+  }
+}
+
+function bucketForPageUrl(url) {
+  for (const [bucket, bucketState] of Object.entries(state.buckets || {})) {
+    if (bucketState.chatUrl && url.startsWith(bucketState.chatUrl)) return String(bucket);
+    const lastChat = Array.isArray(bucketState.chatHistory) ? bucketState.chatHistory.at(-1) : null;
+    if (bucketState.reviewerSlotId && lastChat?.chatUrl && url.startsWith(lastChat.chatUrl)) return String(bucket);
+  }
+  return null;
+}
+
+async function createBoundedPage(context) {
+  const pending = Promise.resolve().then(() => context.newPage());
+  try {
+    return await withPageProbeTimeout(pending, 'browser newPage', 10000);
+  } catch (error) {
+    // Playwright cannot cancel a pending newPage call. Close a page if the
+    // underlying call resolves after its deadline so it cannot leak tab 4.
+    pending.then(page => page?.close?.({ runBeforeUnload: false })).catch(() => {});
+    error.code = error.code || 'BROWSER_PAGE_CREATE_TIMEOUT';
+    throw error;
+  }
+}
+
+async function ensureBrowserSlots(context) {
+  const currentPages = context.pages().filter(page => !page.isClosed());
+  if (browserContextRef === context
+    && coordinatorPageRef && !coordinatorPageRef.isClosed()
+    && [...reviewerSlotRegistry.values()].length === MAX_REVIEWER_TABS
+    && [...reviewerSlotRegistry.values()].every(slot => slot.page && !slot.page.isClosed())) {
+    const existingPages = [...reviewerSlotRegistry.values()].map(slot => slot.page);
+    const budget = await ensureBrowserPageBudget(context, {
+      coordinatorPage: coordinatorPageRef,
+      reviewerPages: existingPages,
+      maxAutomationTabs: MAX_AUTOMATION_TABS,
+      maxReviewerTabs: MAX_REVIEWER_TABS,
+    });
+    if (!budget.ok) {
+      const error = new Error(`automation browser page budget is invalid: ${budget.reason}`);
+      error.code = 'AUTOMATION_TAB_CAP_EXCEEDED';
+      throw error;
+    }
+    const coordinatorHealth = await classifyReviewerHealth(coordinatorPageRef, { timeoutMs: 2500 });
+    browserRuntimeStatus.coordinatorHealth = coordinatorHealth;
+    browserRuntimeStatus.chatgptReady = coordinatorHealth.state === 'HEALTHY';
+    browserRuntimeStatus.authenticationRequired = coordinatorHealth.state === 'AUTH_REQUIRED';
+    return;
+  }
+
+  browserContextRef = context;
+  coordinatorPageRef = null;
+  reviewerSlotRegistry = new Map();
+
+  const projectPages = currentPages.filter(isProjectPage);
+  const healthByPage = new Map();
+  for (const page of projectPages) {
+    healthByPage.set(page, await classifyReviewerHealth(page, { timeoutMs: 2500 }));
+  }
+  const generatingPages = projectPages.filter(page => healthByPage.get(page)?.actualGeneration);
+  if (generatingPages.length > MAX_REVIEWER_TABS) {
+    const error = new Error(`detected ${generatingPages.length} live reviewer generations; the safe limit is ${MAX_REVIEWER_TABS}`);
+    error.code = 'REVIEWER_GENERATION_CAP_EXCEEDED';
+    throw error;
+  }
+
+  const reviewerPages = [...generatingPages];
+  const orderedBucketStates = Object.entries(state.buckets || {})
+    .filter(([, bucketState]) => !bucketState.complete && bucketState.chatUrl)
+    .sort(([bucketA, stateA], [bucketB, stateB]) => {
+      const aPinned = stateA.reviewerSlotId ? 1 : 0;
+      const bPinned = stateB.reviewerSlotId ? 1 : 0;
+      return bPinned - aPinned || Number(bucketA) - Number(bucketB);
+    });
+  for (const [, bucketState] of orderedBucketStates) {
+    if (reviewerPages.length >= MAX_REVIEWER_TABS) break;
+    const match = projectPages.find(page => currentPageUrl(page).startsWith(bucketState.chatUrl));
+    if (match && !reviewerPages.includes(match)) reviewerPages.push(match);
+  }
+  for (const page of projectPages) {
+    if (reviewerPages.length >= MAX_REVIEWER_TABS) break;
+    if (reviewerPages.includes(page)) continue;
+    const url = currentPageUrl(page);
+    if (/\/c\//i.test(url)) reviewerPages.push(page);
+  }
+
+  const selected = new Set(reviewerPages);
+  let coordinator = projectPages.find(page => !selected.has(page) && !/\/c\//i.test(currentPageUrl(page))) || null;
+  if (!coordinator && projectPages.length > reviewerPages.length) {
+    coordinator = projectPages.find(page => !selected.has(page)) || null;
+  }
+  if (!coordinator) coordinator = await createBoundedPage(context);
+
+  while (reviewerPages.length < MAX_REVIEWER_TABS) {
+    const reusable = projectPages.find(page => !reviewerPages.includes(page) && page !== coordinator);
+    if (reusable) reviewerPages.push(reusable);
+    else reviewerPages.push(await createBoundedPage(context));
+  }
+
+  if (!currentPageUrl(coordinator).startsWith(config.projectUrl)) {
+    try {
+      await coordinator.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    } catch (error) {
+      error.code = error.code || 'COORDINATOR_PAGE_NAVIGATION_FAILED';
+      throw error;
+    }
+  }
+
+  const reviewerSlotIds = ['reviewer-1', 'reviewer-2'];
+  for (let index = 0; index < reviewerPages.length; index += 1) {
+    const page = reviewerPages[index];
+    const bucket = bucketForPageUrl(currentPageUrl(page));
+    const slotId = reviewerSlotIds[index];
+    const slot = { slotId, page, bucket, health: healthByPage.get(page) || null, lastAssignedAt: now() };
+    reviewerSlotRegistry.set(slotId, slot);
+    if (bucket && state.buckets[bucket]) state.buckets[bucket].reviewerSlotId = slotId;
+  }
+  for (const [bucket, bucketState] of Object.entries(state.buckets || {})) {
+    if (bucketState.reviewerSlotId && reviewerSlotRegistry.get(bucketState.reviewerSlotId)?.bucket !== String(bucket)) {
+      bucketState.reviewerSlotId = null;
+    }
+  }
+  coordinatorPageRef = coordinator;
+  const coordinatorHealth = await classifyReviewerHealth(coordinatorPageRef, { timeoutMs: 2500 });
+
+  // Retire excess known project tabs only after checking that none is carrying
+  // a live generation. Conversation URLs remain durable in state and are
+  // reloaded into one of the reusable reviewer slots when needed.
+  const keep = new Set([coordinatorPageRef, ...reviewerPages]);
+  for (const page of projectPages) {
+    if (keep.has(page)) continue;
+    const health = healthByPage.get(page) || await classifyReviewerHealth(page, { timeoutMs: 2500 });
+    if (health.actualGeneration) {
+      const error = new Error('an extra project tab still has a live generation; safe tab-budget recovery is deferred');
+      error.code = 'REVIEWER_GENERATION_CAP_EXCEEDED';
+      throw error;
+    }
+    try { await page.close({ runBeforeUnload: false }); } catch (error) {
+      const failure = new Error(`could not retire an idle excess project tab: ${error.message || error}`);
+      failure.code = 'AUTOMATION_TAB_CAP_EXCEEDED';
+      throw failure;
+    }
+  }
+
+  const budget = await ensureBrowserPageBudget(context, {
+    coordinatorPage: coordinatorPageRef,
+    reviewerPages: reviewerPages,
+    maxAutomationTabs: MAX_AUTOMATION_TABS,
+    maxReviewerTabs: MAX_REVIEWER_TABS,
+  });
+  if (!budget.ok) {
+    const error = new Error(`automation browser page budget is invalid: ${budget.reason}`);
+    error.code = 'AUTOMATION_TAB_CAP_EXCEEDED';
+    throw error;
+  }
+  browserRuntimeStatus.coordinatorTabPresent = true;
+  browserRuntimeStatus.coordinatorHealth = coordinatorHealth;
+  browserRuntimeStatus.chatgptReady = coordinatorHealth.state === 'HEALTHY';
+  browserRuntimeStatus.authenticationRequired = coordinatorHealth.state === 'AUTH_REQUIRED';
+  browserRuntimeStatus.reviewerTabCount = budget.reviewerTabCount;
+  browserRuntimeStatus.automationTabCount = budget.automationTabCount;
+  browserRuntimeStatus.liveReviewerGenerations = [...reviewerSlotRegistry.values()]
+    .filter(slot => slot.health?.actualGeneration).length;
+  browserRuntimeStatus.reviewerSlots = [...reviewerSlotRegistry.values()].map(slot => ({
+    slotId: slot.slotId,
+    present: Boolean(slot.page && !slot.page.isClosed()),
+    pageUrl: currentPageUrl(slot.page),
+    bucket: slot.bucket,
+    health: slot.health?.state || 'UNPROBED',
+    actualGeneration: Boolean(slot.health?.actualGeneration),
+    reason: slot.health?.reason || null,
+  }));
+  saveState();
+}
+
+async function reviewerSlotForBucket(context, bucket, { allowUninitialized = false } = {}) {
+  await ensureBrowserSlots(context);
+  const bucketKey = String(bucket);
+  const bucketState = state.buckets[bucketKey];
+  const existing = [...reviewerSlotRegistry.values()].find(slot => slot.bucket === bucketKey);
+  if (existing) {
+    const targetUrl = bucketState?.chatUrl || (allowUninitialized ? config.projectUrl : null);
+    if (targetUrl && !currentPageUrl(existing.page).startsWith(targetUrl)) {
+      const health = await classifyReviewerHealth(existing.page, { timeoutMs: 2500 });
+      if (health.actualGeneration) {
+        const error = new Error(`reviewer slot ${existing.slotId} is generating and cannot navigate to B${bucket}`);
+        error.code = 'REVIEWER_SLOTS_BUSY';
+        throw error;
+      }
+      await existing.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    }
+    existing.health = await classifyReviewerHealth(existing.page, { timeoutMs: 2500 });
+    return existing;
+  }
+
+  const candidates = [...reviewerSlotRegistry.values()];
+  for (const slot of candidates) {
+    const health = await classifyReviewerHealth(slot.page, { timeoutMs: 2500 });
+    slot.health = health;
+    if (health.actualGeneration) continue;
+    const previousBucket = slot.bucket;
+    if (previousBucket && state.buckets[previousBucket]) {
+      state.buckets[previousBucket].reviewerSlotId = null;
+    }
+    slot.bucket = bucketKey;
+    slot.lastAssignedAt = now();
+    if (bucketState) bucketState.reviewerSlotId = slot.slotId;
+    saveState();
+    const targetUrl = bucketState?.chatUrl || (allowUninitialized ? config.projectUrl : null);
+    if (!targetUrl) return slot;
+    if (!currentPageUrl(slot.page).startsWith(targetUrl)) {
+      try {
+        await slot.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      } catch (error) {
+        error.code = error.code || 'REVIEWER_PAGE_NAVIGATION_FAILED';
+        throw error;
+      }
+    }
+    slot.health = await classifyReviewerHealth(slot.page, { timeoutMs: 2500 });
+    return slot;
+  }
+  const error = new Error(`both reusable reviewer slots are occupied by live generations; cannot load B${bucket}`);
+  error.code = 'REVIEWER_SLOTS_BUSY';
+  throw error;
+}
+
+async function refreshReviewerSlotStatus() {
+  const slots = [];
+  let liveReviewerGenerations = 0;
+  for (const slot of reviewerSlotRegistry.values()) {
+    const health = await classifyReviewerHealth(slot.page, { timeoutMs: 2500 });
+    slot.health = health;
+    if (health.actualGeneration) liveReviewerGenerations += 1;
+    slots.push({
+      slotId: slot.slotId,
+      present: Boolean(slot.page && !slot.page.isClosed()),
+      pageUrl: currentPageUrl(slot.page),
+      bucket: slot.bucket,
+      health: health.state,
+      actualGeneration: Boolean(health.actualGeneration),
+      reason: health.reason,
+    });
+  }
+  browserRuntimeStatus.coordinatorTabPresent = Boolean(coordinatorPageRef && !coordinatorPageRef.isClosed());
+  browserRuntimeStatus.reviewerTabCount = slots.filter(slot => slot.present).length;
+  browserRuntimeStatus.automationTabCount = Number(browserRuntimeStatus.reviewerTabCount)
+    + Number(browserRuntimeStatus.coordinatorTabPresent);
+  browserRuntimeStatus.liveReviewerGenerations = liveReviewerGenerations;
+  browserRuntimeStatus.reviewerSlots = slots;
+  return slots;
 }
 
 function latestRecoverableWriteIncident(bucket) {
@@ -1047,7 +1591,7 @@ function liveWriteRecoveryStallReason(bucketState, responseAction, currentTimeMs
 }
 
 async function reconcileOutstandingResponses(context, liveGeneratingByBucket) {
-  if (readControl().desiredState !== 'RUNNING') return;
+  if (readControl().desiredState === 'STOPPED') return;
 
   for (const [bucket, bucketState] of Object.entries(state.buckets)) {
     if (bucketState.complete || !bucketHasUnresolvedAwaitingAction(bucketState) || !bucketState.chatUrl) continue;
@@ -1101,6 +1645,14 @@ async function reconcileOutstandingResponses(context, liveGeneratingByBucket) {
         if (lostWriteRecoveryRetryReady(bucketState, responseAction)) {
           const recovery = latestRecoverableWriteIncident(bucket);
           if (recovery) {
+            if (!preDispatchReady || readControl().desiredState !== 'RUNNING') {
+              clearAwaiting(bucketState, responseActionId);
+              bucketState.writeRecoveryResumePending = true;
+              bucketState.phase = 'ACTIVE';
+              bucketState.lastAction = `write-recovery-reconciled-awaiting-dispatch-gate:${responseActionId}`;
+              saveState();
+              continue;
+            }
             const latestAssistant = await latestMessage(page, 'assistant');
             const responseHash = latestAssistant
               ? sha16(latestAssistant)
@@ -1142,7 +1694,12 @@ async function reconcileOutstandingResponses(context, liveGeneratingByBucket) {
 
       updateReceivedMessage(bucketState, text, responseHash);
       const allowDispatch = !isSchedulingBlockedBucket(bucket)
-        && readControl().desiredState === 'RUNNING';
+        && !bucketState.sourcePackCursorReconciliationRequired
+        && bucketState.phase !== 'HOLD'
+        && !['INTEGRITY', 'USER', 'COMPLETE'].includes(bucketState.hold?.type)
+        && sourcePackShardMappingStatus().ready
+        && readControl().desiredState === 'RUNNING'
+        && preDispatchReady;
 
       if (bucketState.phase === 'SETUP_WAIT') {
         await processSetupWait(page, bucket, bucketState, text, responseHash);
@@ -1169,12 +1726,19 @@ async function reconcileOutstandingResponses(context, liveGeneratingByBucket) {
 
 async function ensurePage(context, bucketState) {
   if (!bucketState.chatUrl) return null;
-  let page = context.pages().find(candidate => candidate.url().startsWith(bucketState.chatUrl));
-  if (!page) {
-    page = await context.newPage();
-    await page.goto(bucketState.chatUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  const bucket = Object.entries(state.buckets).find(([, value]) => value === bucketState)?.[0];
+  if (bucket === undefined) return null;
+  const slot = await reviewerSlotForBucket(context, Number(bucket));
+  if (!currentPageUrl(slot.page).startsWith(bucketState.chatUrl)) {
+    const health = await classifyReviewerHealth(slot.page, { timeoutMs: 2500 });
+    if (health.actualGeneration) {
+      const error = new Error(`reviewer slot ${slot.slotId} has a live generation and cannot navigate to B${bucket}`);
+      error.code = 'REVIEWER_SLOTS_BUSY';
+      throw error;
+    }
+    await slot.page.goto(bucketState.chatUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
   }
-  return page;
+  return slot.page;
 }
 
 function isAuthenticationPage(page) {
@@ -1221,10 +1785,15 @@ function wakeCodex(incidentPath) {
 }
 
 function notifyUserIncident(incident) {
+  if (process.platform !== 'win32') {
+    log(`Operator notification skipped on ${process.platform}; incident ${incident.id} is available in the dashboard`);
+    return;
+  }
   try {
     const recipient = process.env.USERNAME || '*';
     const message = `R4.3.3 incident queued: ${incident.id}. Open the local dashboard for live coordinator status.`;
     const child = spawn('msg.exe', [recipient, message], { detached: true, stdio: 'ignore', windowsHide: true });
+    child.on('error', error => log(`Unable to notify operator for ${incident.id}: ${error.message}`));
     child.unref();
   } catch (error) {
     log(`Unable to notify operator for ${incident.id}: ${error.message}`);
@@ -1235,15 +1804,37 @@ function recordIncident(kind, bucket, detail, extra = {}, options = {}) {
   const fingerprint = incidentFingerprint(kind, bucket, detail);
   const previous = state.incidents[fingerprint];
   const nowMs = Date.now();
+  const safeBucket = bucket === null || bucket === undefined ? null : String(bucket);
+  const bucketState = safeBucket === null ? null : state.buckets[safeBucket];
+  const applyHold = incidentId => {
+    if (!bucketState || options.holdBucket === false) return;
+    const holdType = options.holdType || classifyHoldType(kind, extra.footer, detail);
+    const retryCount = holdType === 'TRANSIENT_EXTERNAL'
+      ? Math.max(0, Number(bucketState.transientHoldRetryCount || 0))
+      : 0;
+    bucketState.phase = 'HOLD';
+    bucketState.lastAction = `incident:${incidentId}`;
+    if (holdType === 'TRANSIENT_EXTERNAL') bucketState.transientHoldRetryCount = retryCount + 1;
+    bucketState.hold = createHoldRecord({
+      type: holdType,
+      reason: extra.footer?.blocker || kind,
+      incidentId,
+      bucket: Number(safeBucket),
+      createdAt: now(),
+      retryCount,
+      validation: options.validation || holdValidationKind(kind, Number(safeBucket), extra.footer),
+    });
+  };
   if (previous && nowMs - Number(previous.lastTriggeredMs || 0) < 30 * 60 * 1000) {
     previous.lastSeenAt = now();
     previous.count = Number(previous.count || 1) + 1;
+    if (bucketState && options.holdBucket !== false) applyHold(previous.id);
     saveState();
     return previous.path;
   }
 
-  const safeBucket = bucket === null || bucket === undefined ? 'GLOBAL' : `B${bucket}`;
-  const id = `INC-${safeBucket}-${new Date().toISOString().replace(/[:.]/g, '')}-${fingerprint}`;
+  const incidentBucket = bucket === null || bucket === undefined ? 'GLOBAL' : `B${bucket}`;
+  const id = `INC-${incidentBucket}-${new Date().toISOString().replace(/[:.]/g, '')}-${fingerprint}`;
   const file = path.join(INCIDENT_DIR, `${id}.json`);
   const incident = {
     id,
@@ -1272,10 +1863,7 @@ function recordIncident(kind, bucket, detail, extra = {}, options = {}) {
     state.coordinator.lastQueuedKind = kind;
     queueCoordinatorStatus(id, incident.detectedAt, kind);
   }
-  if (bucket !== null && bucket !== undefined && state.buckets[String(bucket)] && options.holdBucket !== false) {
-    state.buckets[String(bucket)].phase = 'HOLD';
-    state.buckets[String(bucket)].lastAction = `incident:${id}`;
-  }
+  if (bucketState && options.holdBucket !== false) applyHold(id);
   saveState();
   log(`${id} ${kind}: ${detail}`);
   if (options.wakeCoordinator !== false) {
@@ -1354,44 +1942,6 @@ function managedReviewerChatCount() {
   )).length;
 }
 
-async function closeRetiredReviewerTabs(context, requestedBucket) {
-  const pages = context.pages().filter(page => !page.isClosed());
-  const retired = listRetiredReviewerTabs(
-    state.buckets,
-    pages.map(page => page.url()),
-  );
-  const failed = [];
-
-  for (const entry of retired) {
-    const page = pages.find(candidate => !candidate.isClosed() && candidate.url() === entry.url);
-    if (!page) continue;
-    try {
-      await page.close();
-    } catch (error) {
-      failed.push({ bucket: entry.bucket, error });
-      log(`B${requestedBucket}: could not close a retired reviewer tab for B${entry.bucket}`);
-    }
-  }
-
-  if (failed.length) {
-    recordIncident(
-      'RETIRED_REVIEWER_TABS_NOT_CLOSED',
-      requestedBucket,
-      'a retired bucket conversation could not be closed; replacement chat was not opened to preserve the five-chat limit',
-      { retainedRetiredTabCount: failed.length },
-      { wakeCoordinator: false },
-    );
-    const error = new Error('Retired reviewer tabs could not be closed; no replacement chat was opened');
-    error.code = 'RETIRED_REVIEWER_TABS_NOT_CLOSED';
-    error.cause = failed[0].error;
-    throw error;
-  }
-
-  if (retired.length) {
-    log(`B${requestedBucket}: closed ${retired.length} retired reviewer tab(s) before rotation`);
-  }
-}
-
 function latestSetupAction(bucket) {
   return Object.values(state.actions || {})
     .filter(action => Number(action?.bucket) === Number(bucket)
@@ -1403,12 +1953,9 @@ function latestSetupAction(bucket) {
 async function closeUnsentReviewerPage(page, bucketState, bucket) {
   bucketState.newChatCreation = null;
   saveState();
-  if (!page) return;
-  try {
-    if (!page.isClosed()) await page.close();
-  } catch (error) {
-    log('B' + bucket + ': unable to close unsent reviewer tab: ' + (error.message || error));
-  }
+  const slot = [...reviewerSlotRegistry.values()].find(entry => entry.page === page);
+  if (slot) slot.bucket = String(bucket);
+  log(`B${bucket}: retained reusable reviewer slot after an unsent setup action`);
 }
 
 async function createReviewer(context, bucket) {
@@ -1427,27 +1974,18 @@ async function createReviewer(context, bucket) {
     }
     return;
   }
-  if (managedReviewerChatCount() >= MAX_REVIEWER_CHAT_TABS) {
-    recordIncident(
-      'REVIEWER_CHAT_CAP_REACHED',
-      bucket,
-      'the five-chat bucket rotation is full; no additional reviewer chat was opened',
-      { maxReviewerChatTabs: MAX_REVIEWER_CHAT_TABS },
-      { wakeCoordinator: false },
-    );
-    return;
-  }
-
-  await closeRetiredReviewerTabs(context, bucket);
-
   bucketState.newChatCreation = { status: 'OPENING', startedAt: now(), actionId: null };
   saveState();
-  log('B' + bucket + ': opening a reviewer chat (' + managedReviewerChatCount() + '/' + MAX_REVIEWER_CHAT_TABS + ' bucket chats allocated)');
+  log(`B${bucket}: opening a reviewer chat in a reusable reviewer slot`);
 
   let page = null;
+  let slot = null;
   try {
-    page = await context.newPage();
-    await page.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    slot = await reviewerSlotForBucket(context, bucket, { allowUninitialized: true });
+    page = slot.page;
+    await page.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    slot.bucket = String(bucket);
+    bucketState.reviewerSlotId = slot.slotId;
     bucketState.newChatCreation.status = 'READY_TO_SEND';
     saveState();
   } catch (error) {
@@ -1480,7 +2018,7 @@ async function createReviewer(context, bucket) {
   try {
     id = await sendAction(page, bucket, 'PROTOCOL_SETUP', setupPrompt(bucket), '');
   } catch (error) {
-    if (['CONTROL_PAUSED', 'CONTROL_STOPPED', 'CHAT_ROLLOVER_REQUIRED', 'REVIEWER_MODEL_UNAVAILABLE'].includes(error.code)) {
+    if (['CONTROL_PAUSED', 'CONTROL_STOPPED', 'CONTROL_RECONCILIATION_ONLY', 'CHAT_ROLLOVER_REQUIRED', 'REVIEWER_MODEL_UNAVAILABLE'].includes(error.code)) {
       await closeUnsentReviewerPage(page, bucketState, bucket);
       throw error;
     }
@@ -1619,12 +2157,6 @@ async function rolloverReviewer(context, bucket, reason) {
   });
   saveState();
 
-  if (oldChatUrl) {
-    const oldPage = context.pages().find(candidate => candidate.url().startsWith(oldChatUrl));
-    if (oldPage) {
-      try { await oldPage.close(); } catch {}
-    }
-  }
   log(`B${bucket}: adaptive chat rollover queued; reason=${reason}`);
 }
 
@@ -1690,8 +2222,7 @@ function turnStallReason(bucketState) {
 function recoverLostAwaitingState() {
   let recovered = false;
   for (const [bucket, bucketState] of Object.entries(state.buckets)) {
-    if (isSchedulingBlockedBucket(bucket)) continue;
-    if (bucketState.complete || !['ACTIVE', 'SETUP_WAIT'].includes(bucketState.phase)) continue;
+    if (isSchedulingBlockedBucket(bucket) || bucketState.complete || !['ACTIVE', 'SETUP_WAIT'].includes(bucketState.phase)) continue;
     // A pending exact source-pack recovery intentionally clears the previous
     // action's awaiting state so the retry can be sent. Do not resurrect the
     // stale SENT action while that recovery is pending.
@@ -2097,6 +2628,7 @@ function recoverUnavailableSourcePackHolds() {
   let recovered = false;
   for (const [bucket, bucketState] of Object.entries(state.buckets)) {
     if (isSchedulingBlockedBucket(bucket)) continue;
+    if (!isVerifiedSourcePackCursor(bucket, bucketState)) continue;
     if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
     const incidentId = String(bucketState.lastAction).slice('incident:'.length);
     const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
@@ -2375,20 +2907,20 @@ function recoverSourcePackHolds() {
   const released = [];
   for (const [bucket, bucketState] of Object.entries(state.buckets)) {
     if (isSchedulingBlockedBucket(bucket)) continue;
+    if (!isVerifiedSourcePackCursor(bucket, bucketState)) continue;
     if (bucketState.phase !== 'HOLD' || !String(bucketState.lastAction || '').startsWith('incident:')) continue;
     const incidentId = String(bucketState.lastAction).slice('incident:'.length);
     const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
     const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
     if (incident?.kind !== 'NEXT_SOURCE_PACKS_REQUIRED') continue;
-    const shard = SOURCE_PACK_SHARDS[Number(bucket)];
+    const shard = configuredSourcePackShard(bucket);
     if (!shard) continue;
-    const targetNumber = nextSourcePackNumber({
-      startPack: shard.startPack,
+    const resolved = resolveNextSourcePackTargetNumber(Number(bucket), {
+      bucketState,
+      incident,
       incidentId,
-      lastDeliveredNumber: bucketState.sourcePackLastDeliveredNumber,
-      lastDeliveredIncidentId: bucketState.sourcePackLastDeliveredIncidentId,
-      bucket: Number(bucket),
     });
+    const targetNumber = resolved.targetNumber;
     if (!isValidSourcePackNumber(Number(bucket), targetNumber)) continue;
     const filename = sourcePackFilename(targetNumber, Number(bucket));
     if (bucketState.sourcePackResumePending
@@ -2427,6 +2959,7 @@ function recoverSourcePackHolds() {
 async function sendPendingSourcePackContinuations(context) {
   for (const [bucket, bucketState] of Object.entries(state.buckets).sort((a, b) => Number(a[0]) - Number(b[0]))) {
     if (isSchedulingBlockedBucket(bucket)) continue;
+    if (!isVerifiedSourcePackCursor(bucket, bucketState)) continue;
     if (!bucketState.sourcePackResumePending
       || bucketState.complete
       || bucketState.phase === 'HOLD'
@@ -2506,7 +3039,7 @@ async function sendPendingSourcePackContinuations(context) {
       continue;
     }
     const targetNumber = resolved.targetNumber;
-    const shard = SOURCE_PACK_SHARDS[Number(bucket)];
+    const shard = configuredSourcePackShard(bucket);
     if (!shard || !incidentId) {
       recordIncident('SOURCE_PACK_CURSOR_INVALID', Number(bucket), `source-pack recovery has no valid target for incident ${incidentId || 'unknown'}`);
       continue;
@@ -2597,6 +3130,10 @@ function updateReceivedMessage(bucketState, text, responseHash) {
 }
 
 function recordFooterProgress(bucket, bucketState, footer, responseAction) {
+  bucketState.lastRegistryWriteVerified = footer?.writesVerified || null;
+  if (Number(footer?.newCases || 0) > 0 && footer?.writesVerified === 'YES') {
+    bucketState.lastRegistryWriteAt = now();
+  }
   const count = Number(footer?.newCases || 0);
   if (!Number.isFinite(count) || count <= 0) return;
 
@@ -2686,6 +3223,17 @@ async function processActive(page, bucket, bucketState, text, responseHash, opti
     markProcessedResponse(bucketState, responseHash, responseActionId);
     saveState();
 
+    if (responseAction?.kind === 'PREREQUISITE_REVALIDATION') {
+      recordIncident(
+        'REGISTRY_PREREQUISITE_RESULT_MALFORMED',
+        bucket,
+        'registry prerequisite revalidation returned no strict AUDIT_TURN_STATUS footer; automatic release is unsafe',
+        { actionId: responseAction.id, responsePreview: String(text).slice(0, 500) },
+        { holdType: 'INTEGRITY' },
+      );
+      return;
+    }
+
     if (bucketState.malformedCount <= 1) {
       if (!allowDispatch) {
         bucketState.lastAction = 'malformed-response-reconciled-without-dispatch';
@@ -2712,13 +3260,67 @@ async function processActive(page, bucket, bucketState, text, responseHash, opti
   markProcessedResponse(bucketState, responseHash, responseActionId, footer);
   recordFooterProgress(bucket, bucketState, footer, responseAction);
 
+  if (responseAction?.kind === 'PREREQUISITE_REVALIDATION') {
+    const availability = String(text).match(/(?:^|\n)REGISTRY_SHARD_AVAILABLE:\s*(YES|NO)\s*(?:\n|$)/i)?.[1]?.toUpperCase();
+    if (availability === 'NO' || registryAvailabilityBlocker(footer)) {
+      recordIncident(
+        'REGISTRY_PREREQUISITE_UNAVAILABLE',
+        bucket,
+        `canonical registry shard ${bucket} is still unavailable after automatic revalidation`,
+        { footer, actionId: responseAction.id, validation: { kind: 'REGISTRY_SHARD_AVAILABLE', bucket: Number(bucket) } },
+        { holdType: 'TRANSIENT_EXTERNAL', validation: { kind: 'REGISTRY_SHARD_AVAILABLE', bucket: Number(bucket) } },
+      );
+      return;
+    }
+    if (availability !== 'YES'
+      || footer.status !== 'NORMAL'
+      || footer.writesVerified !== 'YES'
+      || footer.blocker.trim().toUpperCase() !== 'NONE'
+      || footer.triggerCoordinator !== 'NO') {
+      recordIncident(
+        'REGISTRY_PREREQUISITE_RESULT_AMBIGUOUS',
+        bucket,
+        'registry availability response did not prove the exact shard was accessible; preserving an integrity hold',
+        { footer, actionId: responseAction.id, responsePreview: String(text).slice(0, 500) },
+        { holdType: 'INTEGRITY' },
+      );
+      return;
+    }
+
+    bucketState.hold = null;
+    bucketState.transientHoldRetryCount = 0;
+    bucketState.phase = 'ACTIVE';
+    bucketState.lastAction = `registry-prerequisite-revalidated:${responseAction.id}`;
+    saveState();
+    recordActivityEvent(state, {
+      bucket,
+      kind: 'HOLD_RELEASED',
+      summary: `registry shard ${bucket} revalidated; prior action response reconciled`,
+    });
+    if (allowDispatch) {
+      await sendAction(page, bucket, 'CONTINUE', continuationPrompt(bucket), responseHash);
+      bucketState.lastAction = `continue-after-registry-revalidation:${responseAction.id}`;
+      saveState();
+    }
+    return;
+  }
+
   if (reviewerConfirmedSourcePackAccess(bucketState, footer, responseAction)) {
+    const targetNumber = parseSourcePackNumber(bucketState.sourcePackTargetNumber, Number(bucket));
     markSourcePackAccessVerified(bucketState, {
-      targetNumber: bucketState.sourcePackTargetNumber,
+      targetNumber,
       incidentId: bucketState.sourcePackResumeIncidentId || bucketState.sourcePackLastDeliveredIncidentId,
       filename: bucketState.sourcePackTargetFilename
-        || sourcePackFilename(bucketState.sourcePackTargetNumber),
+        || sourcePackFilename(targetNumber, Number(bucket)),
       requestActionId: responseAction?.id || bucketState.sourcePackLastDeliveredActionId,
+    });
+    recordSourcePackCursorEvidence(bucket, bucketState, {
+      targetNumber,
+      evidenceKind: 'SOURCE_PACK_ACCESS',
+      sourceActionId: responseAction?.id,
+      responseActionId,
+      responseHash,
+      footer,
     });
   }
 
@@ -2912,12 +3514,24 @@ async function processActive(page, bucket, bucketState, text, responseHash, opti
     const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
     const previousFilename = bucketState.sourcePackTargetFilename
       || sourcePackFilename(lastConsumed, Number(bucket));
+    const cursorEvidenceSourceActionId = bucketState.sourcePackRequestActionId
+      || bucketState.sourcePackLastDeliveredActionId
+      || (isSourcePackContinuationEvidenceKind(responseAction?.kind) ? responseActionId : null);
     const advanced = advanceSourcePackAfterBoundary(Number(bucket), bucketState, {
       incidentId,
       incident,
       responseText: text,
     });
     if (advanced.ok) {
+      recordSourcePackCursorEvidence(bucket, bucketState, {
+        targetNumber: advanced.nextPack,
+        evidenceKind: 'SOURCE_PACK_BOUNDARY',
+        sourceActionId: cursorEvidenceSourceActionId,
+        responseActionId,
+        responseHash,
+        consumedNumber: advanced.consumed,
+        footer,
+      });
       bucketState.advisoryAnomalyResumePending = false;
       bucketState.advisoryAnomalyInterruptedActionId = null;
       bucketState.lastAction = responseActionId
@@ -2945,7 +3559,7 @@ async function processActive(page, bucket, bucketState, text, responseHash, opti
 
   const recoverablePackNumber = recoverablePackNumberFromFooter(footer);
   if (Number.isInteger(recoverablePackNumber) && isValidSourcePackNumber(Number(bucket), recoverablePackNumber)) {
-    const shard = SOURCE_PACK_SHARDS[Number(bucket)];
+    const shard = configuredSourcePackShard(bucket);
     if (!shard) {
       saveState();
       recordIncident('SOURCE_PACK_SHARD_CONFIG_MISSING', bucket, `no source-pack shard configuration exists for Bucket ${bucket}`, { footer });
@@ -3076,6 +3690,7 @@ async function processActive(page, bucket, bucketState, text, responseHash, opti
 }
 
 async function recoverIdleActiveBucket(page, bucket, bucketState, text, responseHash) {
+  if (!preDispatchReady || readControl().desiredState !== 'RUNNING') return false;
   if (bucketState.phase !== 'ACTIVE'
     || bucketState.awaitingResponseAt
     || bucketState.processedHash !== responseHash) return false;
@@ -3116,11 +3731,13 @@ async function recoverIdleActiveBucket(page, bucket, bucketState, text, response
 async function processBucket(context, bucket) {
   const bucketState = state.buckets[String(bucket)];
   if (isSchedulingBlockedBucket(bucket)
+    || bucketState.sourcePackCursorReconciliationRequired
+    || !isVerifiedSourcePackCursor(bucket, bucketState)
     || bucketState.complete
     || bucketState.phase === 'PENDING'
     || bucketState.phase === 'HOLD'
     || bucketState.phase === 'PAUSED') return;
-  if (readControl().desiredState !== 'RUNNING') return;
+  if (readControl().desiredState !== 'RUNNING' || !preDispatchReady) return;
 
   try {
     const page = await ensurePage(context, bucketState);
@@ -3237,13 +3854,19 @@ async function processBucket(context, bucket) {
     if (bucketState.phase === 'SETUP_WAIT' && responseActionId) {
       await processSetupWait(page, bucket, bucketState, text, responseHash);
     } else if (bucketState.phase === 'ACTIVE' && responseActionId) {
-      await processActive(page, bucket, bucketState, text, responseHash);
+      await processActive(page, bucket, bucketState, text, responseHash, {
+        allowDispatch: preDispatchReady
+          && readControl().desiredState === 'RUNNING'
+          && sourcePackShardMappingStatus().ready,
+      });
     }
   } catch (error) {
-    if (error.code === 'CONTROL_PAUSED' || error.code === 'CONTROL_STOPPED') {
+    if (['CONTROL_PAUSED', 'CONTROL_STOPPED', 'CONTROL_RECONCILIATION_ONLY'].includes(error.code)) {
       bucketState.lastAction = error.code === 'CONTROL_PAUSED'
         ? 'paused-before-send'
-        : 'stopped-before-send';
+        : error.code === 'CONTROL_STOPPED'
+          ? 'stopped-before-send'
+          : 'reconciliation-only-before-send';
       saveState();
       return;
     }
@@ -3307,6 +3930,100 @@ function applyResolvedSourcePackTarget(bucket, bucketState, resolved, incidentId
     bucketState.sourcePackLastVisibleNumber = resolved.lastVisible;
   }
   return true;
+}
+
+function isVerifiedSourcePackCursor(bucket, bucketState) {
+  const targetNumber = parseSourcePackNumber(bucketState?.sourcePackTargetNumber, Number(bucket));
+  const targetFilename = sourcePackFilename(targetNumber, Number(bucket));
+  const proof = bucketState?.sourcePackCursorEvidence;
+  const sourceAction = proof?.sourceActionId ? state.actions[proof.sourceActionId] : null;
+  const responseAction = proof?.responseActionId ? state.actions[proof.responseActionId] : null;
+  return Boolean(
+    targetNumber !== null
+    && targetFilename
+    && proof
+    && Number(proof.bucket) === Number(bucket)
+    && Number(proof.targetNumber) === targetNumber
+    && proof.targetFilename === targetFilename
+    && ['SOURCE_PACK_ACCESS', 'SOURCE_PACK_BOUNDARY'].includes(proof.evidenceKind)
+    && proof.sourceActionId
+    && proof.responseActionId
+    && proof.sourceActionId === proof.responseActionId
+    && sourceAction?.status === 'SENT'
+    && sourceAction.deliveryVerified === true
+    && isSourcePackContinuationEvidenceKind(sourceAction.kind)
+    && sourceAction.sourcePackTargetFilename === proof.sourceActionTargetFilename
+    && proof.responseKey === actionResponseKey(proof.responseActionId, proof.responseHash)
+    && responseAction?.status === 'SENT'
+    && responseAction.deliveryVerified === true
+    && /^[a-f0-9]{16}$/i.test(String(proof.responseHash || ''))
+    && Number.isFinite(Date.parse(proof.verifiedAt || '')),
+  );
+}
+
+function recordSourcePackCursorEvidence(bucket, bucketState, {
+  targetNumber,
+  evidenceKind,
+  sourceActionId,
+  responseActionId,
+  responseHash,
+  consumedNumber = null,
+  footer = null,
+} = {}) {
+  const bucketNumber = Number(bucket);
+  const target = parseSourcePackNumber(targetNumber, bucketNumber);
+  const filename = sourcePackFilename(target, bucketNumber);
+  const sourceAction = sourceActionId ? state.actions[sourceActionId] : null;
+  const responseAction = responseActionId ? state.actions[responseActionId] : null;
+  const responseKey = actionResponseKey(responseActionId, responseHash);
+  const expectedActionPack = evidenceKind === 'SOURCE_PACK_ACCESS'
+    ? target
+    : parseSourcePackNumber(consumedNumber, bucketNumber);
+  if (!filename
+    || !['SOURCE_PACK_ACCESS', 'SOURCE_PACK_BOUNDARY'].includes(evidenceKind)
+    || !sourceAction?.id
+    || sourceAction.status !== 'SENT'
+    || sourceAction.deliveryVerified !== true
+    || !isSourcePackContinuationEvidenceKind(sourceAction.kind)
+    || !responseAction?.id
+    || responseAction.status !== 'SENT'
+    || responseAction.deliveryVerified !== true
+    || responseAction.id !== sourceAction.id
+    || !expectedActionPack
+    || sourceAction.sourcePackTargetFilename !== sourcePackFilename(expectedActionPack, bucketNumber)
+    || bucketState.processedResponseKey !== responseKey
+    || (evidenceKind === 'SOURCE_PACK_ACCESS' && footer?.status !== 'NORMAL')
+    || (evidenceKind === 'SOURCE_PACK_BOUNDARY'
+      && !(footer?.status === 'NORMAL' && String(footer?.blocker || '').toUpperCase() === 'NEXT_SOURCE_PACKS_REQUIRED'))) return false;
+
+  bucketState.sourcePackCursorEvidence = {
+    bucket: bucketNumber,
+    targetNumber: target,
+    targetFilename: filename,
+    evidenceKind,
+    sourceActionId: sourceAction.id,
+    sourceActionTargetFilename: sourceAction.sourcePackTargetFilename,
+    responseActionId: responseAction.id,
+    responseHash,
+    responseKey,
+    consumedNumber: parseSourcePackNumber(consumedNumber, bucketNumber),
+    footerStatus: footer?.status || null,
+    footerBlocker: footer?.blocker || null,
+    verifiedAt: now(),
+  };
+  bucketState.sourcePackCursorReconciliationRequired = false;
+  if (bucketState.hold?.type === 'INTEGRITY'
+    && bucketState.hold.reason === 'SOURCE_PACK_CURSOR_RECONCILIATION_REQUIRED') {
+    bucketState.hold = bucketState.sourcePackDeferredHold || null;
+    bucketState.sourcePackDeferredHold = null;
+    bucketState.phase = bucketState.hold ? 'HOLD' : (bucketState.chatUrl ? 'ACTIVE' : 'PENDING');
+    bucketState.lastAction = `source-pack-cursor-evidence-verified:${responseAction.id}`;
+  }
+  return true;
+}
+
+function isSourcePackContinuationEvidenceKind(kind) {
+  return ['SOURCE_PACK_CONTINUE', 'SOURCE_PACK_RETRY'].includes(String(kind || ''));
 }
 
 function stageUnavailableSourcePackBackoff(
@@ -3373,6 +4090,7 @@ function recoverFalseSourcePackBoundaryAdvances() {
   let recovered = false;
   for (const [bucket, bucketState] of Object.entries(state.buckets)) {
     if (isSchedulingBlockedBucket(bucket) || bucketState.complete || !bucketState.sourcePackResumePending) continue;
+    if (!isVerifiedSourcePackCursor(bucket, bucketState)) continue;
     const bucketNumber = Number(bucket);
     const currentTarget = parseSourcePackNumber(bucketState.sourcePackTargetNumber, bucketNumber);
     if (currentTarget === null) continue;
@@ -3448,6 +4166,7 @@ function recoverStaleSourcePackBoundaryState() {
   for (const [bucket, bucketState] of Object.entries(state.buckets)) {
     if (isSchedulingBlockedBucket(bucket)) continue;
     if (bucketState.complete) continue;
+    if (!isVerifiedSourcePackCursor(bucket, bucketState)) continue;
     if (bucketState.sourcePackResumePending) continue;
     if (bucketHasUnresolvedAwaitingAction(bucketState)) continue;
 
@@ -3506,92 +4225,68 @@ function recoverStaleSourcePackBoundaryState() {
 async function recoverInvalidSourcePackCursors(context) {
   let recovered = false;
   for (const [bucket, bucketState] of Object.entries(state.buckets)) {
-    if (isSchedulingBlockedBucket(bucket)) continue;
+    if (isSchedulingBlockedBucket(bucket) || bucketState.complete) continue;
     const bucketNumber = Number(bucket);
     const hadInvalid = sanitizeStoredSourcePackCursorFields(bucketNumber, bucketState)
       || isInvalidZeroSourcePackFilename(bucketState.sourcePackTargetFilename)
       || bucketState.sourcePackTargetNumber === 0
       || bucketState.sourcePackLastDeliveredNumber === 0;
+    const proofValid = isVerifiedSourcePackCursor(bucketNumber, bucketState);
+    const cursorSnapshot = {
+      targetNumber: bucketState.sourcePackTargetNumber ?? null,
+      targetFilename: bucketState.sourcePackTargetFilename ?? null,
+      lastConsumedNumber: bucketState.sourcePackLastConsumedNumber ?? null,
+      lastVisibleNumber: bucketState.sourcePackLastVisibleNumber ?? null,
+      lastDeliveredNumber: bucketState.sourcePackLastDeliveredNumber ?? null,
+      lastDeliveredActionId: bucketState.sourcePackLastDeliveredActionId ?? null,
+      awaitingActionId: bucketState.awaitingActionId || null,
+      processedResponseKey: bucketState.processedResponseKey || null,
+      evidence: bucketState.sourcePackCursorEvidence || null,
+    };
 
-    if (hadInvalid) {
-      if (bucketState.sourcePackLastDeliveredNumber === 0
-        || isInvalidZeroSourcePackFilename(sourcePackFilename(bucketState.sourcePackLastDeliveredNumber, bucketNumber))) {
-        bucketState.sourcePackLastDeliveredNumber = null;
-        bucketState.sourcePackLastDeliveredIncidentId = null;
-        bucketState.sourcePackLastDeliveredAt = null;
-        bucketState.sourcePackLastDeliveredActionId = null;
-      }
-      if (String(bucketState.lastMessageSentKind || '') === 'SOURCE_PACK_CONTINUE'
-        && (bucketState.sourcePackTargetNumber === 0 || isInvalidZeroSourcePackFilename(bucketState.sourcePackTargetFilename))) {
-        bucketState.awaitingResponseAt = null;
-        bucketState.awaitingActionId = null;
-      }
-    }
-
-    if (!hadInvalid && isValidSourcePackNumber(bucketNumber, bucketState.sourcePackTargetNumber)) continue;
-
-    let responseText = bucketState.sourcePackBoundaryResponsePreview || null;
-    if (!responseText && bucketState.chatUrl && context) {
-      try {
-        const page = await ensurePage(context, bucketState);
-        if (page) {
-          const messages = await readVisibleMessages(page);
-          responseText = messages
-            .filter(message => message.role === 'assistant')
-            .map(message => message.text)
-            .join('\n');
-        }
-      } catch {}
-    }
-
-    let incidentId = bucketState.sourcePackResumeIncidentId;
-    let incidentRecord = incidentId
-      ? Object.values(state.incidents).find(entry => entry.id === incidentId)
-      : null;
-    let incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
-    if ((!incident || incident.kind !== 'NEXT_SOURCE_PACKS_REQUIRED')
-      && String(bucketState.lastProcessedBlocker || '').trim().toUpperCase() === 'NEXT_SOURCE_PACKS_REQUIRED') {
-      const latestBoundary = latestSourcePackBoundaryIncident(bucketNumber);
-      if (latestBoundary) {
-        incidentId = latestBoundary.incident.id;
-        incidentRecord = latestBoundary.record;
-        incident = latestBoundary.incident;
-      }
-    }
-
-    const resolved = resolveNextSourcePackTargetNumber(bucketNumber, {
-      bucketState,
-      incident,
-      incidentId,
-      responseText,
-    });
-
-    if (!isValidSourcePackNumber(bucketNumber, resolved.targetNumber)) {
-      if (hadInvalid) {
-        bucketState.sourcePackResumePending = false;
-        bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
-        bucketState.lastAction = `source-pack-cursor-unresolved:${resolved.reason}`;
-        log(`B${bucket}: rejected invalid source-pack cursor; could not resolve exact next pack (${resolved.reason})`);
+    if (proofValid) {
+      bucketState.sourcePackCursorReconciliationRequired = false;
+      if (bucketState.hold?.type === 'INTEGRITY'
+        && bucketState.hold.reason === 'SOURCE_PACK_CURSOR_RECONCILIATION_REQUIRED') {
+        bucketState.hold = bucketState.sourcePackDeferredHold || null;
+        bucketState.sourcePackDeferredHold = null;
+        bucketState.phase = bucketState.hold ? 'HOLD' : (bucketState.chatUrl ? 'ACTIVE' : 'PENDING');
+        bucketState.lastAction = `source-pack-cursor-proof-accepted:${bucketState.sourcePackCursorEvidence.responseActionId}`;
         recovered = true;
       }
       continue;
     }
 
-    if (bucketState.sourcePackTargetNumber === resolved.targetNumber
-      && bucketState.sourcePackTargetFilename === sourcePackFilename(resolved.targetNumber, bucketNumber)) {
-      if (hadInvalid) recovered = true;
+    bucketState.sourcePackCursorReconciliationRequired = true;
+    bucketState.sourcePackResumePending = false;
+    const currentHoldIsCursor = bucketState.hold?.type === 'INTEGRITY'
+      && bucketState.hold.reason === 'SOURCE_PACK_CURSOR_RECONCILIATION_REQUIRED';
+    if (currentHoldIsCursor) {
+      bucketState.phase = 'HOLD';
       continue;
     }
 
-    applyResolvedSourcePackTarget(bucketNumber, bucketState, resolved, incidentId);
-    bucketState.sourcePackResumePending = true;
-    bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
-    bucketState.awaitingResponseAt = null;
-    bucketState.awaitingActionId = null;
-    bucketState.responseBaselineHash = null;
-    resetSourcePackAccessState(bucketState);
-    bucketState.lastAction = `source-pack-cursor-recovered:${resolved.reason}:pack-${resolved.targetNumber}`;
-    log(`B${bucket}: recovered invalid source-pack cursor to pack_${String(resolved.targetNumber).padStart(6, '0')}.jsonl (${resolved.reason})`);
+    // Keep an existing external/user hold available for recovery after cursor evidence is resolved.
+    if (bucketState.hold && !['INTEGRITY', 'USER', 'COMPLETE'].includes(bucketState.hold.type)) {
+      bucketState.sourcePackDeferredHold = bucketState.hold;
+    }
+    if (bucketState.hold?.type === 'INTEGRITY' || bucketState.hold?.type === 'USER' || bucketState.hold?.type === 'COMPLETE') {
+      bucketState.phase = 'HOLD';
+      continue;
+    }
+
+    const pathValue = recordIncident(
+      'SOURCE_PACK_CURSOR_RECONCILIATION_REQUIRED',
+      bucketNumber,
+      'source-pack target cannot be used until an action-attributed source-pack response proves the exact boundary',
+      { cursorSnapshot, hadInvalid, contextAvailable: Boolean(context) },
+      { holdType: 'INTEGRITY' },
+    );
+    const incident = pathValue ? Object.values(state.incidents).find(entry => entry.path === pathValue) : null;
+    bucketState.sourcePackCursorIncidentId = incident?.id || bucketState.hold?.incidentId || null;
+    bucketState.sourcePackResumePending = false;
+    bucketState.phase = 'HOLD';
+    log(`B${bucket}: source-pack cursor requires action-attributed reconciliation; dispatch remains blocked`);
     recovered = true;
   }
   if (recovered) saveState();
@@ -3645,6 +4340,90 @@ function recoverRecoverableHoldsForScheduling() {
     if (recoverRecoverableHoldForScheduling(bucket, bucketState)) recovered = true;
   }
   if (recovered) saveState();
+}
+
+async function recoverTransientRegistryHolds(context) {
+  let changed = false;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (isSchedulingBlockedBucket(bucket)
+      || bucketState.phase !== 'HOLD'
+      || bucketState.hold?.type !== 'TRANSIENT_EXTERNAL'
+      || bucketState.hold?.validation?.kind !== 'REGISTRY_SHARD_AVAILABLE'
+      || bucketHasUnresolvedAwaitingAction(bucketState)
+      || !isHoldRetryDue(bucketState.hold)) continue;
+
+    if (!bucketState.chatUrl) {
+      deferTransientHold(bucketState, 'reviewer conversation unavailable for registry revalidation');
+      changed = true;
+      continue;
+    }
+
+    let page;
+    let health;
+    try {
+      page = await ensurePage(context, bucketState);
+      health = await classifyReviewerHealth(page);
+    } catch (error) {
+      deferTransientHold(bucketState, `reviewer prerequisite probe failed: ${error.message || error}`);
+      changed = true;
+      continue;
+    }
+
+    if (health.state === 'AUTH_REQUIRED') {
+      recordIncident(
+        'REVIEWER_AUTH_REQUIRED',
+        Number(bucket),
+        'automatic registry revalidation requires the existing authenticated reviewer session',
+        { health },
+        { holdType: 'USER' },
+      );
+      changed = true;
+      continue;
+    }
+    if (health.state !== 'HEALTHY' || health.actualGeneration) {
+      deferTransientHold(bucketState, `registry revalidation deferred while reviewer is ${health.state}`);
+      changed = true;
+      continue;
+    }
+
+    try {
+      const latestAssistant = await latestMessage(page, 'assistant');
+      const responseHash = latestAssistant ? sha16(latestAssistant) : (bucketState.processedHash || bucketState.lastHash || '');
+      const actionIdSent = await sendAction(
+        page,
+        Number(bucket),
+        'PREREQUISITE_REVALIDATION',
+        registryPrerequisiteRevalidationPrompt(Number(bucket)),
+        responseHash,
+      );
+      bucketState.phase = 'ACTIVE';
+      bucketState.hold = {
+        ...bucketState.hold,
+        revalidationActionId: actionIdSent,
+        lastAttemptAt: now(),
+      };
+      bucketState.lastAction = `registry-prerequisite-revalidation-sent:${actionIdSent}`;
+      saveState();
+      recordActivityEvent(state, {
+        bucket,
+        kind: 'HOLD_REVALIDATION',
+        summary: `registry prerequisite revalidation sent (${actionIdSent})`,
+      });
+      changed = true;
+      log(`B${bucket}: transient registry hold revalidation sent (${actionIdSent})`);
+    } catch (error) {
+      if (bucketHasUnresolvedAwaitingAction(bucketState)) {
+        bucketState.phase = 'ACTIVE';
+        bucketState.hold.revalidationActionId = bucketState.awaitingActionId;
+        bucketState.hold.lastAttemptAt = now();
+      } else {
+        deferTransientHold(bucketState, `registry revalidation dispatch failed: ${error.message || error}`);
+      }
+      changed = true;
+    }
+  }
+  if (changed) saveState();
+  return changed;
 }
 
 async function reconcileStaleGenerationReservations(context) {
@@ -3883,7 +4662,7 @@ async function attemptActivateReviewerSlot(context, bucket, liveGeneratingByBuck
       if (updated?.chatUrl) return { activated: true, method: 'create-reviewer' };
       return { activated: false, reason: 'create-reviewer-no-chat' };
     } catch (error) {
-      if (error.code === 'CONTROL_PAUSED' || error.code === 'CONTROL_STOPPED') throw error;
+      if (['CONTROL_PAUSED', 'CONTROL_STOPPED', 'CONTROL_RECONCILIATION_ONLY'].includes(error.code)) throw error;
       return { activated: false, reason: error.message || String(error) };
     }
   }
@@ -3892,10 +4671,11 @@ async function attemptActivateReviewerSlot(context, bucket, liveGeneratingByBuck
 }
 
 async function fillReviewerSlots(context) {
-  if (readControl().desiredState !== 'RUNNING') return;
+  if (readControl().desiredState !== 'RUNNING' || !preDispatchReady) return;
 
   let liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
   await reconcileOutstandingResponses(context, liveGeneratingByBucket);
+  await recoverTransientRegistryHolds(context);
   liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
   await reconcileStaleGenerationReservations(context);
   await recoverSetupAckHolds(context);
@@ -3908,6 +4688,8 @@ async function fillReviewerSlots(context) {
     const writeRecoveryCandidates = Object.entries(state.buckets)
       .filter(([bucket, bucketState]) => (
         !isSchedulingBlockedBucket(bucket)
+        && !bucketState.sourcePackCursorReconciliationRequired
+        && isVerifiedSourcePackCursor(bucket, bucketState)
         && !bucketState.complete
         && bucketState.phase !== 'HOLD'
         && bucketState.writeRecoveryResumePending
@@ -3922,6 +4704,8 @@ async function fillReviewerSlots(context) {
     const setupReadyCandidates = Object.entries(state.buckets)
       .filter(([bucket, bucketState]) => (
         !isSchedulingBlockedBucket(bucket)
+        && !bucketState.sourcePackCursorReconciliationRequired
+        && isVerifiedSourcePackCursor(bucket, bucketState)
         && bucketState.phase === 'SETUP_WAIT'
         && bucketState.setupVerified
         && String(bucketState.setupVerifiedChatId || '') === String(bucketState.chatId || '')
@@ -3936,6 +4720,8 @@ async function fillReviewerSlots(context) {
       ...setupReadyCandidates.filter(bucket => !writeRecoveryCandidates.includes(bucket)),
       ...regularCandidates.filter(bucket => (
         !writeRecoveryCandidates.includes(bucket) && !setupReadyCandidates.includes(bucket)
+        && !state.buckets[String(bucket)]?.sourcePackCursorReconciliationRequired
+        && isVerifiedSourcePackCursor(bucket, state.buckets[String(bucket)])
       )),
     ];
     if (!candidates.length) break;
@@ -4010,7 +4796,9 @@ function statusMetrics() {
 
 function writeStatus(extra = {}) {
   const control = readControl();
+  const heartbeatAt = now();
   const metrics = statusMetrics();
+  const sourceShardMapping = sourcePackShardMappingStatus();
   const operations = buildOperationsStatus({
     state,
     occupancy: lastLiveReviewerOccupancy,
@@ -4021,14 +4809,66 @@ function writeStatus(extra = {}) {
     auditablePopulation: config.auditablePopulation,
     graceMs: dispatchStartGraceMs(),
   });
+  const schedulerExclusions = { ...(operations.bucketExclusions || {}) };
+  for (const [bucket, value] of Object.entries(state.buckets)) {
+    if (!value.complete && value.sourcePackCursorReconciliationRequired) {
+      schedulerExclusions[bucket] = 'SOURCE_PACK_CURSOR_RECONCILIATION_REQUIRED';
+    }
+    if (!value.complete && preDispatchEvidence.bucketExclusions?.[bucket]) {
+      schedulerExclusions[bucket] ||= preDispatchEvidence.bucketExclusions[bucket];
+    }
+  }
+  if (!sourceShardMapping.ready) {
+    for (let bucket = 0; bucket < 6; bucket += 1) {
+      schedulerExclusions[String(bucket)] = `SOURCE_SHARD_CONFIG_MISSING: missing=${sourceShardMapping.missingBuckets.join(',') || 'none'}; placeholder=${sourceShardMapping.placeholderBuckets.join(',') || 'none'}`;
+    }
+  }
   const status = {
-    updatedAt: now(),
+    updatedAt: heartbeatAt,
+    controllerPid: process.pid,
+    startedAt: controllerStartedAt,
+    heartbeatAt,
+    controllerState: controllerLifecycleState,
+    stalePreviousRun: previousControllerStale(previousRuntimeStatus),
+    previousRun: previousRuntimeStatus ? {
+      controllerPid: previousRuntimeStatus.controllerPid || null,
+      startedAt: previousRuntimeStatus.startedAt || null,
+      heartbeatAt: previousRuntimeStatus.heartbeatAt || previousRuntimeStatus.updatedAt || null,
+      stale: previousControllerStale(previousRuntimeStatus),
+    } : null,
+    build: {
+      gitSha: loadedGitSha,
+      sourceHash: loadedSourceHash,
+      loadedSourceHash,
+      diskSourceHash: sourceHashFromDisk(),
+      startedAt: controllerStartedAt,
+    },
     connected: true,
+    configurationState: sourceShardMapping.ready ? 'READY' : 'CONFIG_MISSING',
+    canonicalRegistry: {
+      status: 'UNAVAILABLE',
+      source: 'NO_FRESH_MACHINE_READABLE_CANONICAL_RECONCILIATION',
+      reconciledAt: null,
+      acceptedTerminalCount: null,
+      remainingAuditableCases: null,
+      duplicateTerminalRows: null,
+      conflictingTerminalRows: null,
+      ownershipMismatches: null,
+    },
+    acceptedTerminalCount: null,
+    acceptedTerminalCountStatus: 'UNAVAILABLE',
+    sourceShardMapping,
+    preflightBlockers: sourceShardMapping.ready ? [] : ['SOURCE_SHARD_CONFIG_MISSING'],
     runState: control.desiredState === 'RUNNING' ? state.runState : control.desiredState,
-    controllerState: state.runState,
     control,
+    preDispatchReady,
+    preDispatchMode: preDispatchReady ? 'DISPATCH_READY' : 'RECONCILIATION_ONLY',
+    preDispatchBlockers: preDispatchEvidence.blockers,
+    preDispatchEvidence,
+    dispatchEnabled: Boolean(preDispatchReady && control.desiredState === 'RUNNING'),
     maxActiveReviewers: MAX_ACTIVE_REVIEWERS,
-    maxReviewerChatTabs: MAX_REVIEWER_CHAT_TABS,
+    maxReviewerTabs: MAX_REVIEWER_TABS,
+    maxAutomationTabs: MAX_AUTOMATION_TABS,
     managedReviewerChatCount: managedReviewerChatCount(),
     reviewerModelPolicy: {
       model: REQUIRED_REVIEWER_MODEL,
@@ -4036,8 +4876,19 @@ function writeStatus(extra = {}) {
       verifiedBeforeEverySend: true,
       fallbackAllowed: false,
     },
+    browserConnected: Boolean(browserRuntimeStatus.browserConnected),
+    browserExecutable: browserRuntimeStatus.browserExecutable || null,
+    browserPid: browserRuntimeStatus.browserPid || null,
+    cdpEndpoint: browserRuntimeStatus.cdpEndpoint || null,
+    chatgptReady: Boolean(browserRuntimeStatus.chatgptReady),
+    authenticationRequired: Boolean(browserRuntimeStatus.authenticationRequired),
+    coordinatorHealth: browserRuntimeStatus.coordinatorHealth || null,
+    coordinatorTabPresent: Boolean(browserRuntimeStatus.coordinatorTabPresent),
+    reviewerTabCount: Number(browserRuntimeStatus.reviewerTabCount || 0),
+    automationTabCount: Number(browserRuntimeStatus.automationTabCount || 0),
+    reviewerSlots: browserRuntimeStatus.reviewerSlots || [],
     maxReviewerGenerations: operations.maxReviewerGenerations,
-    liveReviewerGenerations: operations.liveReviewerGenerations,
+    liveReviewerGenerations: Number(browserRuntimeStatus.liveReviewerGenerations ?? operations.liveReviewerGenerations),
     productiveReviewerCount: operations.productiveReviewerCount,
     substantiveAuditGenerations: operations.substantiveAuditGenerations,
     schedulingBlockedBuckets: Array.from(SCHEDULING_BLOCKED_BUCKETS).sort((a, b) => a - b),
@@ -4052,6 +4903,7 @@ function writeStatus(extra = {}) {
     schedulerUnderutilized: operations.schedulerUnderutilized,
     idleReviewerCapacity: operations.idleReviewerCapacity,
     idleCapacityReason: operations.idleCapacityReason,
+    schedulerExclusions,
     progressingBuckets5m: operations.progressingBuckets5m,
     progressingBuckets15m: operations.progressingBuckets15m,
     progressingBuckets60m: operations.progressingBuckets60m,
@@ -4081,25 +4933,49 @@ function writeStatus(extra = {}) {
           bucket,
           {
             schedulingBlocked: isSchedulingBlockedBucket(bucket),
+            bucket: Number(bucket),
             complete: value.complete,
             phase: value.phase,
+            holdType: value.hold?.type || null,
+            holdReason: value.hold?.reason || null,
+            holdSince: value.hold?.createdAt || null,
+            recoverable: value.hold?.type === 'TRANSIENT_EXTERNAL',
+            sourcePackCursorStatus: value.sourcePackCursorReconciliationRequired
+              ? 'INTEGRITY_RECONCILIATION_REQUIRED'
+              : 'PROVEN',
+            sourcePackCursorReconciliationRequired: Boolean(value.sourcePackCursorReconciliationRequired),
+            sourcePackCursorEvidence: value.sourcePackCursorEvidence || null,
+            nextRecoveryAttemptAt: value.hold?.nextAttemptAt || null,
+            eligibleForScheduling: sourceShardMapping.ready && (ops.eligibleForScheduling ?? false),
+            schedulerExclusionReason: schedulerExclusions[bucket] || null,
             operationalState: ops.operationalState || null,
             workflowPhase: value.phase,
             reviewerModelVerification: value.reviewerModelVerification || null,
             newChatCreationStatus: value.newChatCreation?.status || null,
             liveGeneration: ops.liveGeneration ?? false,
+            actualGenerationDetected: Boolean(lastLiveGeneratingByBucket[String(bucket)]),
+            generationReserved: bucketHasGenerationReservation(value),
+            reviewerSlot: value.reviewerSlotId || null,
             chatId: value.chatId,
             chatUrl: value.chatUrl,
+            reviewerConversationId: value.chatId || null,
             lastSeen: value.lastSeen,
             lastAction: value.lastAction,
             currentActionId: ops.currentActionId || value.awaitingActionId || value.lastMessageSentActionId || null,
-            currentActionType: ops.currentActionType || value.lastMessageSentKind || null,
+            currentActionType: value.awaitingActionId
+              ? state.actions[value.awaitingActionId]?.kind || ops.currentActionType || value.lastMessageSentKind || null
+              : ops.currentActionType || value.lastMessageSentKind || null,
             currentSourcePack: ops.currentSourcePack || null,
             lastConsumedSourcePack: ops.lastConsumedSourcePack || null,
             nextStagedSourcePack: ops.nextStagedSourcePack || null,
+            currentPack: ops.currentSourcePack || null,
+            lastConsumedPack: ops.lastConsumedSourcePack || null,
+            targetPack: value.sourcePackTargetFilename || ops.nextStagedSourcePack || null,
             sourcePackResumePending: ops.sourcePackResumePending ?? Boolean(value.sourcePackResumePending),
             sourcePackAccessVerified: ops.sourcePackAccessVerified ?? Boolean(value.sourcePackAccessVerified),
             lastProgressAt: ops.lastProgressAt || value.lastProgressAt || null,
+            lastRegistryWriteAt: value.lastRegistryWriteAt || null,
+            lastRegistryWriteVerified: value.lastRegistryWriteVerified || null,
             minutesSinceLastProgress: ops.minutesSinceLastProgress ?? null,
             lastProgressNewCases: ops.lastProgressNewCases ?? value.lastProgressNewCases ?? null,
             recentCases15m: ops.recentCases15m ?? 0,
@@ -4140,41 +5016,118 @@ function writeStatus(extra = {}) {
   saveJsonAtomic(STATUS_PATH, status);
 }
 
-async function connectBrowserWithRetry() {
-  const endpoint = `http://127.0.0.1:${config.cdpPort}`;
-  const maxAttempts = 4;
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      writeStatus({ connected: false, connecting: true, cdpAttempt: attempt });
-      log(`connecting to Chrome CDP on ${config.cdpPort} (attempt ${attempt}/${maxAttempts})`);
-      const browser = await chromium.connectOverCDP(endpoint, { timeout: 10000 });
-      writeStatus({ connected: true, connecting: false, cdpAttempt: attempt });
-      return browser;
-    } catch (error) {
-      lastError = error;
-      log(`Chrome CDP connection attempt ${attempt}/${maxAttempts} failed: ${error.message || error}`);
-      writeStatus({
-        connected: false,
-        connecting: attempt < maxAttempts,
-        cdpAttempt: attempt,
-        cdpError: error.message || String(error),
-      });
-      if (attempt < maxAttempts) await sleep(5000);
-    }
-  }
-
-  throw lastError || new Error('Chrome CDP connection failed');
-}
-
 function isBrowserDisconnectedError(error) {
+  if (['BROWSER_UNAVAILABLE', 'BROWSER_PAGE_CREATE_TIMEOUT', 'REVIEWER_PAGE_NAVIGATION_FAILED',
+    'COORDINATOR_PAGE_NAVIGATION_FAILED'].includes(error?.code)) return true;
   const text = String(error?.stack || error?.message || error || '');
   return /browser|context|target page|CDP/i.test(text)
     && /closed|disconnect|timeout|target|ECONNREFUSED|ECONNRESET|ETIMEDOUT/i.test(text);
 }
 
+function isReviewerCapacitySafetyError(error) {
+  return ['AUTOMATION_TAB_CAP_EXCEEDED', 'REVIEWER_GENERATION_CAP_EXCEEDED', 'REVIEWER_SLOTS_BUSY'].includes(error?.code);
+}
+
+function browserRetryDelayMs(attempt) {
+  const base = Number(config.browserRetryBaseMs || 15000);
+  const max = Number(config.browserRetryMaxMs || 300000);
+  const safeBase = Number.isFinite(base) && base > 0 ? Math.min(base, 60000) : 15000;
+  const safeMax = Number.isFinite(max) && max >= safeBase ? Math.min(max, 900000) : 300000;
+  return Math.min(safeMax, safeBase * (2 ** Math.min(Math.max(0, attempt - 1), 8)));
+}
+
+function evaluatePreDispatchReadiness({ sourceShardMapping, liveGeneratingByBucket }) {
+  const blockers = [];
+  const bucketExclusions = {};
+  const eligibleBuckets = [];
+  const liveWorkBuckets = [];
+  const allComplete = allBucketsComplete();
+
+  if (!browserRuntimeStatus.browserConnected || !browserRuntimeStatus.chatgptReady) {
+    blockers.push(browserRuntimeStatus.authenticationRequired ? 'BROWSER_AUTH_REQUIRED' : 'BROWSER_NOT_READY');
+  }
+  if (!sourceShardMapping?.ready) blockers.push('SOURCE_SHARD_CONFIG_MISSING');
+  if (!startupReconciliationComplete) blockers.push('STARTUP_RECONCILIATION_PENDING');
+
+  const scheduled = new Set(selectReviewerSlotCandidates(state.buckets, SCHEDULING_BLOCKED_BUCKETS).map(String));
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    if (bucketState.complete) continue;
+    let reason = null;
+    if (isSchedulingBlockedBucket(bucket)) reason = 'SCHEDULING_BLOCKED';
+    else if (!isVerifiedSourcePackCursor(bucket, bucketState)) reason = 'SOURCE_PACK_CURSOR_RECONCILIATION_REQUIRED';
+    else if (bucketState.phase === 'HOLD' || bucketState.hold) {
+      reason = `${bucketState.hold?.type || 'HOLD'}:${bucketState.hold?.reason || 'BUCKET_HELD'}`;
+    } else if (bucketHasUnresolvedAwaitingAction(bucketState) && !liveGeneratingByBucket?.[bucket]) {
+      reason = 'UNRESOLVED_ACTION_WITHOUT_LIVE_GENERATION';
+    }
+
+    if (!reason && (scheduled.has(bucket)
+      || (bucketState.phase === 'SETUP_WAIT' && bucketState.setupVerified
+        && String(bucketState.setupVerifiedChatId || '') === String(bucketState.chatId || '')))) {
+      eligibleBuckets.push(Number(bucket));
+      continue;
+    }
+    if (!reason && Boolean(liveGeneratingByBucket?.[bucket])) {
+      liveWorkBuckets.push(Number(bucket));
+      continue;
+    }
+    if (!reason) reason = bucketState.phase === 'ACTIVE'
+      ? 'ACTIVE_REVIEWER_REQUIRES_RECONCILIATION'
+      : `NOT_SCHEDULER_ELIGIBLE:${bucketState.phase || 'UNKNOWN'}`;
+    bucketExclusions[bucket] = reason;
+  }
+
+  if (!eligibleBuckets.length && !liveWorkBuckets.length && !allComplete) {
+    blockers.push('NO_EVIDENCE_BACKED_ELIGIBLE_BUCKET');
+  }
+
+  const ready = blockers.length === 0;
+  return {
+    ready,
+    checkedAt: now(),
+    blockers,
+    eligibleBuckets,
+    liveWorkBuckets,
+    bucketExclusions,
+    sourceShardMappingReady: Boolean(sourceShardMapping?.ready),
+    browserReady: Boolean(browserRuntimeStatus.browserConnected && browserRuntimeStatus.chatgptReady),
+    startupReconciliationComplete,
+    allBucketsComplete: allComplete,
+  };
+}
+
+function updatePreDispatchReadiness(sourceShardMapping, liveGeneratingByBucket) {
+  preDispatchEvidence = evaluatePreDispatchReadiness({ sourceShardMapping, liveGeneratingByBucket });
+  preDispatchReady = preDispatchEvidence.ready;
+  return preDispatchEvidence;
+}
+
+function promoteRecoveredStartupControl(control) {
+  if (!preDispatchReady || control.desiredState !== 'RECONCILIATION_ONLY') return false;
+  const isControllerRecoveryRecord = control.requestedBy === 'controller-startup-recovery';
+  if (control.present && !isControllerRecoveryRecord) return false;
+  saveJsonAtomic(CONTROL_PATH, {
+    desiredState: 'RUNNING',
+    requestedAt: now(),
+    requestedBy: 'controller-startup-recovery',
+    preDispatchReadyAt: preDispatchEvidence.checkedAt,
+    preDispatchEligibleBuckets: preDispatchEvidence.eligibleBuckets,
+  });
+  log('startup reconciliation gate passed; promoted controller startup recovery to RUNNING');
+  return true;
+}
+
 async function main() {
+  if (startupStateError) {
+    controllerLifecycleState = 'ERROR';
+    writeStatus({
+      connected: false,
+      controllerState: 'ERROR',
+      fatal: startupStateError.message || String(startupStateError),
+      durableStateError: startupStateError.code || 'DURABLE_STATE_INVALID',
+    });
+    throw startupStateError;
+  }
   recoverInvalidLegacyChatRehydration();
   recoverTimeoutHolds();
   recoverLegacyInterruptedWriteRecoveryRollovers();
@@ -4190,32 +5143,107 @@ async function main() {
   recoverStaleSourcePackBoundaryState();
   resetSetupWaitObservationState();
   recoverLostAwaitingState();
+  await recoverInvalidSourcePackCursors(null);
   saveState();
   log(`controller v6 starting; maxActiveReviewers=${MAX_ACTIVE_REVIEWERS}; auditablePopulation=${config.auditablePopulation}`);
   writeStatus({ connected: false, starting: true });
   let browser = null;
   let context = null;
+  let browserRetryAttempt = 0;
 
   while (true) {
     const control = syncControlState();
     if (control.desiredState === 'STOPPED') {
-      writeStatus({ connected: false, stopped: true, allComplete: allBucketsComplete() });
+      cleanupOwnedBrowserProfileIfStopped();
+      controllerLifecycleState = 'STOPPED';
+      writeStatus({ connected: false, controllerState: 'STOPPED', stopped: true, allComplete: allBucketsComplete() });
       log('controller stopped by operator control');
       return;
-    }
-    if (control.desiredState === 'PAUSED') {
-      writeStatus({ paused: true, allComplete: allBucketsComplete() });
-      await sleep(Number(config.pollSeconds) * 1000);
-      continue;
     }
 
     try {
       if (!browser || !browser.isConnected() || !context) {
-        browser = await connectBrowserWithRetry();
-        context = browser.contexts()[0];
-        if (!context) throw new Error('Chrome CDP connected but no browser context exists');
+        const profile = browserLaunchProfile();
+        const runtime = await connectOrLaunchBrowser({
+          endpoint: config.cdpEndpoint || null,
+          cdpPort: config.cdpPort,
+          preferredExecutable: profile.preferredExecutable,
+          profileDir: profile.profileDir,
+          profileDirectoryName: config.browserProfileName || 'Default',
+          projectRoot: ROOT,
+          connectTimeoutMs: config.browserConnectTimeoutMs || 5000,
+          startupTimeoutMs: config.browserStartupTimeoutMs || 15000,
+          retryIntervalMs: config.browserRetryIntervalMs || 500,
+          candidateExecutables: config.browserCandidates || config.browserExecutables || [],
+        });
+        browser = runtime.browser;
+        context = runtime.context;
+        if (!context) throw new Error('Browser startup completed without a browser context');
+        ownedBrowserProfile = {
+          launched: Boolean(runtime.launched),
+          pid: runtime.pid || null,
+          profileDir: runtime.profileDir || null,
+          profileDirectoryName: runtime.profileDirectoryName || config.browserProfileName || 'Default',
+        };
+        browserRetryAttempt = 0;
+        browserRuntimeStatus.browserConnected = true;
+        browserRuntimeStatus.browserExecutable = runtime.executable || config.browserExecutable || config.browserPath || null;
+        browserRuntimeStatus.browserPid = runtime.pid || null;
+        browserRuntimeStatus.cdpEndpoint = runtime.endpoint || config.cdpEndpoint || `http://127.0.0.1:${config.cdpPort}`;
       }
 
+      await ensureBrowserSlots(context);
+      if (!browserRuntimeStatus.chatgptReady) {
+        preDispatchReady = false;
+        startupReconciliationComplete = false;
+        preDispatchEvidence = {
+          ready: false,
+          checkedAt: now(),
+          blockers: [browserRuntimeStatus.authenticationRequired ? 'BROWSER_AUTH_REQUIRED' : 'BROWSER_NOT_READY'],
+          eligibleBuckets: [],
+          bucketExclusions: {},
+        };
+        controllerLifecycleState = 'DEGRADED';
+        const browserState = browserRuntimeStatus.authenticationRequired ? 'AUTH_REQUIRED' : 'CHATGPT_NOT_READY';
+        writeStatus({
+          connected: true,
+          controllerState: 'DEGRADED',
+          browserState,
+          browserConnected: Boolean(browser?.isConnected?.()),
+          dispatchEnabled: false,
+          browserError: browserRuntimeStatus.coordinatorHealth?.reason || 'ChatGPT project page is not ready',
+        });
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
+
+      const shardMapping = sourcePackShardMappingStatus();
+      if (!shardMapping.ready) {
+        preDispatchReady = false;
+        startupReconciliationComplete = false;
+        await recoverInvalidSourcePackCursors(context);
+        const liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
+        await reconcileOutstandingResponses(context, liveGeneratingByBucket);
+        const reconciledLive = await inspectLiveGeneratingByBucket(context);
+        refreshLiveReviewerOccupancy(reconciledLive);
+        updatePreDispatchReadiness(shardMapping, reconciledLive);
+        controllerLifecycleState = 'DEGRADED';
+        writeStatus({
+          connected: true,
+          controllerState: 'DEGRADED',
+          browserState: 'CONFIG_MISSING',
+          configurationState: 'CONFIG_MISSING',
+          preflightBlockers: ['SOURCE_SHARD_CONFIG_MISSING'],
+          sourceShardMapping: shardMapping,
+          dispatchEnabled: false,
+          preDispatchReady: false,
+          preDispatchBlockers: preDispatchEvidence.blockers,
+        });
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
+
+      await recoverInvalidSourcePackCursors(context);
       await recoverReviewerStallHolds(context);
       recoverLostAwaitingState();
       recoverSourcePackHolds();
@@ -4228,9 +5256,41 @@ async function main() {
       liveGeneratingByBucket = await inspectLiveGeneratingByBucket(context);
       refreshLiveReviewerOccupancy(liveGeneratingByBucket);
       await recoverInvalidSourcePackCursors(context);
+      startupReconciliationComplete = true;
+      updatePreDispatchReadiness(shardMapping, liveGeneratingByBucket);
+
+      const recoveredControl = readControl();
+      if (promoteRecoveredStartupControl(recoveredControl)) {
+        controllerLifecycleState = 'RECOVERING';
+        writeStatus({
+          connected: true,
+          controllerState: 'RECOVERING',
+          dispatchEnabled: false,
+          preDispatchReady: true,
+          startupControlPromoted: true,
+        });
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
+      if (!preDispatchReady || recoveredControl.desiredState !== 'RUNNING') {
+        controllerLifecycleState = recoveredControl.desiredState === 'PAUSED' ? 'PAUSED' : 'RECOVERING';
+        writeStatus({
+          connected: true,
+          controllerState: controllerLifecycleState,
+          paused: recoveredControl.desiredState === 'PAUSED',
+          allComplete: allBucketsComplete(),
+          dispatchEnabled: false,
+          preDispatchReady,
+          preDispatchBlockers: preDispatchEvidence.blockers,
+        });
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
+
       ensureCoordinatorWakeProgress();
       await sendPendingSourcePackContinuations(context);
       await fillReviewerSlots(context);
+      controllerLifecycleState = 'RUNNING';
 
       for (let bucket = 0; bucket < Number(config.bucketCount); bucket += 1) {
         await processBucket(context, bucket);
@@ -4252,18 +5312,68 @@ async function main() {
         writeStatus({ allComplete: false });
       }
     } catch (error) {
+      if (isReviewerCapacitySafetyError(error)) {
+        controllerLifecycleState = 'DEGRADED';
+        writeStatus({
+          connected: true,
+          controllerState: 'DEGRADED',
+          browserState: error.code,
+          browserError: error.message || String(error),
+          browserConnected: Boolean(browser?.isConnected?.()),
+        });
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
       if (!isBrowserDisconnectedError(error)) throw error;
-      log(`browser connection lost; reconnecting: ${error.message || error}`);
-      recordIncident(
-        'BROWSER_DISCONNECTED',
-        null,
-        'browser or page connection closed; controller will retry',
-        { lastError: error.message || String(error), stack: error.stack || null },
-      );
-      writeStatus({ connected: false, reconnecting: true, browserError: error.message || String(error) });
+      browserRetryAttempt += 1;
+      const unavailable = error?.code === 'BROWSER_UNAVAILABLE';
+      const delayMs = browserRetryDelayMs(browserRetryAttempt);
+      const recoveryState = unavailable ? 'DEGRADED' : 'RECOVERING';
+      log(`${unavailable ? 'browser unavailable' : 'browser connection lost'}; bounded retry in ${delayMs}ms: ${error.message || error}`);
+      if (!unavailable) {
+        recordIncident(
+          'BROWSER_DISCONNECTED',
+          null,
+          'browser or page connection closed; controller will retry',
+          { lastError: error.message || String(error), stack: error.stack || null },
+        );
+      }
+      writeStatus({
+        connected: false,
+        controllerState: recoveryState,
+        browserState: unavailable ? 'BROWSER_UNAVAILABLE' : 'DISCONNECTED',
+        browserError: error.message || String(error),
+        browserAttempts: error.attempts || null,
+        retryInMs: delayMs,
+      });
+      controllerLifecycleState = recoveryState;
+      browserRuntimeStatus.browserConnected = false;
+      browserRuntimeStatus.coordinatorTabPresent = false;
+      browserRuntimeStatus.reviewerTabCount = 0;
+      browserRuntimeStatus.liveReviewerGenerations = 0;
+      browserRuntimeStatus.reviewerSlots = [];
+      preDispatchReady = false;
+      startupReconciliationComplete = false;
+      preDispatchEvidence = {
+        ready: false,
+        checkedAt: now(),
+        blockers: [unavailable ? 'BROWSER_UNAVAILABLE' : 'BROWSER_DISCONNECTED'],
+        eligibleBuckets: [],
+        bucketExclusions: {},
+      };
       browser = null;
       context = null;
-      await sleep(5000);
+      cleanupOwnedBrowserProfileIfStopped();
+      ownedBrowserProfile = {
+        launched: false,
+        pid: null,
+        profileDir: null,
+        profileDirectoryName: config.browserProfileName || 'Default',
+      };
+      browserContextRef = null;
+      coordinatorPageRef = null;
+      reviewerSlotRegistry = new Map();
+      await sleep(delayMs);
       continue;
     }
 
@@ -4275,9 +5385,11 @@ main().then(() => {
   process.exit(0);
 }).catch(error => {
   try {
+    cleanupOwnedBrowserProfileIfStopped();
+    controllerLifecycleState = 'ERROR';
     log(`FATAL ${error.stack || error}`);
-    recordIncident('CONTROLLER_FATAL', null, error.message || String(error), { stack: error.stack || null });
-    writeStatus({ connected: false, fatal: error.message || String(error) });
+    if (!startupStateError) recordIncident('CONTROLLER_FATAL', null, error.message || String(error), { stack: error.stack || null });
+    writeStatus({ connected: false, controllerState: 'ERROR', fatal: error.message || String(error) });
   } catch {}
   process.exit(1);
 });
