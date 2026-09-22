@@ -449,8 +449,8 @@ export function validateSourceBrowserProfile({
 }
 
 /**
- * Validate the dedicated Firefox fallback profile without creating or
- * mutating it. Firefox uses parent.lock rather than Chromium's SingletonLock.
+ * Validate the dedicated Firefox fallback profile without opening it. Firefox
+ * uses parent.lock rather than Chromium's SingletonLock.
  * A live owner is rejected so a human Firefox session is never joined or
  * overwritten by the automation fallback.
  */
@@ -461,10 +461,7 @@ export function validateFirefoxProfileDirectory({
 } = {}) {
   if (!profileDir) throw codedError('FIREFOX_PROFILE_UNCONFIGURED', 'Firefox fallback profile directory is required');
   const resolved = path.resolve(profileDir);
-  const lockNames = platform === 'win32' ? ['parent.lock', 'lock'] : ['parent.lock', '.parentlock', 'lock'];
-  if (lockNames.some(name => fs.existsSync(path.join(resolved, name)))) {
-    throw codedError('FIREFOX_PROFILE_IN_USE', 'Firefox fallback profile has an active ownership lock');
-  }
+  let ownerPid = null;
   if (platform === 'linux') {
     let entries;
     try {
@@ -490,7 +487,32 @@ export function validateFirefoxProfileDirectory({
         return argument.startsWith('-profile=') && samePath(argument.slice('-profile='.length), resolved);
       });
       if (hasProfile) {
-        throw codedError('FIREFOX_PROFILE_IN_USE', `Firefox fallback profile is in use by process ${entry}`);
+        ownerPid = Number(entry);
+        break;
+      }
+    }
+  } else if (['win32', 'darwin'].includes(platform)) {
+    const lockNames = ['parent.lock', '.parentlock', 'lock'];
+    if (lockNames.some(name => fs.existsSync(path.join(resolved, name)))) {
+      throw codedError('FIREFOX_PROFILE_IN_USE', 'Firefox fallback profile has an active ownership lock');
+    }
+  }
+  if (ownerPid) {
+    throw codedError('FIREFOX_PROFILE_IN_USE', `Firefox fallback profile is in use by process ${ownerPid}`);
+  }
+  // Playwright/Firefox leaves these markers when a launch is interrupted.
+  // The Linux process inspection above proves the profile is idle before any
+  // marker is removed, and the directory is dedicated to this fallback.
+  if (platform === 'linux') {
+    for (const name of ['parent.lock', '.parentlock', 'lock', '.startup-incomplete']) {
+      const candidate = path.join(resolved, name);
+      try {
+        const metadata = fs.lstatSync(candidate);
+        if (!metadata.isDirectory()) fs.unlinkSync(candidate);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          throw codedError('FIREFOX_PROFILE_UNVERIFIED', `Firefox fallback profile marker could not be cleared: ${error.message || error}`);
+        }
       }
     }
   }
@@ -743,6 +765,40 @@ async function launchPersistentContextBounded(playwrightChromium, userDataDir, o
   }
 }
 
+async function ensureBootstrapPageBounded(context, timeoutMs) {
+  const pages = typeof context?.pages === 'function' ? context.pages() : [];
+  let page = pages.find(candidate => !candidate?.isClosed?.()) || null;
+  if (!page && typeof context?.newPage === 'function') {
+    const boundedTimeoutMs = boundedMs(timeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 30000);
+    let timer;
+    let pending;
+    try {
+      pending = Promise.resolve().then(() => context.newPage());
+      const timeout = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(codedError(
+          'BROWSER_PAGE_CREATE_TIMEOUT',
+          `Firefox bootstrap page creation exceeded ${boundedTimeoutMs}ms`,
+        )), boundedTimeoutMs);
+      });
+      page = await Promise.race([pending, timeout]);
+    } catch (error) {
+      pending?.then(latePage => latePage?.close?.({ runBeforeUnload: false })).catch(() => {});
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (!page) throw new Error('Firefox persistent launch returned no page');
+  const currentUrl = typeof page.url === 'function' ? String(page.url() || '') : '';
+  if (currentUrl !== AUTOMATION_BOOTSTRAP_URL) {
+    await page.goto(AUTOMATION_BOOTSTRAP_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: Math.min(boundedMs(timeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 30000), 15000),
+    });
+  }
+  return page;
+}
+
 async function waitForCdp(playwrightChromium, endpoint, child, deadline, retryIntervalMs, connectTimeoutMs, attempts) {
   let lastError = null;
   while (Date.now() < deadline) {
@@ -822,6 +878,7 @@ export async function connectOrLaunchBrowser({
   firefoxExecutable = null,
   firefoxCandidates = [],
   firefoxProfileDir = null,
+  firefoxProcRoot = '/proc',
   firefoxFallbackEnabled = false,
   platform = process.platform,
   env = process.env,
@@ -1049,23 +1106,25 @@ export async function connectOrLaunchBrowser({
         if (samePath(firefoxProfile, persistentProfileDir)) {
           throw codedError('FIREFOX_PROFILE_CONFLICT', 'Firefox fallback profile must be separate from the Chromium profile');
         }
-        validateFirefoxProfileDirectory({ profileDir: firefoxProfile, platform });
+        validateFirefoxProfileDirectory({ profileDir: firefoxProfile, platform, procRoot: firefoxProcRoot });
         fs.mkdirSync(firefoxProfile, { recursive: true });
       } catch (error) {
         attempts.push({ phase: 'firefox-profile-validation', error: error.message || String(error) });
       }
       if (!attempts.some(attempt => attempt.phase === 'firefox-profile-validation')) {
         for (const executable of firefoxBrowserCandidates) {
+          let context;
           try {
-            const context = await launchPersistentContextBounded(
+            context = await launchPersistentContextBounded(
               playwrightFirefox,
               firefoxProfile,
               {
                 headless: false,
                 executablePath: executable,
+                channel: 'moz-firefox',
                 timeout: startupMs,
                 viewport: null,
-                args: [AUTOMATION_BOOTSTRAP_URL],
+                args: [],
                 env,
               },
               startupMs,
@@ -1075,6 +1134,7 @@ export async function connectOrLaunchBrowser({
               try { await context?.close?.(); } catch {}
               throw new Error('Firefox persistent launch returned no browser context');
             }
+            await ensureBootstrapPageBounded(context, startupMs);
             return {
               browser,
               context,
@@ -1088,6 +1148,7 @@ export async function connectOrLaunchBrowser({
               transport: 'persistent-firefox',
             };
           } catch (error) {
+            try { await context?.close?.(); } catch {}
             attempts.push({ phase: 'firefox-browser-launch', executable, error: error.message || String(error) });
           }
         }

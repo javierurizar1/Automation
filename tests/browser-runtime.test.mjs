@@ -350,11 +350,21 @@ test('Firefox is a final bounded fallback with an isolated persistent profile', 
   fs.writeFileSync(path.join(source, 'Default', 'Preferences'), '{}');
   fs.writeFileSync(path.join(source, 'Default', 'Cookies'), 'preserve');
   fs.writeFileSync(path.join(source, 'SingletonLock'), 'external-owner');
+  fs.mkdirSync(firefoxProfile, { recursive: true });
+  for (const marker of ['parent.lock', '.parentlock', 'lock', '.startup-incomplete']) {
+    fs.writeFileSync(path.join(firefoxProfile, marker), 'stale');
+  }
 
   let context;
+  let bootstrapUrl = 'about:blank';
+  const bootstrapPage = {
+    isClosed: () => false,
+    url: () => bootstrapUrl,
+    goto: async url => { bootstrapUrl = url; },
+  };
   const browser = { contexts: () => [context] };
   context = {
-    pages: () => [],
+    pages: () => [bootstrapPage],
     browser: () => browser,
     close: async () => {},
   };
@@ -390,8 +400,10 @@ test('Firefox is a final bounded fallback with an isolated persistent profile', 
   assert.equal(launches[0].userDataDir, path.resolve(firefoxProfile));
   assert.equal(launches[0].options.headless, false);
   assert.equal(launches[0].options.executablePath, firefoxCandidate);
+  assert.equal(launches[0].options.channel, 'moz-firefox');
   assert.equal(launches[0].options.viewport, null);
-  assert.match(launches[0].options.args.join(' '), new RegExp(AUTOMATION_BOOTSTRAP_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.deepEqual(launches[0].options.args, []);
+  assert.equal(bootstrapUrl, AUTOMATION_BOOTSTRAP_URL);
   assert.equal(connected.browser, browser);
   assert.equal(connected.context, context);
   assert.equal(connected.profileMode, 'firefox');
@@ -399,6 +411,9 @@ test('Firefox is a final bounded fallback with an isolated persistent profile', 
   assert.equal(connected.endpoint, null);
   assert.equal(fs.readFileSync(path.join(source, 'Default', 'Cookies'), 'utf8'), 'preserve');
   assert.equal(fs.existsSync(path.join(source, 'SingletonLock')), true);
+  for (const marker of ['parent.lock', '.parentlock', 'lock', '.startup-incomplete']) {
+    assert.equal(fs.existsSync(path.join(firefoxProfile, marker)), false, `stale Firefox marker removed: ${marker}`);
+  }
   assert.equal(validateFirefoxProfileDirectory({ profileDir: firefoxProfile, platform: 'linux' }).profileMode, 'firefox');
 });
 
@@ -408,12 +423,15 @@ test('Firefox fallback refuses an actively owned dedicated profile', async (t) =
   const source = path.join(directory, 'chrome-source');
   const firefoxProfile = path.join(directory, 'firefox-profile');
   const firefoxCandidate = path.join(directory, 'firefox');
+  const procRoot = path.join(directory, 'proc');
   fs.writeFileSync(firefoxCandidate, '');
   fs.mkdirSync(path.join(source, 'Default'), { recursive: true });
   fs.writeFileSync(path.join(source, 'Local State'), '{}');
   fs.writeFileSync(path.join(source, 'Default', 'Preferences'), '{}');
   fs.mkdirSync(firefoxProfile, { recursive: true });
   fs.writeFileSync(path.join(firefoxProfile, 'parent.lock'), 'owned');
+  fs.mkdirSync(path.join(procRoot, '99999'), { recursive: true });
+  fs.writeFileSync(path.join(procRoot, '99999', 'cmdline'), `firefox\0-profile\0${firefoxProfile}\0`);
   let launchCalls = 0;
   await assert.rejects(connectOrLaunchBrowser({
     endpoint: 'http://127.0.0.1:59231',
@@ -424,6 +442,7 @@ test('Firefox fallback refuses an actively owned dedicated profile', async (t) =
     firefoxFallbackEnabled: true,
     firefoxExecutable: firefoxCandidate,
     firefoxProfileDir: firefoxProfile,
+    firefoxProcRoot: procRoot,
     playwrightChromium: { async connectOverCDP() { throw new Error('CDP unavailable'); } },
     playwrightFirefox: {
       async launchPersistentContext() {

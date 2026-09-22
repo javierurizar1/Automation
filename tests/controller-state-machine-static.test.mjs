@@ -618,6 +618,9 @@ test('Firefox fallback is explicit, bounded, visible, and isolated from Chromium
   assert.match(browserRuntime, /discoverFirefoxCandidates/);
   assert.match(browserRuntime, /validateFirefoxProfileDirectory/);
   assert.match(browserRuntime, /transport: 'persistent-firefox'/);
+  assert.match(browserRuntime, /channel: 'moz-firefox'/);
+  assert.match(browserRuntime, /ensureBootstrapPageBounded/);
+  assert.match(browserRuntime, /firefoxProcRoot/);
   assert.match(browserRuntime, /headless: false/);
   assert.match(browserRuntime, /R433-Firefox-Fallback/);
   assert.match(controller, /firefoxFallbackEnabled: profile\.firefoxFallbackEnabled/);
