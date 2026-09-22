@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "kind": "R433_CONSERVATIVE_RECONCILIATION",
+  "generatedAt": "2026-09-22T00:00:00.000Z",
+  "auditablePopulation": 65720,
+  "source": "population-reconciliation.md and pack-scan-B4-B5.md",
+  "buckets": {
+    "0": {
+      "decision": "PROTECTED_HOLD",
+      "reason": "UNRESOLVED_SOURCE_PACK_PREFIX"
+    },
+    "1": {
+      "decision": "PROTECTED_HOLD",
+      "reason": "UNRESOLVED_SOURCE_PACK_PREFIX"
+    },
+    "2": {
+      "decision": "PROTECTED_HOLD",
+      "reason": "UNRESOLVED_SOURCE_PACK_PREFIX"
+    },
+    "3": {
+      "decision": "PROTECTED_HOLD",
+      "reason": "UNRESOLVED_CURSOR_HISTORY"
+    },
+    "4": {
+      "decision": "PROTECTED_HOLD",
+      "reason": "INDEXED_PREFIX_GAP",
+      "gap": {
+        "pack": 5,
+        "missingStableIdCount": 9,
+        "registryTerminalCount": 841,
+        "indexedRecordCount": 850
+      }
+    },
+    "5": {
+      "decision": "CONSERVATIVE_RESUME",
+      "reconciliationId": "R433-B5-PACK-PREFIX-20260922",
+      "reason": "TERMINAL_PREFIX_PROVEN",
+      "nextPack": 33,
+      "nextFilename": "pack_000033.jsonl",
+      "boundary": {
+        "firstPack": 1,
+        "terminalThroughPack": 32,
+        "nextPack": 33
+      },
+      "terminalPrefix": {
+        "startPack": 1,
+        "endPack": 32,
+        "packIndexRecordCount": 350,
+        "contentScanRecordCount": 1250,
+        "terminalRecordCount": 1600
+      },
+      "packIndexPrefix": {
+        "startPack": 1,
+        "endPack": 7,
+        "recordCount": 350,
+        "registryTerminalCount": 350,
+        "missingTerminalCount": 0
+      },
+      "contentScan": {
+        "startPack": 8,
+        "endPack": 206,
+        "recordCount": 9910,
+        "validRecordCount": 9910,
+        "terminalRecordCount": 1250,
+        "pendingRecordCount": 8660,
+        "malformedRecordCount": 0,
+        "duplicateRecordCount": 0,
+        "ownershipMismatchCount": 0
+      },
+      "registry": {
+        "registryTerminalSetAuthoritative": true,
+        "terminalRowsChanged": 0,
+        "substantiveFieldsChanged": 0,
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      },
+      "safety": {
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      }
+    }
+  }
+}

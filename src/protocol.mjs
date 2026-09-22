@@ -875,6 +875,100 @@ export function sourcePackShardForBucket(bucket) {
   return SOURCE_PACK_SHARDS[Number(bucket)] || null;
 }
 
+/**
+ * Validate a read-only, case-level source-pack reconciliation record before it
+ * is allowed to seed a durable conservative cursor.  This proof is narrower
+ * than action-attributed reviewer evidence: it only establishes that every
+ * case in a contiguous prefix is already terminal in the canonical registry
+ * and that the next pack must be scanned with terminal-row skipping enabled.
+ * It never proves corpus completion and it never authorizes overwriting a
+ * terminal registry row.
+ */
+export function validateConservativeSourcePackBoundary(bucket, record, {
+  expectedAuditablePopulation = null,
+} = {}) {
+  const bucketNumber = Number(bucket);
+  const entry = record?.buckets?.[String(bucketNumber)] || record?.bucket || record;
+  const failures = [];
+  const integer = value => Number.isInteger(Number(value));
+  const bool = (value, expected = true) => value === expected;
+
+  if (!record || typeof record !== 'object' || Array.isArray(record)) failures.push('record-missing');
+  if (Number(record?.version) !== 1) failures.push('record-version');
+  if (String(record?.kind || '') !== 'R433_CONSERVATIVE_RECONCILIATION') failures.push('record-kind');
+  if (!Number.isInteger(bucketNumber) || bucketNumber < 0 || bucketNumber >= 6) failures.push('bucket');
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) failures.push('bucket-entry-missing');
+  if (entry?.decision !== 'CONSERVATIVE_RESUME') failures.push('decision');
+  if (!String(entry?.reconciliationId || '').trim()) failures.push('reconciliation-id');
+
+  const boundary = entry?.boundary || {};
+  const terminalPrefix = entry?.terminalPrefix || {};
+  const packIndex = entry?.packIndexPrefix || {};
+  const scan = entry?.contentScan || {};
+  const safety = entry?.safety || {};
+  const registry = entry?.registry || {};
+  const firstPack = Number(boundary.firstPack);
+  const throughPack = Number(boundary.terminalThroughPack);
+  const nextPack = Number(boundary.nextPack);
+
+  if (!integer(firstPack) || firstPack < 1) failures.push('boundary-first-pack');
+  if (!integer(throughPack) || throughPack < firstPack) failures.push('boundary-terminal-through');
+  if (!integer(nextPack) || nextPack !== throughPack + 1) failures.push('boundary-next-pack');
+  if (terminalPrefix.startPack !== firstPack) failures.push('terminal-prefix-start');
+  if (terminalPrefix.endPack !== throughPack) failures.push('terminal-prefix-end');
+  if (entry?.nextFilename !== `pack_${String(nextPack).padStart(6, '0')}.jsonl`) failures.push('boundary-next-filename');
+
+  if (!integer(packIndex.startPack) || Number(packIndex.startPack) !== firstPack) failures.push('pack-index-start');
+  if (!integer(packIndex.endPack)
+    || Number(packIndex.endPack) < firstPack
+    || Number(packIndex.endPack) > throughPack) failures.push('pack-index-end');
+  if (!integer(packIndex.recordCount) || Number(packIndex.recordCount) <= 0) failures.push('pack-index-record-count');
+  if (!integer(packIndex.registryTerminalCount) || Number(packIndex.registryTerminalCount) !== Number(packIndex.recordCount)) {
+    failures.push('pack-index-terminal-count');
+  }
+  if (Number(packIndex.missingTerminalCount || 0) !== 0) failures.push('pack-index-missing-terminal');
+
+  if (!integer(scan.startPack)
+    || (Number(scan.startPack) !== firstPack && Number(scan.startPack) !== Number(packIndex.endPack) + 1)) failures.push('scan-start');
+  if (!integer(scan.endPack) || Number(scan.endPack) < throughPack) failures.push('scan-end');
+  if (!integer(scan.recordCount) || Number(scan.recordCount) !== Number(scan.validRecordCount)) failures.push('scan-valid-count');
+  if (!integer(scan.terminalRecordCount) || !integer(scan.pendingRecordCount)
+    || Number(scan.terminalRecordCount) + Number(scan.pendingRecordCount) !== Number(scan.validRecordCount)) {
+    failures.push('scan-terminal-pending-arithmetic');
+  }
+  for (const field of ['malformedRecordCount', 'duplicateRecordCount', 'ownershipMismatchCount']) {
+    if (Number(scan[field] || 0) !== 0) failures.push(`scan-${field}`);
+  }
+
+  if (Number(registry.terminalRowsChanged || 0) !== 0) failures.push('registry-terminal-rows-changed');
+  if (Number(registry.substantiveFieldsChanged || 0) !== 0) failures.push('registry-substantive-fields-changed');
+  for (const [field, expected] of [
+    ['registryTerminalSetAuthoritative', true],
+    ['skipTerminalStableIds', true],
+    ['overwriteTerminalRows', false],
+    ['readbackVerifyNewWrites', true],
+    ['fullCorpusReconciled', false],
+    ['actionAwareCursorProven', false],
+    ['boundaryMonotonic', true],
+  ]) {
+    if (!bool(registry[field] ?? safety[field], expected)) failures.push(`safety-${field}`);
+  }
+
+  if (expectedAuditablePopulation !== null
+    && Number(record?.auditablePopulation) !== Number(expectedAuditablePopulation)) failures.push('auditable-population');
+
+  return {
+    valid: failures.length === 0,
+    reason: failures[0] || null,
+    failures,
+    bucket: bucketNumber,
+    reconciliationId: String(entry?.reconciliationId || ''),
+    nextPack: Number.isInteger(nextPack) ? nextPack : null,
+    nextFilename: integer(nextPack) ? `pack_${String(nextPack).padStart(6, '0')}.jsonl` : null,
+    terminalThroughPack: Number.isInteger(throughPack) ? throughPack : null,
+  };
+}
+
 export function buildSourcePackContinuationPrompt(bucket, source) {
   return `Continue Bucket ${bucket} using the exact next R4.3.3 source pack in the connected Google Drive source. Before reviewing, locate and open the exact file named ${source.filename} in shard_${bucket} at ${source.folderUrl}. Use the connected Google Drive source capability. List the exact shard folder and paginate/continue the folder listing until either ${source.filename} is found or the folder listing is fully exhausted. A failed exact-name Drive search is not proof that a raw JSONL file is absent; exact-name search may be used only as a supplementary lookup after folder listing, and you must not stop merely because search returns no result. Do not substitute another pack. Do not infer source content from prior context. Reconcile R433_AUDIT_SHARD_${bucket} against this exact pack, skip every valid terminalized stable_id, and process as many additional eligible owned cases as this turn can safely complete. Persist and readback-verify every new result. Only if the exact shard folder listing has been exhausted and the exact Drive file still cannot be found/opened or its identity cannot be verified, stop without guessing and return STATUS: ERROR with BLOCKER: SOURCE_PACK_UNAVAILABLE_OR_UNVERIFIED and TRIGGER_COORDINATOR: YES. If this pack is exhausted and full-corpus owned cases remain, return STATUS: NORMAL, WRITES_VERIFIED: YES, BLOCKER: NEXT_SOURCE_PACKS_REQUIRED, TRIGGER_COORDINATOR: NO. Current-pack exhaustion is never corpus completion. End with the required strict six-line AUDIT_TURN_STATUS footer.`;
 }

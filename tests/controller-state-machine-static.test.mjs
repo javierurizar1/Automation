@@ -875,6 +875,31 @@ test('pack inventory exhaustion reconciles the corpus instead of retrying a phan
   assert.match(cursorRecovery, /bucketState\.phase = 'HOLD'/);
 });
 
+test('durable conservative B5 reconciliation is validated before projection and protects B0-B4', () => {
+  const evidencePath = path.join(ROOT, 'config', 'reconciliation-evidence.json');
+  const evidence = JSON.parse(fs.readFileSync(evidencePath, 'utf8'));
+  assert.equal(evidence.kind, 'R433_CONSERVATIVE_RECONCILIATION');
+  assert.equal(evidence.buckets['5'].decision, 'CONSERVATIVE_RESUME');
+  assert.equal(evidence.buckets['5'].boundary.nextPack, 33);
+  for (const bucket of ['0', '1', '2', '3', '4']) {
+    assert.match(evidence.buckets[bucket].decision, /PROTECTED_HOLD/);
+  }
+
+  const applyStart = controller.indexOf('function applyDurableConservativeReconciliation()');
+  const applyEnd = controller.indexOf('\nfunction updateWorkingClock', applyStart);
+  assert.ok(applyStart >= 0 && applyEnd > applyStart);
+  const apply = controller.slice(applyStart, applyEnd);
+  assert.match(apply, /validateConservativeSourcePackBoundary\(5, record/);
+  assert.match(apply, /sourcePackTargetNumber = target/);
+  assert.match(apply, /sourcePackLastConsumedNumber = consumed/);
+  assert.match(apply, /sourcePackResumePending = true/);
+  assert.match(apply, /skipTerminalStableIds: true/);
+  assert.match(apply, /overwriteTerminalRows: false/);
+  assert.match(apply, /readbackVerifyNewWrites: true/);
+  assert.match(apply, /Existing action-attributed evidence/);
+  assert.match(controller, /applyDurableConservativeReconciliation\(\);/);
+});
+
 test('missing control starts in recovery-only and cannot dispatch before pre-dispatch evidence', () => {
   const readStart = controller.indexOf('function readControl()');
   const readEnd = controller.indexOf('\nfunction controlPauseError', readStart);

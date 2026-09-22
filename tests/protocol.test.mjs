@@ -64,7 +64,13 @@ import {
   extractLastVisibleSourcePackNumber,
   resolveNextSourcePackTargetNumber,
   sanitizeStoredSourcePackCursorFields,
+  validateConservativeSourcePackBoundary,
 } from '../src/protocol.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test('parses a strict NORMAL footer', () => {
   const footer = parseFooter(`work done
@@ -960,6 +966,39 @@ test('null cursor never coerces to pack 0', () => {
   });
   assert.notEqual(resolved.targetNumber, 0);
   assert.notEqual(sourcePackFilename(resolved.targetNumber, 1), 'pack_000000.jsonl');
+});
+
+test('B5 conservative reconciliation proves the safe next pack 33 boundary', () => {
+  const record = JSON.parse(fs.readFileSync(path.join(ROOT, 'config', 'reconciliation-evidence.json'), 'utf8'));
+  const result = validateConservativeSourcePackBoundary(5, record, {
+    expectedAuditablePopulation: 65720,
+  });
+  assert.equal(result.valid, true);
+  assert.equal(result.nextPack, 33);
+  assert.equal(result.nextFilename, 'pack_000033.jsonl');
+  assert.equal(result.terminalThroughPack, 32);
+});
+
+test('B4 indexed pack gap remains protected and cannot become a conservative resume', () => {
+  const record = JSON.parse(fs.readFileSync(path.join(ROOT, 'config', 'reconciliation-evidence.json'), 'utf8'));
+  const b4 = JSON.parse(JSON.stringify(record));
+  b4.buckets['4'] = {
+    ...b4.buckets['4'],
+    decision: 'CONSERVATIVE_RESUME',
+    reconciliationId: 'R433-B4-UNSAFE',
+    nextPack: 6,
+    nextFilename: 'pack_000006.jsonl',
+    boundary: { firstPack: 1, terminalThroughPack: 5, nextPack: 6 },
+    terminalPrefix: { startPack: 1, endPack: 5 },
+    packIndexPrefix: { startPack: 1, endPack: 5, recordCount: 850, registryTerminalCount: 841, missingTerminalCount: 9 },
+    contentScan: { startPack: 18, endPack: 213, recordCount: 9795, validRecordCount: 9795, terminalRecordCount: 2750, pendingRecordCount: 7045, malformedRecordCount: 0, duplicateRecordCount: 0, ownershipMismatchCount: 0 },
+    registry: { registryTerminalSetAuthoritative: true, terminalRowsChanged: 0, substantiveFieldsChanged: 0, skipTerminalStableIds: true, overwriteTerminalRows: false, readbackVerifyNewWrites: true, fullCorpusReconciled: false, actionAwareCursorProven: false, boundaryMonotonic: true },
+  };
+  const result = validateConservativeSourcePackBoundary(4, b4, {
+    expectedAuditablePopulation: 65720,
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.failures.includes('pack-index-missing-terminal'));
 });
 
 test('invalid persisted zero cursor is rejected for bucket 1', () => {

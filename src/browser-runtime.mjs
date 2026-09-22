@@ -103,7 +103,11 @@ function isDefaultBrowserDataDirectory(profileDir, options = {}) {
   return defaultBrowserDataDirectories(options).find(candidate => samePath(candidate.path, profileDir)) || null;
 }
 
-function linuxProfileUse(sourceProfileDir, family, profileDirectoryName, procRoot = '/proc', staleLockMaxAgeMs = 15 * 60 * 1000, { ignoreRegularLocks = false } = {}) {
+function linuxProfileUse(sourceProfileDir, family, profileDirectoryName, procRoot = '/proc', staleLockMaxAgeMs = 15 * 60 * 1000, {
+  ignoreRegularLocks = false,
+  platform = process.platform,
+  env = process.env,
+} = {}) {
   let entries;
   try {
     entries = fs.readdirSync(procRoot).filter(entry => /^\d+$/.test(entry));
@@ -162,7 +166,25 @@ function linuxProfileUse(sourceProfileDir, family, profileDirectoryName, procRoo
     if (hasExplicitProfile) return { state: 'IN_USE', pid, reason: 'browser process uses the source profile directory' };
     const hasUserDataArgument = commandLine.some(argument => argument === '--user-data-dir' || argument.startsWith('--user-data-dir='));
     if (!hasUserDataArgument && browserFamily(commandLine[0]) === family) {
-      return { state: 'IN_USE', pid, reason: 'browser process may be using its default source profile' };
+      // Infer the implicit default profile from the browser process's own
+      // environment. The caller may intentionally be checking an isolated
+      // profile under a different HOME (as the bootstrap tests do), and an
+      // unrelated browser must not block that profile.
+      let processEnv = null;
+      try {
+        const rawEnv = fs.readFileSync(path.join(procRoot, entry, 'environ')).toString('utf8');
+        processEnv = Object.fromEntries(rawEnv.split('\0').filter(Boolean).map(value => {
+          const separator = value.indexOf('=');
+          return separator < 0 ? [value, ''] : [value.slice(0, separator), value.slice(separator + 1)];
+        }));
+      } catch {}
+      const processDefaultDirectory = defaultBrowserDataDirectories({
+        platform,
+        env: processEnv || process.env,
+      }).find(candidate => candidate.family === family);
+      if (processDefaultDirectory && samePath(processDefaultDirectory.path, source)) {
+        return { state: 'IN_USE', pid, reason: 'browser process may be using its default source profile' };
+      }
     }
   }
   return { state: 'IDLE' };
@@ -281,7 +303,7 @@ export async function bootstrapAutomationProfile({
       profileName,
       procRoot,
       staleLockMaxAgeMs,
-      { ignoreRegularLocks: true },
+      { ignoreRegularLocks: true, platform, env },
     );
     if (use.state !== 'IDLE') {
       throw codedError('BROWSER_PROFILE_IN_USE', `Automation profile is in use or cannot be checked (${use.reason || use.state})`);
@@ -293,7 +315,14 @@ export async function bootstrapAutomationProfile({
     return { profileDir: automationProfileDir, profileDirectoryName: profileName, bootstrapped: false, reused: true };
   }
 
-  const sourceUse = linuxProfileUse(sourceProfileDir, defaultDirectory.family, profileName, procRoot, staleLockMaxAgeMs);
+  const sourceUse = linuxProfileUse(
+    sourceProfileDir,
+    defaultDirectory.family,
+    profileName,
+    procRoot,
+    staleLockMaxAgeMs,
+    { platform, env },
+  );
   if (sourceUse.state !== 'IDLE') {
     throw codedError('BROWSER_PROFILE_IN_USE', `Default source profile is in use or cannot be checked (${sourceUse.reason || sourceUse.state})`);
   }
@@ -313,7 +342,14 @@ export async function bootstrapAutomationProfile({
   });
   try {
     await waitForChildExit(child, boundedTimeoutMs);
-    const sourceUseAfterCopy = linuxProfileUse(sourceProfileDir, defaultDirectory.family, profileName, procRoot, staleLockMaxAgeMs);
+    const sourceUseAfterCopy = linuxProfileUse(
+      sourceProfileDir,
+      defaultDirectory.family,
+      profileName,
+      procRoot,
+      staleLockMaxAgeMs,
+      { platform, env },
+    );
     if (sourceUseAfterCopy.state !== 'IDLE') {
       throw codedError('BROWSER_PROFILE_SOURCE_CHANGED', `Source profile became active during bootstrap (${sourceUseAfterCopy.reason || sourceUseAfterCopy.state})`);
     }

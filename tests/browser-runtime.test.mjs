@@ -271,6 +271,23 @@ test('reviewer health requires live evidence and recognizes reconnecting, offlin
   assert.equal(disconnected.actualGeneration, false);
 });
 
+test('ChatGPT landing-page login markers expose HUMAN_AUTH_REQUIRED', async () => {
+  const health = await classifyReviewerHealth(makeReviewerPage({
+    url: 'https://chatgpt.com/',
+    dom: {
+      bodyText: 'Log in to get answers based on saved chats, plus create images and upload files. Log in Sign up for free',
+      stopSelector: null,
+      composer: false,
+      readyState: 'complete',
+      online: true,
+    },
+  }));
+  assert.equal(health.state, 'AUTH_REQUIRED');
+  assert.equal(health.actualGeneration, false);
+  assert.match(health.reason, /HUMAN_AUTH_REQUIRED/);
+  assert.equal(health.evidence.authenticationRequired, true);
+});
+
 test('reviewer generation is counted only when the page exposes an active generation control', async () => {
   const healthy = makeReviewerPage({
     dom: { bodyText: 'Completed response', stopSelector: null, composer: true, readyState: 'complete', online: true },

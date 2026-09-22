@@ -89,6 +89,31 @@ export async function classifyReviewerHealth(page, { timeoutMs = DEFAULT_REVIEWE
     }, GENERATION_SELECTORS), boundedTimeoutMs, 'reviewer health probe');
     const bodyText = String(dom.bodyText || '');
     const compactText = bodyText.toLowerCase().replace(/\s+/g, ' ');
+    // The normal ChatGPT landing page is reachable before authentication, but
+    // it has no conversation composer. Treat its explicit login markers as a
+    // human-authentication state instead of misclassifying it as a broken
+    // reviewer page. This keeps the visible persistent browser open for the
+    // operator and prevents recovery from entering a launch loop.
+    const chatgptHost = (() => {
+      try {
+        const hostname = new URL(url).hostname.toLowerCase();
+        return hostname === 'chatgpt.com' || hostname.endsWith('.chatgpt.com')
+          || hostname === 'chat.openai.com' || hostname.endsWith('.openai.com');
+      } catch {
+        return false;
+      }
+    })();
+    const humanAuthMarker = chatgptHost && !dom.composer && (
+      /log in to get answers/.test(compactText)
+      || /sign up for free/.test(compactText)
+      || /continue with google/.test(compactText)
+      || /log in to continue/.test(compactText)
+    );
+    if (humanAuthMarker) {
+      return healthResult('AUTH_REQUIRED', false,
+        'HUMAN_AUTH_REQUIRED: visible ChatGPT landing page requires authentication',
+        { url, readyState: dom.readyState, authenticationRequired: true });
+    }
     if (/\b(reconnecting|trying to reconnect|connection lost|reconnect to continue)\b/i.test(compactText)) {
       return healthResult('RECONNECTING', false, 'reviewer page reports a reconnect state', { url, text: bodyText.slice(0, 240) });
     }
