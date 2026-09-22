@@ -13,7 +13,7 @@ const DEFAULT_RETRY_INTERVAL_MS = 500;
 // endpoint can be observed. Keep this separate from the normal attach retry
 // interval so very small test/recovery budgets remain deterministic without
 // introducing an unbounded wait.
-const MIN_SPAWN_STARTUP_TIMEOUT_MS = 500;
+const MIN_SPAWN_STARTUP_TIMEOUT_MS = 1000;
 const MAX_CANDIDATES = 6;
 const PROFILE_COPY_TIMEOUT_MS = 30000;
 const PROFILE_BOOTSTRAP_SCRIPT = fileURLToPath(new URL('./browser-profile-bootstrap.mjs', import.meta.url));
