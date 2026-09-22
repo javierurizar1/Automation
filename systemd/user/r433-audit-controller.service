@@ -1,6 +1,7 @@
 [Unit]
 Description=R4.3.3 Audit Controller
-After=network-online.target
+Wants=r433-source-browser.service
+After=network-online.target r433-source-browser.service
 StartLimitIntervalSec=30min
 StartLimitBurst=3
 

@@ -23,7 +23,7 @@ GPT-5.6 Sol was the highest selectable option verified in the connected account 
 
 The browser profile settings are explicit. Set `browserProfileMode` to `source` for the visible persistent authenticated browser profile used in production. The controller attaches to an existing CDP session first, then launches the configured profile with a bounded non-headless startup if no session is available. Source profile locks, cookies, and session data are preserved. Set `browserProfileMode` to `clone` only when an isolated copied profile is intentionally required; cloning is never selected automatically.
 
-On Linux with systemd user services, run `scripts/install-systemd-user.sh` after Node.js, npm, dependencies, and private config.json are ready. It installs and starts the controller, dashboard, and bounded watchdog timer without root privileges. See [Linux user services](docs/LINUX_USER_SERVICE.md).
+On Linux with systemd user services, run `scripts/install-systemd-user.sh` after Node.js, npm, dependencies, and private config.json are ready. It installs and starts the visible persistent source browser, controller, dashboard, and bounded watchdog timer without root privileges. The source browser starts on a committed data bootstrap page; the controller performs bounded navigation to ChatGPT after CDP attach. See [Linux user services](docs/LINUX_USER_SERVICE.md).
 
 The example config contains placeholders and is not runnable as-is. Never publish chat IDs, service identifiers, cookies, tokens, browser profiles, case data, or runtime state. This review copy also replaces private source-shard folder IDs and operational pack offsets with placeholders; it is not a production checkout.
 

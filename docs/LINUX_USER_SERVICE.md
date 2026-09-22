@@ -6,7 +6,7 @@ The Linux service files run the controller and loopback dashboard under the sign
 scripts/install-systemd-user.sh
 ```
 
-The installer copies units to `~/.config/systemd/user`, enables controller and dashboard startup, and enables a watchdog timer. The controller and dashboard listen only on the configured loopback addresses. The dashboard defaults to `http://127.0.0.1:9350/`.
+The installer copies units to `~/.config/systemd/user`, enables the visible persistent source browser, controller, dashboard, and watchdog timer. The source browser opens a committed data bootstrap page on the configured CDP port. After attaching, the controller navigates that same authenticated profile to the configured ChatGPT project URL with a bounded timeout. The controller and dashboard listen only on the configured loopback addresses. The dashboard defaults to `http://127.0.0.1:9350/`.
 
 ## Recovery behavior
 

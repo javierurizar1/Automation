@@ -20,6 +20,9 @@ const reviewerTabs = fs.readFileSync(path.join(ROOT, 'src', 'reviewer-tabs.mjs')
 const browserRuntime = fs.readFileSync(path.join(ROOT, 'src', 'browser-runtime.mjs'), 'utf8');
 const reviewerModel = fs.readFileSync(path.join(ROOT, 'src', 'reviewer-model.mjs'), 'utf8');
 const dashboardHtml = fs.readFileSync(path.join(ROOT, 'dashboard.html'), 'utf8');
+const sourceBrowserUnit = fs.readFileSync(path.join(ROOT, 'systemd', 'user', 'r433-source-browser.service'), 'utf8');
+const controllerUnit = fs.readFileSync(path.join(ROOT, 'systemd', 'user', 'r433-audit-controller.service'), 'utf8');
+const systemdInstaller = fs.readFileSync(path.join(ROOT, 'scripts', 'install-systemd-user.sh'), 'utf8');
 
 function makeSourcePackCursorVerifier(state) {
   const verifierStart = controller.indexOf('function isVerifiedSourcePackCursor(');
@@ -1000,4 +1003,23 @@ test('controller adopts the committed browser bootstrap page as its coordinator'
   const projectPageEnd = controller.indexOf('\nfunction bucketForPageUrl', projectPageStart);
   assert.ok(projectPageStart >= 0 && projectPageEnd > projectPageStart);
   assert.match(controller.slice(projectPageStart, projectPageEnd), /url === AUTOMATION_BOOTSTRAP_URL/);
+});
+
+test('source browser service uses the committed bootstrap and bounded post-attach navigation', () => {
+  assert.match(sourceBrowserUnit, /Description=R4\.3\.3 Persistent Source Browser/);
+  assert.match(sourceBrowserUnit, /--user-data-dir=@BROWSER_PROFILE_DIR@/);
+  assert.match(sourceBrowserUnit, /--profile-directory=@BROWSER_PROFILE_NAME@/);
+  assert.match(sourceBrowserUnit, /data:text\/html,%%3Ctitle%%3ER433%%20automation%%20bootstrap%%3C%%2Ftitle%%3E/);
+  assert.doesNotMatch(sourceBrowserUnit, /https:\/\/chatgpt\.com/);
+  assert.match(controllerUnit, /Wants=r433-source-browser\.service/);
+  assert.match(controllerUnit, /After=network-online\.target r433-source-browser\.service/);
+  assert.match(systemdInstaller, /r433-source-browser\.service/);
+
+  const slots = controller.slice(
+    controller.indexOf('async function ensureBrowserSlots'),
+    controller.indexOf('async function reviewerSlotForBucket'),
+  );
+  assert.match(slots, /await coordinator\.goto\(config\.projectUrl, \{ waitUntil: 'domcontentloaded', timeout: 15000 \}\)/);
+  assert.match(slots, /classifyReviewerHealth\(coordinator/);
+  assert.match(controller, /profileMode: runtime\.profileMode \|\| profile\.profileMode \|\| 'source'/);
 });
