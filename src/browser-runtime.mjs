@@ -9,6 +9,11 @@ import { chromium, firefox } from 'playwright-core';
 const DEFAULT_CONNECT_TIMEOUT_MS = 5000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 45000;
 const DEFAULT_RETRY_INTERVAL_MS = 500;
+// A spawned browser needs a small finite process-start grace before its CDP
+// endpoint can be observed. Keep this separate from the normal attach retry
+// interval so very small test/recovery budgets remain deterministic without
+// introducing an unbounded wait.
+const MIN_SPAWN_STARTUP_TIMEOUT_MS = 500;
 const MAX_CANDIDATES = 6;
 const PROFILE_COPY_TIMEOUT_MS = 30000;
 const PROFILE_BOOTSTRAP_SCRIPT = fileURLToPath(new URL('./browser-profile-bootstrap.mjs', import.meta.url));
@@ -837,8 +842,9 @@ function waitForExit(child, timeoutMs) {
   });
 }
 
-async function terminateOwnedProcess(child, platform = process.platform) {
+async function terminateOwnedProcess(child, platform = process.platform, waitTimeoutMs = 1200) {
   if (!child || child.exitCode !== null) return true;
+  const boundedWaitMs = boundedMs(waitTimeoutMs, 1200, 3000);
   try {
     if (platform === 'win32' && child.pid) {
       spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 3000 });
@@ -848,12 +854,12 @@ async function terminateOwnedProcess(child, platform = process.platform) {
       child.kill('SIGTERM');
     }
   } catch {}
-  if (await waitForExit(child, 1200)) return true;
+  if (await waitForExit(child, boundedWaitMs)) return true;
   try {
     if (platform !== 'win32' && child.pid && child.__codexDetached) process.kill(-child.pid, 'SIGKILL');
     else child.kill('SIGKILL');
   } catch {}
-  return waitForExit(child, 1200);
+  return waitForExit(child, boundedWaitMs);
 }
 
 /**
@@ -1055,7 +1061,7 @@ export async function connectOrLaunchBrowser({
         continue;
       }
       const spawnError = new Promise(resolve => child.once('error', resolve));
-      const deadline = Date.now() + startupMs;
+      const deadline = Date.now() + Math.max(startupMs, MIN_SPAWN_STARTUP_TIMEOUT_MS);
       try {
         const attached = await Promise.race([
           waitForCdp(playwrightChromium, endpoint, child, deadline, retryMs, connectMs, attempts),
@@ -1073,7 +1079,7 @@ export async function connectOrLaunchBrowser({
         };
       } catch (error) {
         attempts.push({ phase: 'browser-startup', executable, error: error.message || String(error) });
-        const stopped = await terminateOwnedProcess(child);
+        const stopped = await terminateOwnedProcess(child, platform, Math.min(1200, Math.max(250, startupMs)));
         if (stopped && selectedProfileMode === 'clone') {
           try { removeDestinationEphemeralFiles(launchProfileDir, launchProfileName || 'Default'); } catch (cleanupError) {
             attempts.push({ phase: 'browser-cleanup', executable, error: cleanupError.message || String(cleanupError) });
