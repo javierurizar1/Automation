@@ -707,6 +707,45 @@ test('ChatGPT landing-page login markers expose HUMAN_AUTH_REQUIRED', async () =
   assert.equal(health.evidence.authenticationRequired, true);
 });
 
+test('Cloudflare challenge markers expose HUMAN_AUTH_REQUIRED with evidence', async () => {
+  const health = await classifyReviewerHealth(makeReviewerPage({
+    url: 'https://chatgpt.com/',
+    dom: {
+      title: 'Just a moment...',
+      bodyText: 'Performing security verification. Verify you are human. cf-chl-captcha',
+      stopSelector: null,
+      composer: false,
+      readyState: 'complete',
+      online: true,
+    },
+  }));
+  assert.equal(health.state, 'AUTH_REQUIRED');
+  assert.equal(health.actualGeneration, false);
+  assert.match(health.reason, /HUMAN_AUTH_REQUIRED/);
+  assert.equal(health.evidence.authenticationRequired, true);
+  assert.equal(health.evidence.browserChallenge, true);
+  assert.deepEqual(health.evidence.challengeMarkers, ['CLOUDFLARE_CHALLENGE']);
+});
+
+test('ChatGPT 502 gateway challenge exposes HUMAN_AUTH_REQUIRED without retry evidence', async () => {
+  const health = await classifyReviewerHealth(makeReviewerPage({
+    url: 'https://chatgpt.com/',
+    dom: {
+      title: 'chatgpt.com | 502: Bad gateway',
+      bodyText: '502: Bad gateway',
+      stopSelector: null,
+      composer: false,
+      readyState: 'complete',
+      online: true,
+    },
+  }));
+  assert.equal(health.state, 'AUTH_REQUIRED');
+  assert.equal(health.actualGeneration, false);
+  assert.equal(health.evidence.authenticationRequired, true);
+  assert.equal(health.evidence.browserChallenge, true);
+  assert.deepEqual(health.evidence.challengeMarkers, ['HTTP_GATEWAY_CHALLENGE']);
+});
+
 test('reviewer generation is counted only when the page exposes an active generation control', async () => {
   const healthy = makeReviewerPage({
     dom: { bodyText: 'Completed response', stopSelector: null, composer: true, readyState: 'complete', online: true },

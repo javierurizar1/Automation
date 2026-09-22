@@ -83,12 +83,15 @@ export async function classifyReviewerHealth(page, { timeoutMs = DEFAULT_REVIEWE
         stopSelector: stop,
         bodyText,
         composer,
+        title: String(document.title || ''),
         readyState: document.readyState,
         online: typeof navigator.onLine === 'boolean' ? navigator.onLine : null,
       };
     }, GENERATION_SELECTORS), boundedTimeoutMs, 'reviewer health probe');
     const bodyText = String(dom.bodyText || '');
     const compactText = bodyText.toLowerCase().replace(/\s+/g, ' ');
+    const title = String(dom.title || '');
+    const compactTitle = title.toLowerCase().replace(/\s+/g, ' ');
     // The normal ChatGPT landing page is reachable before authentication, but
     // it has no conversation composer. Treat its explicit login markers as a
     // human-authentication state instead of misclassifying it as a broken
@@ -103,6 +106,27 @@ export async function classifyReviewerHealth(page, { timeoutMs = DEFAULT_REVIEWE
         return false;
       }
     })();
+    const challengeMarkers = [];
+    if (chatgptHost && !dom.composer) {
+      if (/\bcloudflare\b|cf-chl-|cf-error|just a moment|verify you are human|performing security verification|checking your browser|enable javascript and cookies/.test(compactText)) {
+        challengeMarkers.push('CLOUDFLARE_CHALLENGE');
+      }
+      if (/(?:\b502\b.*\bbad gateway\b|\bbad gateway\b.*\b502\b|\b503\b.*\bservice unavailable\b|\bservice unavailable\b.*\b503\b)/.test(`${compactTitle} ${compactText}`)) {
+        challengeMarkers.push('HTTP_GATEWAY_CHALLENGE');
+      }
+    }
+    if (challengeMarkers.length) {
+      return healthResult('AUTH_REQUIRED', false,
+        'HUMAN_AUTH_REQUIRED: Cloudflare challenge or gateway page requires human browser verification',
+        {
+          url,
+          title,
+          readyState: dom.readyState,
+          authenticationRequired: true,
+          browserChallenge: true,
+          challengeMarkers,
+        });
+    }
     const humanAuthMarker = chatgptHost && !dom.composer && (
       /log in to get answers/.test(compactText)
       || /sign up for free/.test(compactText)
