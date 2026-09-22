@@ -21,6 +21,7 @@ const browserRuntime = fs.readFileSync(path.join(ROOT, 'src', 'browser-runtime.m
 const reviewerModel = fs.readFileSync(path.join(ROOT, 'src', 'reviewer-model.mjs'), 'utf8');
 const dashboardHtml = fs.readFileSync(path.join(ROOT, 'dashboard.html'), 'utf8');
 const sourceBrowserUnit = fs.readFileSync(path.join(ROOT, 'systemd', 'user', 'r433-source-browser.service'), 'utf8');
+const fallbackChromeUnit = fs.readFileSync(path.join(ROOT, 'systemd', 'user', 'r433-fallback-chrome.service'), 'utf8');
 const controllerUnit = fs.readFileSync(path.join(ROOT, 'systemd', 'user', 'r433-audit-controller.service'), 'utf8');
 const systemdInstaller = fs.readFileSync(path.join(ROOT, 'scripts', 'install-systemd-user.sh'), 'utf8');
 
@@ -1022,4 +1023,16 @@ test('source browser service uses the committed bootstrap and bounded post-attac
   assert.match(slots, /await coordinator\.goto\(config\.projectUrl, \{ waitUntil: 'domcontentloaded', timeout: 15000 \}\)/);
   assert.match(slots, /classifyReviewerHealth\(coordinator/);
   assert.match(controller, /profileMode: runtime\.profileMode \|\| profile\.profileMode \|\| 'source'/);
+});
+
+test('Chrome fallback service keeps its dedicated profile and starts on the committed bootstrap', () => {
+  assert.match(fallbackChromeUnit, /Description=R4\.3\.3 Dedicated Chrome Fallback Browser/);
+  assert.match(fallbackChromeUnit, /\/usr\/bin\/google-chrome/);
+  assert.match(fallbackChromeUnit, /--remote-debugging-port=9334/);
+  assert.match(fallbackChromeUnit, /--user-data-dir=%h\/.config\/R433-Chrome-Fallback/);
+  assert.match(fallbackChromeUnit, /data:text\/html,%%3Ctitle%%3ER433%%20automation%%20bootstrap%%3C%%2Ftitle%%3E/);
+  assert.doesNotMatch(fallbackChromeUnit, /https:\/\/chatgpt\.com/);
+  assert.match(systemdInstaller, /r433-fallback-chrome\.service/);
+  assert.match(fallbackChromeUnit, /TimeoutStartSec=45s/);
+  assert.match(fallbackChromeUnit, /RestartSec=30s/);
 });

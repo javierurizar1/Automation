@@ -8,6 +8,8 @@ scripts/install-systemd-user.sh
 
 The installer copies units to `~/.config/systemd/user`, enables the visible persistent source browser, controller, dashboard, and watchdog timer. The source browser opens a committed data bootstrap page on the configured CDP port. After attaching, the controller navigates that same authenticated profile to the configured ChatGPT project URL with a bounded timeout. The controller and dashboard listen only on the configured loopback addresses. The dashboard defaults to `http://127.0.0.1:9350/`.
 
+The installer also copies `r433-fallback-chrome.service` without enabling it. When the source browser is unavailable, start this bounded fallback explicitly with `systemctl --user start r433-fallback-chrome.service`. It uses CDP 9334 and the persistent dedicated profile `~/.config/R433-Chrome-Fallback`, starts on the same committed data bootstrap page, and leaves navigation to ChatGPT to the controller after attach.
+
 ## Recovery behavior
 
 The watchdog timer runs once per 30 seconds after a 60-second boot grace period. It reads the controller heartbeat, process identity, systemd unit state, desired control state, and browser connection health. It does not read or edit registry results, case data, source packs, reviewer conversations, or bucket state.

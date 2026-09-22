@@ -108,6 +108,7 @@ for name in (
     'r433-audit-dashboard.service',
     'r433-audit-watchdog.service',
     'r433-audit-watchdog.timer',
+    'r433-fallback-chrome.service',
     'r433-source-browser.service',
 ):
     content = (source / name).read_text(encoding='utf-8')
