@@ -138,6 +138,7 @@ function browserLaunchProfile() {
   const braveDefaultProfile = braveUserDataDir && path.join(braveUserDataDir, 'Default');
   const hasExistingBraveProfile = Boolean(braveDefaultProfile && fs.existsSync(braveDefaultProfile));
   return {
+    profileMode: config.browserProfileMode || 'source',
     profileDir: config.browserProfileDir
       || (hasExistingBraveProfile ? braveUserDataDir : path.join(ROOT, 'chrome-profile')),
     preferredExecutable: config.browserExecutable
@@ -579,6 +580,7 @@ let ownedBrowserProfile = {
   pid: null,
   profileDir: null,
   profileDirectoryName: 'Default',
+  profileMode: 'source',
 };
 
 function cleanupOwnedBrowserProfileIfStopped() {
@@ -590,6 +592,10 @@ function cleanupOwnedBrowserProfileIfStopped() {
     } catch (error) {
       if (error.code !== 'ESRCH') return [];
     }
+  }
+  if (ownedBrowserProfile.profileMode !== 'clone') {
+    ownedBrowserProfile.launched = false;
+    return [];
   }
   try {
     const removed = cleanupAutomationProfileEphemeral(ownedBrowserProfile);
@@ -5311,6 +5317,7 @@ async function main() {
           cdpPort: config.cdpPort,
           preferredExecutable: profile.preferredExecutable,
           profileDir: profile.profileDir,
+          profileMode: profile.profileMode,
           profileDirectoryName: config.browserProfileName || 'Default',
           projectRoot: ROOT,
           connectTimeoutMs: config.browserConnectTimeoutMs || 5000,
@@ -5326,6 +5333,7 @@ async function main() {
           pid: runtime.pid || null,
           profileDir: runtime.profileDir || null,
           profileDirectoryName: runtime.profileDirectoryName || config.browserProfileName || 'Default',
+          profileMode: runtime.profileMode || profile.profileMode || 'source',
         };
         browserRetryAttempt = 0;
         browserRuntimeStatus.browserConnected = true;
@@ -5511,6 +5519,7 @@ async function main() {
           profileDir: ownedBrowserProfile.profileDir,
           profileDirectoryName: ownedBrowserProfile.profileDirectoryName,
           remoteDebuggingPort: config.cdpPort,
+          cleanupEphemeral: ownedBrowserProfile.profileMode === 'clone',
         });
         if (recovery.attempted && recovery.stopped) {
           log(`terminated owned browser after bounded readiness failure; cleaned ${recovery.cleaned?.length || 0} ephemeral lock file(s)`);
@@ -5524,6 +5533,7 @@ async function main() {
         pid: null,
         profileDir: null,
         profileDirectoryName: config.browserProfileName || 'Default',
+        profileMode: config.browserProfileMode || 'source',
       };
       browserContextRef = null;
       coordinatorPageRef = null;

@@ -602,6 +602,7 @@ test('controller CDP reconnect attempts do not block for a full minute', () => {
   assert.match(controller, /connectOrLaunchBrowser\(\{/);
   assert.match(controller, /connectTimeoutMs: config\.browserConnectTimeoutMs \|\| 5000/);
   assert.match(controller, /startupTimeoutMs: config\.browserStartupTimeoutMs \|\| 15000/);
+  assert.match(controller, /profileMode: profile\.profileMode/);
   assert.match(controller, /profileDirectoryName: config\.browserProfileName \|\| 'Default'/);
 });
 
@@ -956,6 +957,9 @@ test('owned browser profile locks are cleaned only after the owned browser stops
   assert.match(controller, /process\.kill\(Number\(ownedBrowserProfile\.pid\), 0\)/);
   assert.match(controller, /cleanupOwnedBrowserProfileIfStopped\(\);/);
   assert.match(controller, /profileDirectoryName: runtime\.profileDirectoryName \|\| config\.browserProfileName \|\| 'Default'/);
+  assert.match(controller, /profileMode: runtime\.profileMode \|\| profile\.profileMode \|\| 'source'/);
+  assert.match(controller, /cleanupEphemeral: ownedBrowserProfile\.profileMode === 'clone'/);
+  assert.match(controller, /ownedBrowserProfile\.profileMode !== 'clone'/);
 });
 
 test('owned browser recovery cleans only launched groups and preserves human auth pages', () => {

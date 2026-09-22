@@ -21,6 +21,8 @@ GPT-5.6 Sol was the highest selectable option verified in the connected account 
 3. On Windows, start the controller with Start-Controller.ps1. It connects to the configured persistent browser/CDP session and serves the dashboard on the configured loopback port.
 4. Open the dashboard locally. The default address is http://127.0.0.1:9350/.
 
+The browser profile settings are explicit. Set `browserProfileMode` to `source` for the visible persistent authenticated browser profile used in production. The controller attaches to an existing CDP session first, then launches the configured profile with a bounded non-headless startup if no session is available. Source profile locks, cookies, and session data are preserved. Set `browserProfileMode` to `clone` only when an isolated copied profile is intentionally required; cloning is never selected automatically.
+
 On Linux with systemd user services, run `scripts/install-systemd-user.sh` after Node.js, npm, dependencies, and private config.json are ready. It installs and starts the controller, dashboard, and bounded watchdog timer without root privileges. See [Linux user services](docs/LINUX_USER_SERVICE.md).
 
 The example config contains placeholders and is not runnable as-is. Never publish chat IDs, service identifiers, cookies, tokens, browser profiles, case data, or runtime state. This review copy also replaces private source-shard folder IDs and operational pack offsets with placeholders; it is not a production checkout.

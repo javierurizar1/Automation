@@ -63,6 +63,21 @@ function browserFamily(value) {
   return null;
 }
 
+const BROWSER_PROFILE_MODES = new Set(['source', 'clone']);
+
+/**
+ * Normalize the profile mode used for a browser launch. Source mode is the
+ * production default so an authenticated browser identity is never silently
+ * copied into a new automation identity.
+ */
+export function normalizeBrowserProfileMode(value = 'source') {
+  const mode = String(value ?? 'source').trim().toLowerCase() || 'source';
+  if (!BROWSER_PROFILE_MODES.has(mode)) {
+    throw codedError('BROWSER_PROFILE_MODE_INVALID', `Unsupported browser profile mode: ${mode}`);
+  }
+  return mode;
+}
+
 function defaultBrowserDataDirectories({ platform = process.platform, env = process.env } = {}) {
   const home = env.HOME || env.USERPROFILE;
   if (!home) return [];
@@ -254,6 +269,7 @@ export async function terminateOwnedBrowserProcessGroup({
   profileDir,
   profileDirectoryName = 'Default',
   remoteDebuggingPort = null,
+  cleanupEphemeral = true,
   platform = process.platform,
   procRoot = '/proc',
   timeoutMs = 2000,
@@ -304,6 +320,7 @@ export async function terminateOwnedBrowserProcessGroup({
   if (!stopped) return { attempted: true, stopped: false, reason: 'TERMINATE_TIMEOUT' };
 
   let cleaned = [];
+  if (!cleanupEphemeral) return { attempted: true, stopped: true, cleaned };
   try {
     cleaned = cleanupAutomationProfileEphemeral({ profileDir: expectedProfile, profileDirectoryName });
   } catch {
@@ -355,6 +372,60 @@ function profileHasRequiredFiles(profileDir, profileName) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Validate a configured persistent browser profile without creating or
+ * mutating it. Source mode must fail closed when another browser owns it.
+ */
+export function validateSourceBrowserProfile({
+  profileDir,
+  profileDirectoryName = 'Default',
+  preferredExecutable = null,
+  platform = process.platform,
+  env = process.env,
+  procRoot = '/proc',
+  staleLockMaxAgeMs = 15 * 60 * 1000,
+} = {}) {
+  if (!profileDir) throw codedError('BROWSER_PROFILE_UNCONFIGURED', 'A persistent source browser profile is required');
+  const profileName = String(profileDirectoryName || 'Default').trim();
+  if (!/^[^\\/]{1,100}$/.test(profileName) || profileName === '.' || profileName === '..') {
+    throw codedError('BROWSER_PROFILE_NAME_INVALID', 'Invalid browser profile directory name');
+  }
+  const sourceProfileDir = path.resolve(profileDir);
+  if (!profileHasRequiredFiles(sourceProfileDir, profileName)) {
+    throw codedError('BROWSER_PROFILE_SOURCE_INVALID', 'Source browser profile lacks Local State or the selected profile directory');
+  }
+
+  const defaultDirectory = isDefaultBrowserDataDirectory(sourceProfileDir, { platform, env });
+  const family = defaultDirectory?.family || browserFamily(preferredExecutable);
+  if (platform === 'linux') {
+    const use = linuxProfileUse(
+      sourceProfileDir,
+      family || 'chromium',
+      profileName,
+      procRoot,
+      staleLockMaxAgeMs,
+      { platform, env },
+    );
+    if (use.state !== 'IDLE') {
+      throw codedError('BROWSER_PROFILE_IN_USE', `Source browser profile is in use or cannot be checked (${use.reason || use.state})`);
+    }
+  } else {
+    const lockPaths = [
+      path.join(sourceProfileDir, 'SingletonLock'),
+      path.join(sourceProfileDir, profileName, 'LOCK'),
+    ];
+    if (lockPaths.some(candidate => fs.existsSync(candidate))) {
+      throw codedError('BROWSER_PROFILE_IN_USE', 'Source browser profile has an active ownership lock');
+    }
+  }
+  return {
+    profileDir: sourceProfileDir,
+    profileDirectoryName: profileName,
+    profileMode: 'source',
+    family: family || null,
+  };
 }
 
 /** Copy an authenticated default browser profile once into the ignored local automation profile. */
@@ -596,6 +667,7 @@ export async function connectOrLaunchBrowser({
   cdpPort = null,
   preferredExecutable = null,
   profileDir = null,
+  profileMode = 'source',
   projectRoot = process.cwd(),
   connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS,
   startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS,
@@ -606,6 +678,7 @@ export async function connectOrLaunchBrowser({
   platform = process.platform,
   env = process.env,
 } = {}) {
+  const selectedProfileMode = normalizeBrowserProfileMode(profileMode);
   const connectMs = boundedMs(connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS, 15000);
   const startupMs = boundedMs(startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 30000);
   const retryMs = boundedMs(retryIntervalMs, DEFAULT_RETRY_INTERVAL_MS, 3000);
@@ -619,7 +692,16 @@ export async function connectOrLaunchBrowser({
     const connected = await connectOnce(playwrightChromium, endpoint, connectMs);
     const context = connected.contexts()[0] || null;
     if (context) {
-      return { ...connected, context, executable: null, pid: null, endpoint, launched: false, profileDir: null };
+      return {
+        ...connected,
+        context,
+        executable: null,
+        pid: null,
+        endpoint,
+        launched: false,
+        profileDir: null,
+        profileMode: selectedProfileMode,
+      };
     }
     attempts.push({ phase: 'existing-cdp-attach', error: 'connected browser has no context' });
   } catch (error) {
@@ -632,7 +714,8 @@ export async function connectOrLaunchBrowser({
   }
 
   // Match the historical Start-Controller profile location unless an explicit
-  // profile is configured. Never clear, recreate, or rotate this profile.
+  // profile is configured. Source mode never clears, recreates, or rotates
+  // this profile; clone mode is an explicit opt-in for an isolated copy.
   const persistentProfileDir = path.resolve(profileDir || path.join(projectRoot, 'chrome-profile'));
   const selectedProfileDirectoryName = profileDirectoryName == null || String(profileDirectoryName).trim() === ''
     ? null
@@ -643,27 +726,48 @@ export async function connectOrLaunchBrowser({
     throw codedError('BROWSER_UNAVAILABLE', 'Invalid browser profile directory name', attempts);
   }
   let launchProfileDir = persistentProfileDir;
-  let launchProfileName = selectedProfileDirectoryName;
-  try {
-    const bootstrap = await bootstrapAutomationProfile({
-      profileDir: persistentProfileDir,
-      profileDirectoryName: selectedProfileDirectoryName || 'Default',
-      projectRoot,
-      platform,
-      env,
-      timeoutMs: Math.min(PROFILE_COPY_TIMEOUT_MS, startupMs),
-    });
-    launchProfileDir = bootstrap.profileDir;
-    launchProfileName = bootstrap.profileDirectoryName;
-  } catch (error) {
-    if (error?.code === 'BROWSER_PROFILE_BOOTSTRAP_UNSUPPORTED'
-      || error?.code === 'BROWSER_PROFILE_UNCONFIGURED') throw error;
-    throw codedError('BROWSER_UNAVAILABLE', `Browser profile bootstrap failed: ${error.message || error}`, attempts);
-  }
-  try {
-    fs.mkdirSync(launchProfileDir, { recursive: true });
-  } catch (error) {
-    throw codedError('BROWSER_UNAVAILABLE', `Persistent browser profile is unavailable: ${error.message || error}`, attempts);
+  let launchProfileName = selectedProfileDirectoryName || 'Default';
+  if (selectedProfileMode === 'source') {
+    try {
+      const source = validateSourceBrowserProfile({
+        profileDir: persistentProfileDir,
+        profileDirectoryName: launchProfileName,
+        preferredExecutable: preferredExecutable || null,
+        platform,
+        env,
+      });
+      launchProfileDir = source.profileDir;
+      launchProfileName = source.profileDirectoryName;
+    } catch (error) {
+      if (error?.code === 'BROWSER_PROFILE_MODE_INVALID'
+        || error?.code === 'BROWSER_PROFILE_UNCONFIGURED'
+        || error?.code === 'BROWSER_PROFILE_NAME_INVALID'
+        || error?.code === 'BROWSER_PROFILE_IN_USE'
+        || error?.code === 'BROWSER_PROFILE_SOURCE_INVALID') throw error;
+      throw codedError('BROWSER_UNAVAILABLE', `Persistent source browser profile is unavailable: ${error.message || error}`, attempts);
+    }
+  } else {
+    try {
+      const bootstrap = await bootstrapAutomationProfile({
+        profileDir: persistentProfileDir,
+        profileDirectoryName: launchProfileName,
+        projectRoot,
+        platform,
+        env,
+        timeoutMs: Math.min(PROFILE_COPY_TIMEOUT_MS, startupMs),
+      });
+      launchProfileDir = bootstrap.profileDir;
+      launchProfileName = bootstrap.profileDirectoryName;
+    } catch (error) {
+      if (error?.code === 'BROWSER_PROFILE_BOOTSTRAP_UNSUPPORTED'
+        || error?.code === 'BROWSER_PROFILE_UNCONFIGURED') throw error;
+      throw codedError('BROWSER_UNAVAILABLE', `Browser profile bootstrap failed: ${error.message || error}`, attempts);
+    }
+    try {
+      fs.mkdirSync(launchProfileDir, { recursive: true });
+    } catch (error) {
+      throw codedError('BROWSER_UNAVAILABLE', `Persistent browser profile is unavailable: ${error.message || error}`, attempts);
+    }
   }
   let port;
   try {
@@ -707,11 +811,12 @@ export async function connectOrLaunchBrowser({
         launched: true,
         profileDir: launchProfileDir,
         profileDirectoryName: launchProfileName,
+        profileMode: selectedProfileMode,
       };
     } catch (error) {
       attempts.push({ phase: 'browser-startup', executable, error: error.message || String(error) });
       const stopped = await terminateOwnedProcess(child);
-      if (stopped) {
+      if (stopped && selectedProfileMode === 'clone') {
         try { removeDestinationEphemeralFiles(launchProfileDir, launchProfileName || 'Default'); } catch (cleanupError) {
           attempts.push({ phase: 'browser-cleanup', executable, error: cleanupError.message || String(cleanupError) });
         }

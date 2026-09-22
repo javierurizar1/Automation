@@ -11,7 +11,9 @@ import {
   cleanupAutomationProfileEphemeral,
   connectOrLaunchBrowser,
   discoverChromiumCandidates,
+  normalizeBrowserProfileMode,
   terminateOwnedBrowserProcessGroup,
+  validateSourceBrowserProfile,
 } from '../src/browser-runtime.mjs';
 import {
   classifyReviewerHealth,
@@ -102,6 +104,7 @@ test('failed preferred Brave startup falls back within bounded startup to Chromi
       preferredExecutable: brave,
       candidateExecutables: [brave, chromium],
       profileDir: path.join(directory, 'preserved-profile'),
+      profileMode: 'clone',
       profileDirectoryName: 'Default',
       connectTimeoutMs: 40,
       startupTimeoutMs: 100,
@@ -154,6 +157,7 @@ test('browser startup returns BROWSER_UNAVAILABLE after the configured finite de
     preferredExecutable: browserCandidate,
     candidateExecutables: [browserCandidate],
     profileDir: path.join(directory, 'profile'),
+    profileMode: 'clone',
     connectTimeoutMs: 30,
     startupTimeoutMs: 80,
     retryIntervalMs: 5,
@@ -201,6 +205,122 @@ test('default Brave profile is cloned once into ignored automation data and then
   });
   assert.equal(second.reused, true);
   assert.equal(second.profileDir, first.profileDir);
+});
+
+test('source profile mode launches the configured persistent profile without cloning', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-browser-source-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'source-profile');
+  const projectRoot = path.join(directory, 'project');
+  const markerPath = path.join(directory, 'launches.txt');
+  const argsMarkerPath = path.join(directory, 'browser-args.txt');
+  const browserCandidate = makeFakeBrowserExecutable(directory, 'brave-browser');
+  fs.mkdirSync(path.join(source, 'Default'), { recursive: true });
+  fs.writeFileSync(path.join(source, 'Local State'), '{}');
+  fs.writeFileSync(path.join(source, 'Default', 'Preferences'), '{}');
+  fs.writeFileSync(path.join(source, 'Default', 'Cookies'), 'authenticated-session');
+  const context = { pages: () => [] };
+  const browser = { contexts: () => [context] };
+  let connected;
+  try {
+    connected = await connectOrLaunchBrowser({
+      endpoint: 'http://127.0.0.1:59226',
+      preferredExecutable: browserCandidate,
+      candidateExecutables: [browserCandidate],
+      profileDir: source,
+      profileMode: 'source',
+      profileDirectoryName: 'Default',
+      projectRoot,
+      connectTimeoutMs: 40,
+      startupTimeoutMs: 300,
+      retryIntervalMs: 5,
+      env: {
+        ...process.env,
+        CODEX_TEST_BROWSER_MARKER: markerPath,
+        CODEX_TEST_BROWSER_ARGS_MARKER: argsMarkerPath,
+      },
+      playwrightChromium: {
+        async connectOverCDP() {
+          if (fs.existsSync(markerPath) && fs.readFileSync(markerPath, 'utf8').includes('brave-browser')) {
+            if (!fs.readFileSync(markerPath, 'utf8').includes('CONNECTED')) fs.appendFileSync(markerPath, 'CONNECTED\n');
+            return browser;
+          }
+          throw new Error('CDP unavailable');
+        },
+      },
+    });
+    assert.equal(connected.profileMode, 'source');
+    assert.equal(connected.profileDir, path.resolve(source));
+    assert.equal(connected.profileDirectoryName, 'Default');
+    assert.equal(fs.existsSync(path.join(projectRoot, 'data', 'browser-profile')), false);
+    assert.equal(fs.readFileSync(path.join(source, 'Default', 'Cookies'), 'utf8'), 'authenticated-session');
+    assert.ok(fs.readFileSync(argsMarkerPath, 'utf8').includes(`--user-data-dir=${source}`));
+  } finally {
+    await stopProcess(connected?.pid);
+  }
+});
+
+test('source profile mode rejects an actively owned profile before launch', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-browser-source-lock-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'source-profile');
+  const markerPath = path.join(directory, 'launches.txt');
+  fs.mkdirSync(path.join(source, 'Default'), { recursive: true });
+  fs.writeFileSync(path.join(source, 'Local State'), '{}');
+  fs.writeFileSync(path.join(source, 'Default', 'Preferences'), '{}');
+  fs.writeFileSync(path.join(source, 'SingletonLock'), 'owned');
+  const browserCandidate = makeFakeBrowserExecutable(directory, 'brave-browser');
+  await assert.rejects(connectOrLaunchBrowser({
+    endpoint: 'http://127.0.0.1:59227',
+    preferredExecutable: browserCandidate,
+    candidateExecutables: [browserCandidate],
+    profileDir: source,
+    profileMode: 'source',
+    env: { ...process.env, CODEX_TEST_BROWSER_MARKER: markerPath },
+    playwrightChromium: { async connectOverCDP() { throw new Error('CDP unavailable'); } },
+  }), error => error.code === 'BROWSER_PROFILE_IN_USE');
+  assert.equal(fs.existsSync(markerPath), false);
+  assert.equal(fs.existsSync(path.join(source, 'SingletonLock')), true);
+});
+
+test('source profile validation preserves profile cookies and locks', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-browser-source-validate-'));
+  try {
+    const source = path.join(directory, 'source-profile');
+    fs.mkdirSync(path.join(source, 'Default'), { recursive: true });
+    fs.writeFileSync(path.join(source, 'Local State'), '{}');
+    fs.writeFileSync(path.join(source, 'Default', 'Preferences'), '{}');
+    fs.writeFileSync(path.join(source, 'Default', 'Cookies'), 'keep');
+    fs.writeFileSync(path.join(source, 'SingletonLock'), 'stale-lock');
+    const staleTime = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    fs.utimesSync(path.join(source, 'SingletonLock'), staleTime, staleTime);
+    const validated = validateSourceBrowserProfile({
+      profileDir: source,
+      profileDirectoryName: 'Default',
+      preferredExecutable: 'brave-browser',
+      platform: 'linux',
+      env: { HOME: directory, XDG_CONFIG_HOME: path.join(directory, '.config') },
+      procRoot: '/proc',
+    });
+    assert.equal(validated.profileMode, 'source');
+    assert.equal(fs.readFileSync(path.join(source, 'Default', 'Cookies'), 'utf8'), 'keep');
+    assert.equal(fs.existsSync(path.join(source, 'SingletonLock')), true);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('browser profile mode defaults to source and rejects unknown values', () => {
+  assert.equal(normalizeBrowserProfileMode(), 'source');
+  assert.equal(normalizeBrowserProfileMode('clone'), 'clone');
+  assert.throws(() => normalizeBrowserProfileMode('rotate'), error => error.code === 'BROWSER_PROFILE_MODE_INVALID');
+});
+
+test('sanitized config declares explicit persistent source profile settings', () => {
+  const example = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'config', 'recovered-config.json'), 'utf8'));
+  assert.equal(example.browserProfileMode, 'source');
+  assert.equal(example.browserProfileName, 'Default');
+  assert.ok(Object.hasOwn(example, 'browserProfileDir'));
 });
 
 test('recent source profile lock remains a fail-closed blocker', async (t) => {
@@ -285,6 +405,34 @@ test('owned browser cleanup terminates only the verified process group and remov
   assert.equal(result.stopped, true);
   assert.equal(fs.existsSync(path.join(profileDir, 'SingletonLock')), false);
   assert.throws(() => process.kill(child.pid, 0), error => error.code === 'ESRCH');
+});
+
+test('owned source browser cleanup stops only the process and preserves source locks/cookies', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-owned-source-cleanup-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const profileDir = path.join(directory, 'profile');
+  fs.mkdirSync(path.join(profileDir, 'Default'), { recursive: true });
+  fs.writeFileSync(path.join(profileDir, 'SingletonLock'), 'owned');
+  fs.writeFileSync(path.join(profileDir, 'Default', 'Cookies'), 'keep');
+  const sleeper = path.join(directory, 'sleeper.mjs');
+  fs.writeFileSync(sleeper, 'setTimeout(() => {}, 30000);\n');
+  const child = process.platform === 'linux'
+    ? spawn(process.execPath, [sleeper, `--user-data-dir=${profileDir}`, '--remote-debugging-port=59228'], { detached: true, stdio: 'ignore' })
+    : null;
+  if (!child?.pid) return;
+  child.unref();
+  await delay(80);
+  const result = await terminateOwnedBrowserProcessGroup({
+    pid: child.pid,
+    profileDir,
+    profileDirectoryName: 'Default',
+    remoteDebuggingPort: 59228,
+    cleanupEphemeral: false,
+    timeoutMs: 250,
+  });
+  assert.equal(result.stopped, true);
+  assert.equal(fs.existsSync(path.join(profileDir, 'SingletonLock')), true);
+  assert.equal(fs.readFileSync(path.join(profileDir, 'Default', 'Cookies'), 'utf8'), 'keep');
 });
 
 test('owned browser cleanup refuses a process whose profile ownership cannot be proven', async (t) => {
