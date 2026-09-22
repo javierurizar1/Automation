@@ -5165,7 +5165,7 @@ function writeStatus(extra = {}) {
 
 function isBrowserDisconnectedError(error) {
   if (['BROWSER_UNAVAILABLE', 'BROWSER_PAGE_CREATE_TIMEOUT', 'REVIEWER_PAGE_NAVIGATION_FAILED',
-    'COORDINATOR_PAGE_NAVIGATION_FAILED'].includes(error?.code)) return true;
+    'COORDINATOR_PAGE_NAVIGATION_FAILED', 'BROWSER_PROFILE_IN_USE'].includes(error?.code)) return true;
   const text = String(error?.stack || error?.message || error || '');
   return /browser|context|target page|CDP/i.test(text)
     && /closed|disconnect|timeout|target|ECONNREFUSED|ECONNRESET|ETIMEDOUT/i.test(text);
@@ -5514,17 +5514,25 @@ async function main() {
       browser = null;
       context = null;
       if (ownedBrowserProfile.launched) {
-        const recovery = await terminateOwnedBrowserProcessGroup({
-          pid: ownedBrowserProfile.pid,
-          profileDir: ownedBrowserProfile.profileDir,
-          profileDirectoryName: ownedBrowserProfile.profileDirectoryName,
-          remoteDebuggingPort: config.cdpPort,
-          cleanupEphemeral: ownedBrowserProfile.profileMode === 'clone',
-        });
-        if (recovery.attempted && recovery.stopped) {
-          log(`terminated owned browser after bounded readiness failure; cleaned ${recovery.cleaned?.length || 0} ephemeral lock file(s)`);
-        } else if (recovery.attempted) {
-          log(`owned browser cleanup did not complete: ${recovery.reason || 'unknown failure'}`);
+        if (ownedBrowserProfile.profileMode === 'clone') {
+          const recovery = await terminateOwnedBrowserProcessGroup({
+            pid: ownedBrowserProfile.pid,
+            profileDir: ownedBrowserProfile.profileDir,
+            profileDirectoryName: ownedBrowserProfile.profileDirectoryName,
+            remoteDebuggingPort: config.cdpPort,
+            cleanupEphemeral: ownedBrowserProfile.profileMode === 'clone',
+          });
+          if (recovery.attempted && recovery.stopped) {
+            log(`terminated owned browser after bounded readiness failure; cleaned ${recovery.cleaned?.length || 0} ephemeral lock file(s)`);
+          } else if (recovery.attempted) {
+            log(`owned browser cleanup did not complete: ${recovery.reason || 'unknown failure'}`);
+          }
+        } else if (ownedBrowserProfile.profileMode === 'source') {
+          // Source mode may have been launched by this controller, but it is the
+          // user's persistent authenticated browser identity. A readiness or
+          // navigation timeout must preserve that visible browser so an operator
+          // can complete authentication and the next bounded loop can reattach.
+          log('preserving launched source browser after bounded readiness failure');
         }
       }
       cleanupOwnedBrowserProfileIfStopped();

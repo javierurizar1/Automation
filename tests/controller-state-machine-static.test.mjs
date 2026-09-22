@@ -978,3 +978,18 @@ test('owned browser recovery cleans only launched groups and preserves human aut
   assert.match(catchBlock, /terminateOwnedBrowserProcessGroup\(/);
   assert.match(catchBlock, /cleanupOwnedBrowserProfileIfStopped\(\);/);
 });
+
+test('a preserved source-browser profile lock stays in bounded recovery instead of becoming fatal', () => {
+  const helperStart = controller.indexOf('function isBrowserDisconnectedError(');
+  const helperEnd = controller.indexOf('\nfunction isReviewerCapacitySafetyError', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  assert.match(controller.slice(helperStart, helperEnd), /BROWSER_PROFILE_IN_USE/);
+
+  const main = controller.slice(controller.indexOf('async function main()'));
+  const catchStart = main.indexOf('} catch (error) {', main.indexOf('await ensureBrowserSlots'));
+  const catchBlock = main.slice(catchStart, catchStart + 5000);
+  assert.match(catchBlock, /isBrowserDisconnectedError\(error\)/);
+  assert.match(catchBlock, /bounded retry in/);
+  assert.match(catchBlock, /profileMode === 'source'/);
+  assert.match(catchBlock, /preserving launched source browser/);
+});
