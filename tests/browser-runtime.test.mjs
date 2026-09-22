@@ -4,12 +4,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   bootstrapAutomationProfile,
   cleanupAutomationProfileEphemeral,
   connectOrLaunchBrowser,
   discoverChromiumCandidates,
+  terminateOwnedBrowserProcessGroup,
 } from '../src/browser-runtime.mjs';
 import {
   classifyReviewerHealth,
@@ -251,6 +253,69 @@ test('reuses an isolated profile after removing a stale destination lock', async
   assert.equal(fs.existsSync(destinationLock), false);
   assert.equal(fs.existsSync(destinationSingleton), false);
   cleanupAutomationProfileEphemeral({ profileDir: first.profileDir, profileDirectoryName: 'Default' });
+});
+
+test('owned browser cleanup terminates only the verified process group and removes destination locks', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-owned-browser-cleanup-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const profileDir = path.join(directory, 'profile');
+  fs.mkdirSync(path.join(profileDir, 'Default'), { recursive: true });
+  fs.writeFileSync(path.join(profileDir, 'SingletonLock'), 'owned');
+  const sleeper = path.join(directory, 'sleeper.mjs');
+  fs.writeFileSync(sleeper, 'setTimeout(() => {}, 30000);\n');
+  const child = process.platform === 'linux'
+    ? spawn(process.execPath, [
+      sleeper,
+      `--user-data-dir=${profileDir}`,
+      '--remote-debugging-port=59224',
+    ], { detached: true, stdio: 'ignore' })
+    : null;
+  if (!child?.pid) return;
+  child.unref();
+  await delay(80);
+
+  const result = await terminateOwnedBrowserProcessGroup({
+    pid: child.pid,
+    profileDir,
+    profileDirectoryName: 'Default',
+    remoteDebuggingPort: 59224,
+    timeoutMs: 250,
+  });
+  assert.equal(result.attempted, true);
+  assert.equal(result.stopped, true);
+  assert.equal(fs.existsSync(path.join(profileDir, 'SingletonLock')), false);
+  assert.throws(() => process.kill(child.pid, 0), error => error.code === 'ESRCH');
+});
+
+test('owned browser cleanup refuses a process whose profile ownership cannot be proven', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-owned-browser-ownership-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const actualProfile = path.join(directory, 'actual');
+  const expectedProfile = path.join(directory, 'expected');
+  fs.mkdirSync(actualProfile, { recursive: true });
+  const sleeper = path.join(directory, 'sleeper.mjs');
+  fs.writeFileSync(sleeper, 'setTimeout(() => {}, 30000);\n');
+  const child = process.platform === 'linux'
+    ? spawn(process.execPath, [sleeper, `--user-data-dir=${actualProfile}`, '--remote-debugging-port=59225'], {
+      detached: true,
+      stdio: 'ignore',
+    })
+    : null;
+  if (!child?.pid) return;
+  child.unref();
+  await delay(80);
+  try {
+    const result = await terminateOwnedBrowserProcessGroup({
+      pid: child.pid,
+      profileDir: expectedProfile,
+      remoteDebuggingPort: 59225,
+      timeoutMs: 250,
+    });
+    assert.equal(result.attempted, false);
+    assert.equal(result.reason, 'OWNERSHIP_UNVERIFIED');
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+  }
 });
 
 test('reviewer health requires live evidence and recognizes reconnecting, offline, and disconnected pages', async () => {

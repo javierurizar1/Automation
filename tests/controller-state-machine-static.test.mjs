@@ -957,3 +957,20 @@ test('owned browser profile locks are cleaned only after the owned browser stops
   assert.match(controller, /cleanupOwnedBrowserProfileIfStopped\(\);/);
   assert.match(controller, /profileDirectoryName: runtime\.profileDirectoryName \|\| config\.browserProfileName \|\| 'Default'/);
 });
+
+test('owned browser recovery cleans only launched groups and preserves human auth pages', () => {
+  const slots = controller.slice(
+    controller.indexOf('async function ensureBrowserSlots'),
+    controller.indexOf('async function reviewerSlotForBucket'),
+  );
+  assert.match(slots, /const authHealth = await classifyReviewerHealth\(coordinator/);
+  assert.match(slots, /authHealth\.state === 'AUTH_REQUIRED'/);
+  assert.match(slots, /HUMAN_AUTH_REQUIRED|AUTH_REQUIRED/);
+
+  const main = controller.slice(controller.indexOf('async function main()'));
+  const catchStart = main.indexOf('} catch (error) {', main.indexOf('await ensureBrowserSlots'));
+  const catchBlock = main.slice(catchStart, catchStart + 5000);
+  assert.match(catchBlock, /if \(ownedBrowserProfile\.launched\)/);
+  assert.match(catchBlock, /terminateOwnedBrowserProcessGroup\(/);
+  assert.match(catchBlock, /cleanupOwnedBrowserProfileIfStopped\(\);/);
+});

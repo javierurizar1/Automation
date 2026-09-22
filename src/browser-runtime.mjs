@@ -215,6 +215,103 @@ export function cleanupAutomationProfileEphemeral({ profileDir, profileDirectory
   return removeDestinationEphemeralFiles(profileDir, profileDirectoryName);
 }
 
+function processGroupId(pid, procRoot = '/proc') {
+  try {
+    const stat = fs.readFileSync(path.join(procRoot, String(pid), 'stat'), 'utf8');
+    const match = stat.match(/^\d+ \(.+\)\s+\S+\s+\d+\s+(\d+)/);
+    return match ? Number(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForProcessExit(pid, timeoutMs = 2000) {
+  const deadline = Date.now() + Math.max(100, Math.min(5000, Number(timeoutMs) || 2000));
+  while (Date.now() < deadline) {
+    try {
+      process.kill(Number(pid), 0);
+    } catch (error) {
+      if (error.code === 'ESRCH') return true;
+      return false;
+    }
+    await delay(50);
+  }
+  try {
+    process.kill(Number(pid), 0);
+    return false;
+  } catch (error) {
+    return error.code === 'ESRCH';
+  }
+}
+
+/**
+ * Stop only a browser process group that this controller launched itself.
+ * Ownership is proven from the live command line and detached process group;
+ * a source profile or an externally attached CDP browser is never touched.
+ */
+export async function terminateOwnedBrowserProcessGroup({
+  pid,
+  profileDir,
+  profileDirectoryName = 'Default',
+  remoteDebuggingPort = null,
+  platform = process.platform,
+  procRoot = '/proc',
+  timeoutMs = 2000,
+} = {}) {
+  const normalizedPid = Number(pid);
+  if (platform !== 'linux' || !Number.isInteger(normalizedPid) || normalizedPid <= 1 || !profileDir) {
+    return { attempted: false, stopped: false, reason: 'OWNERSHIP_UNVERIFIED' };
+  }
+
+  let commandLine;
+  try {
+    commandLine = fs.readFileSync(path.join(procRoot, String(normalizedPid), 'cmdline'))
+      .toString('utf8').split('\0').filter(Boolean);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return { attempted: true, stopped: true, alreadyExited: true, cleaned: [] };
+    }
+    return { attempted: false, stopped: false, reason: 'OWNERSHIP_UNVERIFIED' };
+  }
+
+  const expectedProfile = path.resolve(profileDir);
+  const profileArgument = commandLine.find((argument, index) => {
+    if (argument.startsWith('--user-data-dir=')) return samePath(argument.slice('--user-data-dir='.length), expectedProfile);
+    return argument === '--user-data-dir' && commandLine[index + 1]
+      && samePath(commandLine[index + 1], expectedProfile);
+  });
+  if (!profileArgument || processGroupId(normalizedPid, procRoot) !== normalizedPid) {
+    return { attempted: false, stopped: false, reason: 'OWNERSHIP_UNVERIFIED' };
+  }
+  if (remoteDebuggingPort != null) {
+    const expectedPort = String(remoteDebuggingPort);
+    const hasExpectedPort = commandLine.some(argument => argument === `--remote-debugging-port=${expectedPort}`);
+    if (!hasExpectedPort) return { attempted: false, stopped: false, reason: 'OWNERSHIP_UNVERIFIED' };
+  }
+
+  try {
+    process.kill(-normalizedPid, 'SIGTERM');
+  } catch (error) {
+    if (error.code !== 'ESRCH') return { attempted: true, stopped: false, reason: 'TERMINATE_FAILED' };
+  }
+  let stopped = await waitForProcessExit(normalizedPid, timeoutMs);
+  if (!stopped) {
+    try { process.kill(-normalizedPid, 'SIGKILL'); } catch (error) {
+      if (error.code !== 'ESRCH') return { attempted: true, stopped: false, reason: 'TERMINATE_FAILED' };
+    }
+    stopped = await waitForProcessExit(normalizedPid, timeoutMs);
+  }
+  if (!stopped) return { attempted: true, stopped: false, reason: 'TERMINATE_TIMEOUT' };
+
+  let cleaned = [];
+  try {
+    cleaned = cleanupAutomationProfileEphemeral({ profileDir: expectedProfile, profileDirectoryName });
+  } catch {
+    return { attempted: true, stopped: true, cleaned, reason: 'LOCK_CLEANUP_FAILED' };
+  }
+  return { attempted: true, stopped: true, cleaned };
+}
+
 function sourceFingerprint(profileDir, profileName) {
   const paths = [path.join(profileDir, 'Local State'), path.join(profileDir, profileName)];
   return paths.map(candidate => {

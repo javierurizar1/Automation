@@ -76,7 +76,11 @@ import {
 } from './operations.mjs';
 import { ensureHighestReviewerModel, REQUIRED_REVIEWER_EFFORT, REQUIRED_REVIEWER_MODEL } from './reviewer-model.mjs';
 import { classifyReviewerHealth, ensureBrowserPageBudget, findActualGeneration } from './reviewer-tabs.mjs';
-import { cleanupAutomationProfileEphemeral, connectOrLaunchBrowser } from './browser-runtime.mjs';
+import {
+  cleanupAutomationProfileEphemeral,
+  connectOrLaunchBrowser,
+  terminateOwnedBrowserProcessGroup,
+} from './browser-runtime.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/(.:)/, '$1')), '..');
 const CONFIG_PATH = path.join(ROOT, 'config.json');
@@ -1494,8 +1498,16 @@ async function ensureBrowserSlots(context) {
     try {
       await coordinator.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     } catch (error) {
-      error.code = error.code || 'COORDINATOR_PAGE_NAVIGATION_FAILED';
-      throw error;
+      // A normal landing page can load enough DOM for the auth marker even
+      // when navigation's domcontentloaded deadline expires. Preserve that
+      // visible page and let the operator authenticate instead of killing it.
+      const authHealth = await classifyReviewerHealth(coordinator, { timeoutMs: 2500 });
+      if (authHealth.state === 'AUTH_REQUIRED') {
+        healthByPage.set(coordinator, authHealth);
+      } else {
+        error.code = error.code || 'COORDINATOR_PAGE_NAVIGATION_FAILED';
+        throw error;
+      }
     }
   }
 
@@ -5493,6 +5505,19 @@ async function main() {
       };
       browser = null;
       context = null;
+      if (ownedBrowserProfile.launched) {
+        const recovery = await terminateOwnedBrowserProcessGroup({
+          pid: ownedBrowserProfile.pid,
+          profileDir: ownedBrowserProfile.profileDir,
+          profileDirectoryName: ownedBrowserProfile.profileDirectoryName,
+          remoteDebuggingPort: config.cdpPort,
+        });
+        if (recovery.attempted && recovery.stopped) {
+          log(`terminated owned browser after bounded readiness failure; cleaned ${recovery.cleaned?.length || 0} ephemeral lock file(s)`);
+        } else if (recovery.attempted) {
+          log(`owned browser cleanup did not complete: ${recovery.reason || 'unknown failure'}`);
+        }
+      }
       cleanupOwnedBrowserProfileIfStopped();
       ownedBrowserProfile = {
         launched: false,
