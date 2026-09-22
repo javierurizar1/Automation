@@ -6,9 +6,9 @@ The Linux service files run the controller and loopback dashboard under the sign
 scripts/install-systemd-user.sh
 ```
 
-The installer copies units to `~/.config/systemd/user`, enables the visible persistent source browser, controller, dashboard, and watchdog timer. The source browser opens a committed data bootstrap page on the configured CDP port. After attaching, the controller navigates that same authenticated profile to the configured ChatGPT project URL with a bounded timeout. The controller and dashboard listen only on the configured loopback addresses. The dashboard defaults to `http://127.0.0.1:9350/`.
+The installer copies units to `~/.config/systemd/user`, enables the visible persistent source browser, controller, dashboard, and watchdog timer. The source browser waits for the dashboard's local HTTP bootstrap endpoint at `http://127.0.0.1:9350/__r433_bootstrap`, then opens that committed page on the configured CDP port. After attaching, the controller navigates the same authenticated profile to the configured ChatGPT project URL with a bounded timeout. The controller and dashboard listen only on the configured loopback addresses. The dashboard defaults to `http://127.0.0.1:9350/`.
 
-The installer also copies `r433-fallback-chrome.service` without enabling it. When the source browser is unavailable, start this bounded fallback explicitly with `systemctl --user start r433-fallback-chrome.service`. It uses CDP 9334 and the persistent dedicated profile `~/.config/R433-Chrome-Fallback`, starts on the same committed data bootstrap page, and leaves navigation to ChatGPT to the controller after attach.
+The installer also copies `r433-fallback-chrome.service` without enabling it. When the source browser is unavailable, start this bounded fallback explicitly with `systemctl --user start r433-fallback-chrome.service`. It uses CDP 9334 and the persistent dedicated profile `~/.config/R433-Chrome-Fallback`, waits for the same local HTTP bootstrap endpoint, and leaves navigation to ChatGPT to the controller after attach.
 
 ## Recovery behavior
 

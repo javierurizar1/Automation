@@ -1395,7 +1395,7 @@ function currentPageUrl(page) {
 
 function isProjectPage(page) {
   const url = currentPageUrl(page);
-  if (url === 'about:blank' || url === AUTOMATION_BOOTSTRAP_URL) return true;
+  if (url === AUTOMATION_BOOTSTRAP_URL) return true;
   try {
     const pageHost = new URL(url).hostname.toLowerCase();
     const projectHost = new URL(config.projectUrl).hostname.toLowerCase();

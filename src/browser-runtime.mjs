@@ -13,10 +13,10 @@ const MAX_CANDIDATES = 6;
 const PROFILE_COPY_TIMEOUT_MS = 30000;
 const PROFILE_BOOTSTRAP_SCRIPT = fileURLToPath(new URL('./browser-profile-bootstrap.mjs', import.meta.url));
 // Playwright waits for a first committed navigation when attaching to a
-// persistent Chromium context. An about:blank startup page never satisfies
-// that wait, so controller-launched browsers use a harmless committed data
-// page and the controller reuses it as the coordinator tab.
-export const AUTOMATION_BOOTSTRAP_URL = 'data:text/html,%3Ctitle%3ER433%20automation%20bootstrap%3C%2Ftitle%3E';
+// persistent Chromium context. The dashboard owns this local HTTP endpoint so
+// the browser gets a real committed document before the controller navigates
+// the same visible authenticated profile to ChatGPT.
+export const AUTOMATION_BOOTSTRAP_URL = 'http://127.0.0.1:9350/__r433_bootstrap';
 const EPHEMERAL_PROFILE_NAMES = new Set([
   'SingletonLock', 'SingletonCookie', 'SingletonSocket', 'DevToolsActivePort', 'LOCK', 'lockfile',
 ]);

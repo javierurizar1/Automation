@@ -1,20 +1,23 @@
 [Unit]
 Description=R4.3.3 Dedicated Chrome Fallback Browser
-After=graphical-session.target network-online.target
-Wants=network-online.target
+After=graphical-session.target network-online.target r433-audit-dashboard.service
+Wants=network-online.target r433-audit-dashboard.service
 StartLimitIntervalSec=30min
 StartLimitBurst=3
 
 [Service]
 Type=simple
 WorkingDirectory=@APP_ROOT@
+Environment="PATH=@NODE_BIN_DIR@:/usr/local/bin:/usr/bin:/bin"
 Environment="DISPLAY=@DISPLAY@"
 Environment="XAUTHORITY=@XAUTHORITY@"
 Environment="XDG_RUNTIME_DIR=%t"
-# Keep the fallback identity separate from the Brave source profile. The
-# controller attaches to the committed data page, then navigates this visible
+# Keep the fallback identity separate from the Brave source profile. The local
+# dashboard endpoint gives Playwright a first committed document. The
+# controller attaches to the committed local bootstrap page, then navigates this visible
 # profile to ChatGPT with its bounded post-attach navigation.
-ExecStart=/usr/bin/google-chrome --remote-debugging-port=9334 --user-data-dir=%h/.config/R433-Chrome-Fallback --profile-directory=Default --no-first-run --no-default-browser-check data:text/html,%%3Ctitle%%3ER433%%20automation%%20bootstrap%%3C%%2Ftitle%%3E
+ExecStartPre=/usr/bin/env node scripts/wait-for-bootstrap.mjs http://127.0.0.1:9350/__r433_bootstrap
+ExecStart=/usr/bin/google-chrome --remote-debugging-port=9334 --user-data-dir=%h/.config/R433-Chrome-Fallback --profile-directory=Default --no-first-run --no-default-browser-check http://127.0.0.1:9350/__r433_bootstrap
 Restart=on-failure
 RestartSec=30s
 TimeoutStartSec=45s

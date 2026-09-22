@@ -18,6 +18,8 @@ const TRACKER_SNAPSHOT_PATH = path.join(DATA_DIR, 'tracker-snapshot.json');
 const INCIDENT_DIR = path.join(DATA_DIR, 'incidents');
 const DASHBOARD_PID_PATH = path.join(DATA_DIR, 'dashboard.pid');
 const DASHBOARD_HTML_PATH = path.join(ROOT, 'dashboard.html');
+const AUTOMATION_BOOTSTRAP_PATH = '/__r433_bootstrap';
+const AUTOMATION_BOOTSTRAP_HTML = '<!doctype html><html><head><meta charset="utf-8"><title>R433 automation bootstrap</title></head><body>R433 automation bootstrap</body></html>';
 const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8').replace(/^\uFEFF/, ''));
 const port = Number(config.dashboardPort || 9350);
 const controllerServiceName = String(config.controllerServiceName || 'r433-audit-controller.service');
@@ -194,6 +196,11 @@ function readBody(req) {
 
 async function handle(req, res) {
   const url = new URL(req.url || '/', `http://${req.headers.host || `127.0.0.1:${port}`}`);
+
+  if (req.method === 'GET' && url.pathname === AUTOMATION_BOOTSTRAP_PATH) {
+    writeResponse(res, 200, 'text/html; charset=utf-8', AUTOMATION_BOOTSTRAP_HTML);
+    return;
+  }
 
   if (req.method === 'GET' && url.pathname === '/') {
     try {

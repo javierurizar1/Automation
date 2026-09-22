@@ -20,6 +20,8 @@ const reviewerTabs = fs.readFileSync(path.join(ROOT, 'src', 'reviewer-tabs.mjs')
 const browserRuntime = fs.readFileSync(path.join(ROOT, 'src', 'browser-runtime.mjs'), 'utf8');
 const reviewerModel = fs.readFileSync(path.join(ROOT, 'src', 'reviewer-model.mjs'), 'utf8');
 const dashboardHtml = fs.readFileSync(path.join(ROOT, 'dashboard.html'), 'utf8');
+const dashboardRuntime = fs.readFileSync(path.join(ROOT, 'src', 'dashboard.mjs'), 'utf8');
+const bootstrapWaiter = fs.readFileSync(path.join(ROOT, 'scripts', 'wait-for-bootstrap.mjs'), 'utf8');
 const sourceBrowserUnit = fs.readFileSync(path.join(ROOT, 'systemd', 'user', 'r433-source-browser.service'), 'utf8');
 const fallbackChromeUnit = fs.readFileSync(path.join(ROOT, 'systemd', 'user', 'r433-fallback-chrome.service'), 'utf8');
 const controllerUnit = fs.readFileSync(path.join(ROOT, 'systemd', 'user', 'r433-audit-controller.service'), 'utf8');
@@ -1004,16 +1006,19 @@ test('controller adopts the committed browser bootstrap page as its coordinator'
   const projectPageEnd = controller.indexOf('\nfunction bucketForPageUrl', projectPageStart);
   assert.ok(projectPageStart >= 0 && projectPageEnd > projectPageStart);
   assert.match(controller.slice(projectPageStart, projectPageEnd), /url === AUTOMATION_BOOTSTRAP_URL/);
+  assert.doesNotMatch(controller.slice(projectPageStart, projectPageEnd), /about:blank/);
 });
 
 test('source browser service uses the committed bootstrap and bounded post-attach navigation', () => {
   assert.match(sourceBrowserUnit, /Description=R4\.3\.3 Persistent Source Browser/);
   assert.match(sourceBrowserUnit, /--user-data-dir=@BROWSER_PROFILE_DIR@/);
   assert.match(sourceBrowserUnit, /--profile-directory=@BROWSER_PROFILE_NAME@/);
-  assert.match(sourceBrowserUnit, /data:text\/html,%%3Ctitle%%3ER433%%20automation%%20bootstrap%%3C%%2Ftitle%%3E/);
+  assert.match(sourceBrowserUnit, /http:\/\/127\.0\.0\.1:9350\/__r433_bootstrap/);
   assert.doesNotMatch(sourceBrowserUnit, /https:\/\/chatgpt\.com/);
+  assert.match(sourceBrowserUnit, /r433-audit-dashboard\.service/);
+  assert.match(sourceBrowserUnit, /wait-for-bootstrap\.mjs/);
   assert.match(controllerUnit, /Wants=r433-source-browser\.service/);
-  assert.match(controllerUnit, /After=network-online\.target r433-source-browser\.service/);
+  assert.match(controllerUnit, /After=network-online\.target r433-audit-dashboard\.service r433-source-browser\.service/);
   assert.match(systemdInstaller, /r433-source-browser\.service/);
 
   const slots = controller.slice(
@@ -1030,9 +1035,21 @@ test('Chrome fallback service keeps its dedicated profile and starts on the comm
   assert.match(fallbackChromeUnit, /\/usr\/bin\/google-chrome/);
   assert.match(fallbackChromeUnit, /--remote-debugging-port=9334/);
   assert.match(fallbackChromeUnit, /--user-data-dir=%h\/.config\/R433-Chrome-Fallback/);
-  assert.match(fallbackChromeUnit, /data:text\/html,%%3Ctitle%%3ER433%%20automation%%20bootstrap%%3C%%2Ftitle%%3E/);
+  assert.match(fallbackChromeUnit, /http:\/\/127\.0\.0\.1:9350\/__r433_bootstrap/);
   assert.doesNotMatch(fallbackChromeUnit, /https:\/\/chatgpt\.com/);
+  assert.match(fallbackChromeUnit, /r433-audit-dashboard\.service/);
+  assert.match(fallbackChromeUnit, /wait-for-bootstrap\.mjs/);
   assert.match(systemdInstaller, /r433-fallback-chrome\.service/);
   assert.match(fallbackChromeUnit, /TimeoutStartSec=45s/);
   assert.match(fallbackChromeUnit, /RestartSec=30s/);
+});
+
+test('dashboard owns a stable local HTTP bootstrap endpoint before ChatGPT navigation', () => {
+  assert.match(dashboardRuntime, /AUTOMATION_BOOTSTRAP_PATH = '\/__r433_bootstrap'/);
+  assert.match(dashboardRuntime, /url\.pathname === AUTOMATION_BOOTSTRAP_PATH/);
+  assert.match(dashboardRuntime, /R433 automation bootstrap/);
+  assert.match(bootstrapWaiter, /timeoutMs/);
+  assert.match(bootstrapWaiter, /probeTimeoutMs/);
+  assert.match(bootstrapWaiter, /Number\.isFinite/);
+  assert.match(bootstrapWaiter, /process\.exit\(1\)/);
 });
