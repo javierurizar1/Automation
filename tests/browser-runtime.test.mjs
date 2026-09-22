@@ -11,10 +11,12 @@ import {
   cleanupAutomationProfileEphemeral,
   connectOrLaunchBrowser,
   discoverChromiumCandidates,
+  discoverFirefoxCandidates,
   AUTOMATION_BOOTSTRAP_URL,
   normalizeBrowserProfileMode,
   terminateOwnedBrowserProcessGroup,
   validateSourceBrowserProfile,
+  validateFirefoxProfileDirectory,
 } from '../src/browser-runtime.mjs';
 import {
   classifyReviewerHealth,
@@ -86,6 +88,22 @@ test('browser candidates prefer the configured browser and retain supported fall
     platform: 'linux',
     env: { PATH: '' },
   }), ['Brave Browser']);
+});
+
+test('Firefox fallback candidates are restricted to installed Firefox executables', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-firefox-candidates-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const preferred = path.join(directory, 'firefox');
+  fs.writeFileSync(preferred, '');
+  const candidates = discoverFirefoxCandidates({
+    preferredExecutable: preferred,
+    candidateExecutables: ['firefox', 'chromium', 'not-a-browser'],
+    platform: 'linux',
+    env: { PATH: '' },
+  });
+  assert.deepEqual(candidates.slice(0, 2), [preferred, 'firefox']);
+  assert.equal(candidates.includes('chromium'), false);
+  assert.equal(candidates.includes('not-a-browser'), false);
 });
 
 test('failed preferred Brave startup falls back within bounded startup to Chromium', async (t) => {
@@ -320,6 +338,108 @@ test('CDP attach failure falls back to a bounded visible persistent source conte
   assert.equal(connected.profileDir, path.resolve(source));
 });
 
+test('Firefox is a final bounded fallback with an isolated persistent profile', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-firefox-fallback-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'chrome-source');
+  const firefoxProfile = path.join(directory, 'firefox-profile');
+  const firefoxCandidate = path.join(directory, 'firefox');
+  fs.writeFileSync(firefoxCandidate, '');
+  fs.mkdirSync(path.join(source, 'Default'), { recursive: true });
+  fs.writeFileSync(path.join(source, 'Local State'), '{}');
+  fs.writeFileSync(path.join(source, 'Default', 'Preferences'), '{}');
+  fs.writeFileSync(path.join(source, 'Default', 'Cookies'), 'preserve');
+  fs.writeFileSync(path.join(source, 'SingletonLock'), 'external-owner');
+
+  let context;
+  const browser = { contexts: () => [context] };
+  context = {
+    pages: () => [],
+    browser: () => browser,
+    close: async () => {},
+  };
+  let chromiumConnectCalls = 0;
+  const launches = [];
+  const connected = await connectOrLaunchBrowser({
+    endpoint: 'http://127.0.0.1:59230',
+    preferredExecutable: path.join(directory, 'brave-browser'),
+    candidateExecutables: [],
+    profileDir: source,
+    profileMode: 'source',
+    profileDirectoryName: 'Default',
+    firefoxFallbackEnabled: true,
+    firefoxExecutable: firefoxCandidate,
+    firefoxProfileDir: firefoxProfile,
+    startupTimeoutMs: 150,
+    playwrightChromium: {
+      async connectOverCDP() {
+        chromiumConnectCalls += 1;
+        throw new Error('Chrome CRPage initialization timeout');
+      },
+    },
+    playwrightFirefox: {
+      async launchPersistentContext(userDataDir, options) {
+        launches.push({ userDataDir, options });
+        return context;
+      },
+    },
+  });
+
+  assert.equal(chromiumConnectCalls, 1);
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].userDataDir, path.resolve(firefoxProfile));
+  assert.equal(launches[0].options.headless, false);
+  assert.equal(launches[0].options.executablePath, firefoxCandidate);
+  assert.equal(launches[0].options.viewport, null);
+  assert.match(launches[0].options.args.join(' '), new RegExp(AUTOMATION_BOOTSTRAP_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(connected.browser, browser);
+  assert.equal(connected.context, context);
+  assert.equal(connected.profileMode, 'firefox');
+  assert.equal(connected.transport, 'persistent-firefox');
+  assert.equal(connected.endpoint, null);
+  assert.equal(fs.readFileSync(path.join(source, 'Default', 'Cookies'), 'utf8'), 'preserve');
+  assert.equal(fs.existsSync(path.join(source, 'SingletonLock')), true);
+  assert.equal(validateFirefoxProfileDirectory({ profileDir: firefoxProfile, platform: 'linux' }).profileMode, 'firefox');
+});
+
+test('Firefox fallback refuses an actively owned dedicated profile', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-firefox-profile-lock-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'chrome-source');
+  const firefoxProfile = path.join(directory, 'firefox-profile');
+  const firefoxCandidate = path.join(directory, 'firefox');
+  fs.writeFileSync(firefoxCandidate, '');
+  fs.mkdirSync(path.join(source, 'Default'), { recursive: true });
+  fs.writeFileSync(path.join(source, 'Local State'), '{}');
+  fs.writeFileSync(path.join(source, 'Default', 'Preferences'), '{}');
+  fs.mkdirSync(firefoxProfile, { recursive: true });
+  fs.writeFileSync(path.join(firefoxProfile, 'parent.lock'), 'owned');
+  let launchCalls = 0;
+  await assert.rejects(connectOrLaunchBrowser({
+    endpoint: 'http://127.0.0.1:59231',
+    preferredExecutable: path.join(directory, 'missing-chrome'),
+    candidateExecutables: [],
+    profileDir: source,
+    profileMode: 'source',
+    firefoxFallbackEnabled: true,
+    firefoxExecutable: firefoxCandidate,
+    firefoxProfileDir: firefoxProfile,
+    playwrightChromium: { async connectOverCDP() { throw new Error('CDP unavailable'); } },
+    playwrightFirefox: {
+      async launchPersistentContext() {
+        launchCalls += 1;
+        throw new Error('must not launch an owned profile');
+      },
+    },
+  }), error => {
+    assert.equal(error.code, 'BROWSER_UNAVAILABLE');
+    assert.ok(error.attempts.some(attempt => attempt.phase === 'firefox-profile-validation'));
+    return true;
+  });
+  assert.equal(launchCalls, 0);
+  assert.equal(fs.existsSync(path.join(firefoxProfile, 'parent.lock')), true);
+});
+
 test('source profile mode rejects an actively owned profile before launch', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-browser-source-lock-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -386,6 +506,8 @@ test('sanitized config declares explicit persistent source profile settings', ()
   assert.equal(example.browserProfileMode, 'source');
   assert.equal(example.browserProfileName, 'Default');
   assert.ok(Object.hasOwn(example, 'browserProfileDir'));
+  assert.equal(example.firefoxFallbackEnabled, true);
+  assert.ok(Object.hasOwn(example, 'firefoxProfileDir'));
 });
 
 test('recent source profile lock remains a fail-closed blocker', async (t) => {

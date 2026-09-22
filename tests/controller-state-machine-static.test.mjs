@@ -612,6 +612,21 @@ test('controller CDP reconnect attempts do not block for a full minute', () => {
   assert.match(controller, /profileDirectoryName: config\.browserProfileName \|\| 'Default'/);
 });
 
+test('Firefox fallback is explicit, bounded, visible, and isolated from Chromium profiles', () => {
+  assert.match(browserRuntime, /import \{ chromium, firefox \} from 'playwright-core'/);
+  assert.match(browserRuntime, /firefoxFallbackEnabled = false/);
+  assert.match(browserRuntime, /discoverFirefoxCandidates/);
+  assert.match(browserRuntime, /validateFirefoxProfileDirectory/);
+  assert.match(browserRuntime, /transport: 'persistent-firefox'/);
+  assert.match(browserRuntime, /headless: false/);
+  assert.match(browserRuntime, /R433-Firefox-Fallback/);
+  assert.match(controller, /firefoxFallbackEnabled: profile\.firefoxFallbackEnabled/);
+  assert.match(controller, /firefoxProfileDir: profile\.firefoxProfileDir/);
+  assert.match(controller, /runtime\.transport === 'persistent-firefox'/);
+  assert.match(controller, /profileMode === 'firefox'/);
+  assert.match(controller, /closed owned Firefox fallback/);
+});
+
 test('interrupted WRITE_RECOVERY generation is retried after a short bounded grace', () => {
   assert.match(controller, /function lostWriteRecoveryRetryReady/);
   assert.match(controller, /responseAction\.kind !== 'WRITE_RECOVERY'/);

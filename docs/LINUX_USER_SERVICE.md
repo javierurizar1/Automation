@@ -10,6 +10,8 @@ The installer copies units to `~/.config/systemd/user`, enables the visible pers
 
 The installer also copies `r433-fallback-chrome.service` without enabling it. When the source browser is unavailable, start this bounded fallback explicitly with `systemctl --user start r433-fallback-chrome.service`. It uses CDP 9334 and the persistent dedicated profile `~/.config/R433-Chrome-Fallback`, waits for the same local HTTP bootstrap endpoint, and leaves navigation to ChatGPT to the controller after attach.
 
+The controller has a final Firefox fallback when `firefoxFallbackEnabled` is enabled (the production default). It discovers the installed Firefox executable, checks the dedicated `~/.config/R433-Firefox-Fallback` profile for ownership, and launches a visible persistent Playwright context on the local bootstrap page. The Firefox profile is separate from every Chromium profile; a profile ownership conflict is reported as a bounded browser recovery condition.
+
 ## Recovery behavior
 
 The watchdog timer runs once per 30 seconds after a 60-second boot grace period. It reads the controller heartbeat, process identity, systemd unit state, desired control state, and browser connection health. It does not read or edit registry results, case data, source packs, reviewer conversations, or bucket state.

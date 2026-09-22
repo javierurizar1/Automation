@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright-core';
+import { chromium, firefox } from 'playwright-core';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 45000;
@@ -66,6 +66,21 @@ function browserFamily(value) {
   if (basename.includes('msedge') || basename.includes('edge')) return 'edge';
   if (basename.includes('chrome')) return 'chrome';
   return null;
+}
+
+function isFirefoxExecutable(candidate) {
+  return /(?:^|[-_.])firefox(?:$|[-_.])/i.test(path.basename(String(candidate || '')));
+}
+
+function defaultFirefoxProfileDirectory({ platform = process.platform, env = process.env } = {}) {
+  const home = env.HOME || env.USERPROFILE;
+  if (!home) return path.join(process.cwd(), 'data', 'firefox-profile');
+  if (platform === 'darwin') return path.join(home, 'Library', 'Application Support', 'R433-Firefox-Fallback');
+  if (platform === 'win32') {
+    const local = env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+    return path.join(local, 'R433-Firefox-Fallback');
+  }
+  return path.join(env.XDG_CONFIG_HOME || path.join(home, '.config'), 'R433-Firefox-Fallback');
 }
 
 const BROWSER_PROFILE_MODES = new Set(['source', 'clone']);
@@ -433,6 +448,55 @@ export function validateSourceBrowserProfile({
   };
 }
 
+/**
+ * Validate the dedicated Firefox fallback profile without creating or
+ * mutating it. Firefox uses parent.lock rather than Chromium's SingletonLock.
+ * A live owner is rejected so a human Firefox session is never joined or
+ * overwritten by the automation fallback.
+ */
+export function validateFirefoxProfileDirectory({
+  profileDir,
+  platform = process.platform,
+  procRoot = '/proc',
+} = {}) {
+  if (!profileDir) throw codedError('FIREFOX_PROFILE_UNCONFIGURED', 'Firefox fallback profile directory is required');
+  const resolved = path.resolve(profileDir);
+  const lockNames = platform === 'win32' ? ['parent.lock', 'lock'] : ['parent.lock', '.parentlock', 'lock'];
+  if (lockNames.some(name => fs.existsSync(path.join(resolved, name)))) {
+    throw codedError('FIREFOX_PROFILE_IN_USE', 'Firefox fallback profile has an active ownership lock');
+  }
+  if (platform === 'linux') {
+    let entries;
+    try {
+      entries = fs.readdirSync(procRoot).filter(entry => /^\d+$/.test(entry));
+    } catch (error) {
+      throw codedError('FIREFOX_PROFILE_UNVERIFIED', `Firefox profile ownership could not be checked: ${error.message || error}`);
+    }
+    if (entries.length > 4096) throw codedError('FIREFOX_PROFILE_UNVERIFIED', 'process table exceeds safe inspection limit');
+    for (const entry of entries) {
+      if (Number(entry) === process.pid) continue;
+      let commandLine;
+      try {
+        commandLine = fs.readFileSync(path.join(procRoot, entry, 'cmdline'))
+          .toString('utf8').split('\0').filter(Boolean);
+      } catch (error) {
+        if (error.code !== 'ENOENT') continue;
+        continue;
+      }
+      const hasProfile = commandLine.some((argument, index) => {
+        if ((argument === '-profile' || argument === '--profile') && commandLine[index + 1]) {
+          return samePath(commandLine[index + 1], resolved);
+        }
+        return argument.startsWith('-profile=') && samePath(argument.slice('-profile='.length), resolved);
+      });
+      if (hasProfile) {
+        throw codedError('FIREFOX_PROFILE_IN_USE', `Firefox fallback profile is in use by process ${entry}`);
+      }
+    }
+  }
+  return { profileDir: resolved, profileMode: 'firefox' };
+}
+
 /** Copy an authenticated default browser profile once into the ignored local automation profile. */
 export async function bootstrapAutomationProfile({
   profileDir,
@@ -594,6 +658,47 @@ export function discoverChromiumCandidates({
   }).slice(0, MAX_CANDIDATES);
 }
 
+/** Return installed Firefox executables in deterministic preference order. */
+export function discoverFirefoxCandidates({
+  preferredExecutable = null,
+  candidateExecutables = [],
+  platform = process.platform,
+  env = process.env,
+  lookupTimeoutMs = 2500,
+} = {}) {
+  const commandNames = platform === 'win32' ? ['firefox.exe'] : ['firefox', 'firefox-esr'];
+  let pathCandidates = [];
+  try {
+    const locator = platform === 'win32' ? 'where.exe' : 'which';
+    const result = spawnSync(locator, platform === 'win32' ? commandNames : ['-a', ...commandNames], {
+      encoding: 'utf8',
+      timeout: boundedMs(lookupTimeoutMs, 2500, 5000),
+      windowsHide: true,
+      env,
+    });
+    if (result.status === 0) {
+      pathCandidates = String(result.stdout || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    }
+  } catch {}
+
+  const knownPaths = platform === 'win32'
+    ? [
+      path.join(env.PROGRAMFILES || '', 'Mozilla Firefox', 'firefox.exe'),
+      path.join(env['PROGRAMFILES(X86)'] || '', 'Mozilla Firefox', 'firefox.exe'),
+    ]
+    : platform === 'darwin'
+      ? ['/Applications/Firefox.app/Contents/MacOS/firefox']
+      : ['/usr/bin/firefox', '/usr/bin/firefox-esr', '/usr/local/bin/firefox'];
+  const ordered = unique([preferredExecutable, ...candidateExecutables, ...knownPaths, ...pathCandidates]);
+  return ordered.filter(candidate => {
+    if (!isFirefoxExecutable(candidate)) return false;
+    if (candidate.includes(path.sep) || (platform === 'win32' && candidate.includes('/'))) {
+      try { return fs.statSync(candidate).isFile(); } catch { return false; }
+    }
+    return true;
+  }).slice(0, MAX_CANDIDATES);
+}
+
 function codedError(code, message, attempts = []) {
   const error = new Error(message);
   error.code = code;
@@ -713,6 +818,11 @@ export async function connectOrLaunchBrowser({
   candidateExecutables = [],
   profileDirectoryName = null,
   playwrightChromium = chromium,
+  playwrightFirefox = firefox,
+  firefoxExecutable = null,
+  firefoxCandidates = [],
+  firefoxProfileDir = null,
+  firefoxFallbackEnabled = false,
   platform = process.platform,
   env = process.env,
 } = {}) {
@@ -747,9 +857,7 @@ export async function connectOrLaunchBrowser({
   }
 
   const candidates = discoverChromiumCandidates({ preferredExecutable, candidateExecutables, platform, env });
-  if (!candidates.length) {
-    throw codedError('BROWSER_UNAVAILABLE', 'No existing CDP session or installed supported Chromium browser was found', attempts);
-  }
+  if (!candidates.length) attempts.push({ phase: 'chromium-discovery', error: 'No installed supported Chromium browser was found' });
 
   // Match the historical Start-Controller profile location unless an explicit
   // profile is configured. Source mode never clears, recreates, or rotates
@@ -765,6 +873,7 @@ export async function connectOrLaunchBrowser({
   }
   let launchProfileDir = persistentProfileDir;
   let launchProfileName = selectedProfileDirectoryName || 'Default';
+  let sourceProfileError = null;
   if (selectedProfileMode === 'source') {
     try {
       const source = validateSourceBrowserProfile({
@@ -780,9 +889,9 @@ export async function connectOrLaunchBrowser({
       if (error?.code === 'BROWSER_PROFILE_MODE_INVALID'
         || error?.code === 'BROWSER_PROFILE_UNCONFIGURED'
         || error?.code === 'BROWSER_PROFILE_NAME_INVALID'
-        || error?.code === 'BROWSER_PROFILE_IN_USE'
-        || error?.code === 'BROWSER_PROFILE_SOURCE_INVALID') throw error;
-      throw codedError('BROWSER_UNAVAILABLE', `Persistent source browser profile is unavailable: ${error.message || error}`, attempts);
+        || !firefoxFallbackEnabled) throw error;
+      sourceProfileError = error;
+      attempts.push({ phase: 'source-profile-validation', error: error.message || String(error) });
     }
   } else {
     try {
@@ -822,7 +931,10 @@ export async function connectOrLaunchBrowser({
   // a fresh visible page and avoids waiting on a malformed already-loaded CRPage
   // target. Source mode is intentionally the only mode eligible for this path:
   // it never races an external profile owner and never deletes profile files.
-  if (selectedProfileMode === 'source' && typeof playwrightChromium?.launchPersistentContext === 'function') {
+  if (!sourceProfileError
+    && candidates.length
+    && selectedProfileMode === 'source'
+    && typeof playwrightChromium?.launchPersistentContext === 'function') {
     for (const executable of candidates) {
       const persistentArgs = [
         `--profile-directory=${launchProfileName}`,
@@ -867,51 +979,118 @@ export async function connectOrLaunchBrowser({
     }
   }
 
-  for (const executable of candidates) {
-    const args = [
-      `--remote-debugging-port=${port}`,
-      `--user-data-dir=${launchProfileDir}`,
-      ...(launchProfileName ? [`--profile-directory=${launchProfileName}`] : []),
-      '--no-first-run',
-      '--no-default-browser-check',
-      AUTOMATION_BOOTSTRAP_URL,
-    ];
-    let child;
-    try {
-      child = spawn(executable, args, { stdio: 'ignore', windowsHide: true, detached: true, env });
-      child.__codexDetached = true;
-    } catch (error) {
-      attempts.push({ phase: 'browser-launch', executable, error: error.message || String(error) });
-      continue;
-    }
-    const spawnError = new Promise(resolve => child.once('error', resolve));
-    const deadline = Date.now() + startupMs;
-    try {
-      const attached = await Promise.race([
-        waitForCdp(playwrightChromium, endpoint, child, deadline, retryMs, connectMs, attempts),
-        spawnError.then(error => { throw error; }),
-      ]);
-      return {
-        ...attached,
-        executable,
-        pid: child.pid || null,
-        endpoint,
-        launched: true,
-        profileDir: launchProfileDir,
-        profileDirectoryName: launchProfileName,
-        profileMode: selectedProfileMode,
-      };
-    } catch (error) {
-      attempts.push({ phase: 'browser-startup', executable, error: error.message || String(error) });
-      const stopped = await terminateOwnedProcess(child);
-      if (stopped && selectedProfileMode === 'clone') {
-        try { removeDestinationEphemeralFiles(launchProfileDir, launchProfileName || 'Default'); } catch (cleanupError) {
-          attempts.push({ phase: 'browser-cleanup', executable, error: cleanupError.message || String(cleanupError) });
+  if (!sourceProfileError || selectedProfileMode === 'clone') {
+    for (const executable of candidates) {
+      const args = [
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${launchProfileDir}`,
+        ...(launchProfileName ? [`--profile-directory=${launchProfileName}`] : []),
+        '--no-first-run',
+        '--no-default-browser-check',
+        AUTOMATION_BOOTSTRAP_URL,
+      ];
+      let child;
+      try {
+        child = spawn(executable, args, { stdio: 'ignore', windowsHide: true, detached: true, env });
+        child.__codexDetached = true;
+      } catch (error) {
+        attempts.push({ phase: 'browser-launch', executable, error: error.message || String(error) });
+        continue;
+      }
+      const spawnError = new Promise(resolve => child.once('error', resolve));
+      const deadline = Date.now() + startupMs;
+      try {
+        const attached = await Promise.race([
+          waitForCdp(playwrightChromium, endpoint, child, deadline, retryMs, connectMs, attempts),
+          spawnError.then(error => { throw error; }),
+        ]);
+        return {
+          ...attached,
+          executable,
+          pid: child.pid || null,
+          endpoint,
+          launched: true,
+          profileDir: launchProfileDir,
+          profileDirectoryName: launchProfileName,
+          profileMode: selectedProfileMode,
+        };
+      } catch (error) {
+        attempts.push({ phase: 'browser-startup', executable, error: error.message || String(error) });
+        const stopped = await terminateOwnedProcess(child);
+        if (stopped && selectedProfileMode === 'clone') {
+          try { removeDestinationEphemeralFiles(launchProfileDir, launchProfileName || 'Default'); } catch (cleanupError) {
+            attempts.push({ phase: 'browser-cleanup', executable, error: cleanupError.message || String(cleanupError) });
+          }
+        }
+        if (!stopped) {
+          attempts.push({ phase: 'browser-cleanup', executable, error: 'failed browser process did not exit within cleanup deadline' });
+          break;
         }
       }
-      if (!stopped) {
-        attempts.push({ phase: 'browser-cleanup', executable, error: 'failed browser process did not exit within cleanup deadline' });
-        break;
+    }
+  }
+
+  // Firefox is a final, explicit fallback. It uses a dedicated persistent
+  // profile because Firefox cannot consume a Chromium user-data directory.
+  // The profile is checked for ownership before it is created or opened, and
+  // no Chromium profile or process is touched by this path.
+  if (firefoxFallbackEnabled && typeof playwrightFirefox?.launchPersistentContext === 'function') {
+    const firefoxProfile = path.resolve(firefoxProfileDir || defaultFirefoxProfileDirectory({ platform, env }));
+    const firefoxBrowserCandidates = discoverFirefoxCandidates({
+      preferredExecutable: firefoxExecutable,
+      candidateExecutables: firefoxCandidates,
+      platform,
+      env,
+    });
+    if (!firefoxBrowserCandidates.length) {
+      attempts.push({ phase: 'firefox-discovery', error: 'No installed Firefox browser was found' });
+    } else {
+      try {
+        if (samePath(firefoxProfile, persistentProfileDir)) {
+          throw codedError('FIREFOX_PROFILE_CONFLICT', 'Firefox fallback profile must be separate from the Chromium profile');
+        }
+        validateFirefoxProfileDirectory({ profileDir: firefoxProfile, platform });
+        fs.mkdirSync(firefoxProfile, { recursive: true });
+      } catch (error) {
+        attempts.push({ phase: 'firefox-profile-validation', error: error.message || String(error) });
+      }
+      if (!attempts.some(attempt => attempt.phase === 'firefox-profile-validation')) {
+        for (const executable of firefoxBrowserCandidates) {
+          try {
+            const context = await launchPersistentContextBounded(
+              playwrightFirefox,
+              firefoxProfile,
+              {
+                headless: false,
+                executablePath: executable,
+                timeout: startupMs,
+                viewport: null,
+                args: [AUTOMATION_BOOTSTRAP_URL],
+                env,
+              },
+              startupMs,
+            );
+            const browser = context?.browser?.() || null;
+            if (!context || !browser) {
+              try { await context?.close?.(); } catch {}
+              throw new Error('Firefox persistent launch returned no browser context');
+            }
+            return {
+              browser,
+              context,
+              executable,
+              pid: null,
+              endpoint: null,
+              launched: true,
+              profileDir: firefoxProfile,
+              profileDirectoryName: null,
+              profileMode: 'firefox',
+              transport: 'persistent-firefox',
+            };
+          } catch (error) {
+            attempts.push({ phase: 'firefox-browser-launch', executable, error: error.message || String(error) });
+          }
+        }
       }
     }
   }

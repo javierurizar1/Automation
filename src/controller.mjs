@@ -138,6 +138,8 @@ function browserLaunchProfile() {
     : null;
   const braveDefaultProfile = braveUserDataDir && path.join(braveUserDataDir, 'Default');
   const hasExistingBraveProfile = Boolean(braveDefaultProfile && fs.existsSync(braveDefaultProfile));
+  const firefoxFallbackProfile = config.firefoxProfileDir
+    || (userConfigRoot ? path.join(userConfigRoot, '.config', 'R433-Firefox-Fallback') : path.join(ROOT, 'data', 'firefox-profile'));
   return {
     profileMode: config.browserProfileMode || 'source',
     profileDir: config.browserProfileDir
@@ -146,6 +148,10 @@ function browserLaunchProfile() {
       || config.browserPath
       || config.chromeExecutable
       || (hasExistingBraveProfile ? 'brave-browser' : null),
+    firefoxFallbackEnabled: config.firefoxFallbackEnabled !== false,
+    firefoxExecutable: config.firefoxExecutable || null,
+    firefoxCandidates: config.firefoxCandidates || [],
+    firefoxProfileDir: firefoxFallbackProfile,
   };
 }
 
@@ -556,6 +562,7 @@ let browserRuntimeStatus = {
   browserExecutable: null,
   browserPid: null,
   cdpEndpoint: null,
+  browserTransport: null,
   chatgptReady: false,
   authenticationRequired: false,
   coordinatorHealth: null,
@@ -582,6 +589,7 @@ let ownedBrowserProfile = {
   profileDir: null,
   profileDirectoryName: 'Default',
   profileMode: 'source',
+  context: null,
 };
 
 function cleanupOwnedBrowserProfileIfStopped() {
@@ -5028,6 +5036,7 @@ function writeStatus(extra = {}) {
     browserExecutable: browserRuntimeStatus.browserExecutable || null,
     browserPid: browserRuntimeStatus.browserPid || null,
     cdpEndpoint: browserRuntimeStatus.cdpEndpoint || null,
+    browserTransport: browserRuntimeStatus.browserTransport || null,
     chatgptReady: Boolean(browserRuntimeStatus.chatgptReady),
     authenticationRequired: Boolean(browserRuntimeStatus.authenticationRequired),
     coordinatorHealth: browserRuntimeStatus.coordinatorHealth || null,
@@ -5303,6 +5312,11 @@ async function main() {
   while (true) {
     const control = syncControlState();
     if (control.desiredState === 'STOPPED') {
+      if (ownedBrowserProfile.profileMode === 'firefox' && ownedBrowserProfile.context) {
+        try { await ownedBrowserProfile.context.close(); } catch (error) {
+          log(`unable to close owned Firefox fallback context: ${error.message || error}`);
+        }
+      }
       cleanupOwnedBrowserProfileIfStopped();
       controllerLifecycleState = 'STOPPED';
       writeStatus({ connected: false, controllerState: 'STOPPED', stopped: true, allComplete: allBucketsComplete() });
@@ -5325,6 +5339,10 @@ async function main() {
           startupTimeoutMs: config.browserStartupTimeoutMs || 15000,
           retryIntervalMs: config.browserRetryIntervalMs || 500,
           candidateExecutables: config.browserCandidates || config.browserExecutables || [],
+          firefoxFallbackEnabled: profile.firefoxFallbackEnabled,
+          firefoxExecutable: profile.firefoxExecutable,
+          firefoxCandidates: profile.firefoxCandidates,
+          firefoxProfileDir: profile.firefoxProfileDir,
         });
         browser = runtime.browser;
         context = runtime.context;
@@ -5335,12 +5353,15 @@ async function main() {
           profileDir: runtime.profileDir || null,
           profileDirectoryName: runtime.profileDirectoryName || config.browserProfileName || 'Default',
           profileMode: runtime.profileMode || profile.profileMode || 'source',
+          context: runtime.context,
         };
         browserRetryAttempt = 0;
         browserRuntimeStatus.browserConnected = true;
         browserRuntimeStatus.browserExecutable = runtime.executable || config.browserExecutable || config.browserPath || null;
         browserRuntimeStatus.browserPid = runtime.pid || null;
-        browserRuntimeStatus.cdpEndpoint = runtime.endpoint || config.cdpEndpoint || `http://127.0.0.1:${config.cdpPort}`;
+        browserRuntimeStatus.browserTransport = runtime.transport || 'cdp';
+        browserRuntimeStatus.cdpEndpoint = runtime.endpoint
+          || (runtime.transport === 'persistent-firefox' ? null : config.cdpEndpoint || `http://127.0.0.1:${config.cdpPort}`);
       }
 
       await ensureBrowserSlots(context);
@@ -5499,6 +5520,7 @@ async function main() {
       });
       controllerLifecycleState = recoveryState;
       browserRuntimeStatus.browserConnected = false;
+      browserRuntimeStatus.browserTransport = null;
       browserRuntimeStatus.coordinatorTabPresent = false;
       browserRuntimeStatus.reviewerTabCount = 0;
       browserRuntimeStatus.liveReviewerGenerations = 0;
@@ -5534,6 +5556,13 @@ async function main() {
           // navigation timeout must preserve that visible browser so an operator
           // can complete authentication and the next bounded loop can reattach.
           log('preserving launched source browser after bounded readiness failure');
+        } else if (ownedBrowserProfile.profileMode === 'firefox') {
+          try {
+            await ownedBrowserProfile.context?.close?.();
+            log('closed owned Firefox fallback after bounded readiness failure');
+          } catch (closeError) {
+            log(`unable to close owned Firefox fallback: ${closeError.message || closeError}`);
+          }
         }
       }
       cleanupOwnedBrowserProfileIfStopped();
@@ -5543,6 +5572,7 @@ async function main() {
         profileDir: null,
         profileDirectoryName: config.browserProfileName || 'Default',
         profileMode: config.browserProfileMode || 'source',
+        context: null,
       };
       browserContextRef = null;
       coordinatorPageRef = null;
