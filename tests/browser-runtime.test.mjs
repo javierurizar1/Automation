@@ -263,6 +263,63 @@ test('source profile mode launches the configured persistent profile without clo
   }
 });
 
+test('CDP attach failure falls back to a bounded visible persistent source context', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-browser-persistent-fallback-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'source-profile');
+  const browserCandidate = makeFakeBrowserExecutable(directory, 'google-chrome');
+  fs.mkdirSync(path.join(source, 'Default'), { recursive: true });
+  fs.writeFileSync(path.join(source, 'Local State'), '{}');
+  fs.writeFileSync(path.join(source, 'Default', 'Preferences'), '{}');
+  fs.writeFileSync(path.join(source, 'Default', 'Cookies'), 'authenticated-session');
+
+  let context;
+  const browser = { contexts: () => [context] };
+  context = {
+    pages: () => [],
+    browser: () => browser,
+    close: async () => {},
+  };
+  let connectCalls = 0;
+  const persistentLaunches = [];
+  const connected = await connectOrLaunchBrowser({
+    endpoint: 'http://127.0.0.1:59229',
+    preferredExecutable: browserCandidate,
+    candidateExecutables: [browserCandidate],
+    profileDir: source,
+    profileMode: 'source',
+    profileDirectoryName: 'Default',
+    connectTimeoutMs: 25,
+    startupTimeoutMs: 150,
+    retryIntervalMs: 5,
+    playwrightChromium: {
+      async connectOverCDP() {
+        connectCalls += 1;
+        throw new Error('CRPage initialization timeout');
+      },
+      async launchPersistentContext(userDataDir, options) {
+        persistentLaunches.push({ userDataDir, options });
+        return context;
+      },
+    },
+  });
+
+  assert.equal(connectCalls, 1, 'CDP attach remains the first attempt');
+  assert.equal(persistentLaunches.length, 1);
+  assert.equal(persistentLaunches[0].userDataDir, path.resolve(source));
+  assert.equal(persistentLaunches[0].options.headless, false);
+  assert.equal(persistentLaunches[0].options.executablePath, browserCandidate);
+  assert.equal(persistentLaunches[0].options.viewport, null);
+  assert.match(persistentLaunches[0].options.args.join(' '), new RegExp(AUTOMATION_BOOTSTRAP_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.doesNotMatch(persistentLaunches[0].options.args.join(' '), /about:blank/);
+  assert.equal(connected.browser, browser);
+  assert.equal(connected.context, context);
+  assert.equal(connected.transport, 'persistent');
+  assert.equal(connected.launched, true);
+  assert.equal(connected.profileMode, 'source');
+  assert.equal(connected.profileDir, path.resolve(source));
+});
+
 test('source profile mode rejects an actively owned profile before launch', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'r433-browser-source-lock-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -273,6 +330,7 @@ test('source profile mode rejects an actively owned profile before launch', asyn
   fs.writeFileSync(path.join(source, 'Default', 'Preferences'), '{}');
   fs.writeFileSync(path.join(source, 'SingletonLock'), 'owned');
   const browserCandidate = makeFakeBrowserExecutable(directory, 'brave-browser');
+  let persistentLaunchCalls = 0;
   await assert.rejects(connectOrLaunchBrowser({
     endpoint: 'http://127.0.0.1:59227',
     preferredExecutable: browserCandidate,
@@ -280,8 +338,12 @@ test('source profile mode rejects an actively owned profile before launch', asyn
     profileDir: source,
     profileMode: 'source',
     env: { ...process.env, CODEX_TEST_BROWSER_MARKER: markerPath },
-    playwrightChromium: { async connectOverCDP() { throw new Error('CDP unavailable'); } },
+    playwrightChromium: {
+      async connectOverCDP() { throw new Error('CDP unavailable'); },
+      async launchPersistentContext() { persistentLaunchCalls += 1; },
+    },
   }), error => error.code === 'BROWSER_PROFILE_IN_USE');
+  assert.equal(persistentLaunchCalls, 0, 'an active external profile is never touched by fallback');
   assert.equal(fs.existsSync(markerPath), false);
   assert.equal(fs.existsSync(path.join(source, 'SingletonLock')), true);
 });

@@ -605,6 +605,39 @@ async function connectOnce(playwrightChromium, endpoint, timeoutMs) {
   return playwrightChromium.connectOverCDP(endpoint, { timeout: timeoutMs });
 }
 
+/**
+ * Launch a visible persistent context with a finite deadline. This is the
+ * recovery path for Chromium builds whose already-loaded page cannot be
+ * adopted by Playwright's CDP transport. The promise is kept attached after
+ * a timeout so a late browser launch is closed rather than leaked.
+ */
+async function launchPersistentContextBounded(playwrightChromium, userDataDir, options, timeoutMs) {
+  const launcher = playwrightChromium?.launchPersistentContext;
+  if (typeof launcher !== 'function') {
+    throw codedError('BROWSER_PERSISTENT_UNSUPPORTED', 'Playwright persistent context launch is unavailable');
+  }
+  const boundedTimeoutMs = boundedMs(timeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 30000);
+  let timer;
+  let pending;
+  try {
+    pending = Promise.resolve().then(() => launcher.call(playwrightChromium, userDataDir, options));
+    const timeout = new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(codedError(
+        'BROWSER_STARTUP_TIMEOUT',
+        `persistent browser launch exceeded ${boundedTimeoutMs}ms`,
+      )), boundedTimeoutMs);
+    });
+    return await Promise.race([pending, timeout]);
+  } catch (error) {
+    // A Playwright launch can resolve after our deadline. Close that context
+    // when it arrives, but never touch a browser we did not launch here.
+    pending?.then(context => context?.close?.()).catch(() => {});
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function waitForCdp(playwrightChromium, endpoint, child, deadline, retryIntervalMs, connectTimeoutMs, attempts) {
   let lastError = null;
   while (Date.now() < deadline) {
@@ -782,6 +815,56 @@ export async function connectOrLaunchBrowser({
   }
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw codedError('BROWSER_UNAVAILABLE', `Invalid CDP port in endpoint: ${endpoint}`, attempts);
+  }
+
+  // CDP attach remains the first choice. If it failed after the source profile
+  // was proven idle, launchPersistentContext gives Playwright a direct pipe to
+  // a fresh visible page and avoids waiting on a malformed already-loaded CRPage
+  // target. Source mode is intentionally the only mode eligible for this path:
+  // it never races an external profile owner and never deletes profile files.
+  if (selectedProfileMode === 'source' && typeof playwrightChromium?.launchPersistentContext === 'function') {
+    for (const executable of candidates) {
+      const persistentArgs = [
+        `--profile-directory=${launchProfileName}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        AUTOMATION_BOOTSTRAP_URL,
+      ];
+      try {
+        const context = await launchPersistentContextBounded(
+          playwrightChromium,
+          launchProfileDir,
+          {
+            headless: false,
+            executablePath: executable,
+            timeout: startupMs,
+            viewport: null,
+            args: persistentArgs,
+            env,
+          },
+          startupMs,
+        );
+        const browser = context?.browser?.() || null;
+        if (!context || !browser) {
+          try { await context?.close?.(); } catch {}
+          throw new Error('persistent browser launch returned no browser context');
+        }
+        return {
+          browser,
+          context,
+          executable,
+          pid: null,
+          endpoint,
+          launched: true,
+          profileDir: launchProfileDir,
+          profileDirectoryName: launchProfileName,
+          profileMode: selectedProfileMode,
+          transport: 'persistent',
+        };
+      } catch (error) {
+        attempts.push({ phase: 'persistent-browser-launch', executable, error: error.message || String(error) });
+      }
+    }
   }
 
   for (const executable of candidates) {
