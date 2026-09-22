@@ -12,6 +12,11 @@ const DEFAULT_RETRY_INTERVAL_MS = 500;
 const MAX_CANDIDATES = 6;
 const PROFILE_COPY_TIMEOUT_MS = 30000;
 const PROFILE_BOOTSTRAP_SCRIPT = fileURLToPath(new URL('./browser-profile-bootstrap.mjs', import.meta.url));
+// Playwright waits for a first committed navigation when attaching to a
+// persistent Chromium context. An about:blank startup page never satisfies
+// that wait, so controller-launched browsers use a harmless committed data
+// page and the controller reuses it as the coordinator tab.
+export const AUTOMATION_BOOTSTRAP_URL = 'data:text/html,%3Ctitle%3ER433%20automation%20bootstrap%3C%2Ftitle%3E';
 const EPHEMERAL_PROFILE_NAMES = new Set([
   'SingletonLock', 'SingletonCookie', 'SingletonSocket', 'DevToolsActivePort', 'LOCK', 'lockfile',
 ]);
@@ -786,7 +791,7 @@ export async function connectOrLaunchBrowser({
       ...(launchProfileName ? [`--profile-directory=${launchProfileName}`] : []),
       '--no-first-run',
       '--no-default-browser-check',
-      'about:blank',
+      AUTOMATION_BOOTSTRAP_URL,
     ];
     let child;
     try {

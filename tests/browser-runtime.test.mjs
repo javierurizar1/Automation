@@ -11,6 +11,7 @@ import {
   cleanupAutomationProfileEphemeral,
   connectOrLaunchBrowser,
   discoverChromiumCandidates,
+  AUTOMATION_BOOTSTRAP_URL,
   normalizeBrowserProfileMode,
   terminateOwnedBrowserProcessGroup,
   validateSourceBrowserProfile,
@@ -135,6 +136,8 @@ test('failed preferred Brave startup falls back within bounded startup to Chromi
     const browserArgs = fs.readFileSync(argsMarkerPath, 'utf8');
     assert.match(browserArgs, /--user-data-dir=/);
     assert.match(browserArgs, /--profile-directory=Default/);
+    assert.match(browserArgs, new RegExp(AUTOMATION_BOOTSTRAP_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(browserArgs, /about:blank/);
     assert.deepEqual(fs.readFileSync(markerPath, 'utf8').trim().split(/\r?\n/), [
       'brave-browser',
       'chromium',

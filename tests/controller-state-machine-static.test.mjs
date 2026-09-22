@@ -993,3 +993,11 @@ test('a preserved source-browser profile lock stays in bounded recovery instead 
   assert.match(catchBlock, /profileMode === 'source'/);
   assert.match(catchBlock, /preserving launched source browser/);
 });
+
+test('controller adopts the committed browser bootstrap page as its coordinator', () => {
+  assert.match(controller, /AUTOMATION_BOOTSTRAP_URL/);
+  const projectPageStart = controller.indexOf('function isProjectPage(');
+  const projectPageEnd = controller.indexOf('\nfunction bucketForPageUrl', projectPageStart);
+  assert.ok(projectPageStart >= 0 && projectPageEnd > projectPageStart);
+  assert.match(controller.slice(projectPageStart, projectPageEnd), /url === AUTOMATION_BOOTSTRAP_URL/);
+});

@@ -77,6 +77,7 @@ import {
 import { ensureHighestReviewerModel, REQUIRED_REVIEWER_EFFORT, REQUIRED_REVIEWER_MODEL } from './reviewer-model.mjs';
 import { classifyReviewerHealth, ensureBrowserPageBudget, findActualGeneration } from './reviewer-tabs.mjs';
 import {
+  AUTOMATION_BOOTSTRAP_URL,
   cleanupAutomationProfileEphemeral,
   connectOrLaunchBrowser,
   terminateOwnedBrowserProcessGroup,
@@ -1394,7 +1395,7 @@ function currentPageUrl(page) {
 
 function isProjectPage(page) {
   const url = currentPageUrl(page);
-  if (url === 'about:blank') return true;
+  if (url === 'about:blank' || url === AUTOMATION_BOOTSTRAP_URL) return true;
   try {
     const pageHost = new URL(url).hostname.toLowerCase();
     const projectHost = new URL(config.projectUrl).hostname.toLowerCase();
