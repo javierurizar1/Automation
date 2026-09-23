@@ -165,6 +165,15 @@ function isSchedulingBlockedBucket(bucket) {
   return SCHEDULING_BLOCKED_BUCKETS.has(Number(bucket));
 }
 
+function desiredReviewerSlotCount(liveGenerationCount = 0) {
+  const candidates = selectReviewerSlotCandidates(state.buckets, SCHEDULING_BLOCKED_BUCKETS)
+    .filter(bucket => !state.buckets[String(bucket)]?.sourcePackCursorReconciliationRequired);
+  return Math.min(
+    MAX_REVIEWER_TABS,
+    Math.max(Number(liveGenerationCount) || 0, Math.min(MAX_REVIEWER_TABS, candidates.length)),
+  );
+}
+
 function bucketStateFor(value) {
   return getBucketState(state, value, config.bucketCount);
 }
@@ -1576,9 +1585,12 @@ async function createBoundedPage(context) {
 
 async function ensureBrowserSlots(context) {
   const currentPages = context.pages().filter(page => !page.isClosed());
+  const currentLiveGenerations = [...reviewerSlotRegistry.values()]
+    .filter(slot => slot.health?.actualGeneration).length;
+  const reviewerTargetCount = desiredReviewerSlotCount(currentLiveGenerations);
   if (browserContextRef === context
     && coordinatorPageRef && !coordinatorPageRef.isClosed()
-    && [...reviewerSlotRegistry.values()].length === MAX_REVIEWER_TABS
+    && [...reviewerSlotRegistry.values()].length === reviewerTargetCount
     && [...reviewerSlotRegistry.values()].every(slot => slot.page && !slot.page.isClosed())) {
     const existingPages = [...reviewerSlotRegistry.values()].map(slot => slot.page);
     const budget = await ensureBrowserPageBudget(context, {
@@ -1614,6 +1626,7 @@ async function ensureBrowserSlots(context) {
     error.code = 'REVIEWER_GENERATION_CAP_EXCEEDED';
     throw error;
   }
+  const targetReviewerCount = desiredReviewerSlotCount(generatingPages.length);
 
   const reviewerPages = [...generatingPages];
   const orderedBucketStates = Object.entries(state.buckets || {})
@@ -1624,12 +1637,12 @@ async function ensureBrowserSlots(context) {
       return bPinned - aPinned || Number(bucketA) - Number(bucketB);
     });
   for (const [, bucketState] of orderedBucketStates) {
-    if (reviewerPages.length >= MAX_REVIEWER_TABS) break;
+    if (reviewerPages.length >= targetReviewerCount) break;
     const match = projectPages.find(page => currentPageUrl(page).startsWith(bucketState.chatUrl));
     if (match && !reviewerPages.includes(match)) reviewerPages.push(match);
   }
   for (const page of projectPages) {
-    if (reviewerPages.length >= MAX_REVIEWER_TABS) break;
+    if (reviewerPages.length >= targetReviewerCount) break;
     if (reviewerPages.includes(page)) continue;
     const url = currentPageUrl(page);
     if (/\/c\//i.test(url)) reviewerPages.push(page);
@@ -1642,7 +1655,7 @@ async function ensureBrowserSlots(context) {
   }
   if (!coordinator) coordinator = await createBoundedPage(context);
 
-  while (reviewerPages.length < MAX_REVIEWER_TABS) {
+  while (reviewerPages.length < targetReviewerCount) {
     const reusable = projectPages.find(page => !reviewerPages.includes(page) && page !== coordinator);
     if (reusable) reviewerPages.push(reusable);
     else reviewerPages.push(await createBoundedPage(context));
