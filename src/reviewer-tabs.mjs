@@ -70,14 +70,25 @@ export async function classifyReviewerHealth(page, { timeoutMs = DEFAULT_REVIEWE
   }
 
   try {
-    const dom = await withTimeout(page.evaluate((selectors) => {
-      const visible = (element) => Boolean(element
-        && element.getClientRects().length
-        && getComputedStyle(element).visibility !== 'hidden'
-        && getComputedStyle(element).display !== 'none');
-      const stop = selectors.find((selector) => Array.from(document.querySelectorAll(selector)).some(visible)) || null;
-      const composer = Array.from(document.querySelectorAll('[role="textbox"][contenteditable="true"], #prompt-textarea'))
-        .some(visible);
+    const inspectGeneration = /\/c\/[^/]+/i.test(url);
+    const dom = await withTimeout(page.evaluate(({ selectors, inspectGeneration: checkGeneration }) => {
+      const visible = (element) => {
+        if (!element || !element.getClientRects().length) return false;
+        const style = getComputedStyle(element);
+        return style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      let stop = null;
+      if (checkGeneration) {
+        for (const selector of selectors) {
+          if (visible(document.querySelector(selector))) {
+            stop = selector;
+            break;
+          }
+        }
+      }
+      const composerElement = document.querySelector('#prompt-textarea')
+        || document.querySelector('[role="textbox"][contenteditable="true"]');
+      const composer = visible(composerElement);
       // A visible composer is enough to establish that the conversation UI is
       // ready. If it is absent, inspect text without reading innerText, which
       // forces a full-page layout and can stall Firefox on long conversations
@@ -91,7 +102,7 @@ export async function classifyReviewerHealth(page, { timeoutMs = DEFAULT_REVIEWE
         readyState: document.readyState,
         online: typeof navigator.onLine === 'boolean' ? navigator.onLine : null,
       };
-    }, GENERATION_SELECTORS), boundedTimeoutMs, 'reviewer health probe');
+    }, { selectors: GENERATION_SELECTORS, inspectGeneration }), boundedTimeoutMs, 'reviewer health probe');
     const bodyText = String(dom.bodyText || '');
     const compactText = bodyText.toLowerCase().replace(/\s+/g, ' ');
     const title = String(dom.title || '');
