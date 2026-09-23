@@ -1194,6 +1194,12 @@ async function waitForSentMarker(page, marker, timeoutMs = 15000) {
 async function sendAction(page, bucket, kind, prompt, responseHash = '') {
   assertControlRunning();
   const bucketState = state.buckets[String(bucket)];
+  if (bucketState?.chatUrl && !currentPageMatchesTarget(page, bucketState.chatUrl)) {
+    const error = new Error(`B${bucket} send blocked because the active tab does not match its recorded chat`);
+    error.code = 'REVIEWER_CHAT_URL_UNCONFIRMED';
+    error.bucket = Number(bucket);
+    throw error;
+  }
   const rolloverReason = await conversationRolloverReason(page);
   if (rolloverReason) {
     const error = new Error(rolloverReason);
@@ -2080,6 +2086,13 @@ async function ensurePage(context, bucketState) {
       throw error;
     }
     await slot.page.goto(bucketState.chatUrl, { waitUntil: 'domcontentloaded', timeout: REVIEWER_NAVIGATION_TIMEOUT_MS });
+  }
+  if (!currentPageMatchesTarget(slot.page, bucketState.chatUrl)) {
+    bucketState.lastAction = isAuthenticationPage(slot.page)
+      ? 'waiting-for-browser-auth'
+      : 'waiting-for-recorded-chat-url';
+    saveState();
+    return null;
   }
   return slot.page;
 }
@@ -5789,6 +5802,38 @@ async function main() {
           preDispatchBlockers: preDispatchEvidence.blockers,
         });
         if (desiredState === 'STOPPED') continue;
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
+      if (error?.code === 'REVIEWER_CHAT_URL_UNCONFIRMED') {
+        const bucket = String(error.bucket ?? '');
+        const bucketState = state.buckets[bucket];
+        if (bucketState) {
+          bucketState.lastAction = 'waiting-for-recorded-chat-url';
+          saveState();
+        }
+        controllerLifecycleState = 'DEGRADED';
+        preDispatchReady = false;
+        startupReconciliationComplete = false;
+        preDispatchEvidence = {
+          ready: false,
+          checkedAt: now(),
+          blockers: ['REVIEWER_CHAT_URL_UNCONFIRMED'],
+          eligibleBuckets: [],
+          bucketExclusions: bucket ? { [bucket]: 'REVIEWER_CHAT_URL_UNCONFIRMED' } : {},
+        };
+        const failure = error.message || String(error);
+        log(`B${bucket || '?'}: blocked send because the active page is not the bucket's recorded chat; draft preserved`);
+        writeStatus({
+          connected: Boolean(browser?.isConnected?.()),
+          controllerState: 'DEGRADED',
+          browserState: 'REVIEWER_CHAT_URL_UNCONFIRMED',
+          browserError: failure,
+          browserConnected: Boolean(browser?.isConnected?.()),
+          dispatchEnabled: false,
+          preDispatchReady: false,
+          preDispatchBlockers: preDispatchEvidence.blockers,
+        });
         await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
         continue;
       }
