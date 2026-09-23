@@ -168,9 +168,24 @@ function isSchedulingBlockedBucket(bucket) {
 function desiredReviewerSlotCount(liveGenerationCount = 0) {
   const candidates = selectReviewerSlotCandidates(state.buckets, SCHEDULING_BLOCKED_BUCKETS)
     .filter(bucket => !state.buckets[String(bucket)]?.sourcePackCursorReconciliationRequired);
+  const activeChats = Object.entries(state.buckets || {}).filter(([bucket, bucketState]) => (
+    !isSchedulingBlockedBucket(bucket)
+    && !bucketState.complete
+    && !bucketState.sourcePackCursorReconciliationRequired
+    && Boolean(bucketState.chatUrl)
+    && bucketState.phase !== 'HOLD'
+    && bucketState.phase !== 'COMPLETE'
+    && (bucketState.phase !== 'PAUSED'
+      || bucketState.sourcePackResumePending
+      || bucketState.awaitingResponseAt
+      || bucketState.awaitingActionId)
+  )).length;
   return Math.min(
     MAX_REVIEWER_TABS,
-    Math.max(Number(liveGenerationCount) || 0, Math.min(MAX_REVIEWER_TABS, candidates.length)),
+    Math.max(
+      Number(liveGenerationCount) || 0,
+      Math.min(MAX_REVIEWER_TABS, Math.max(candidates.length, activeChats)),
+    ),
   );
 }
 
