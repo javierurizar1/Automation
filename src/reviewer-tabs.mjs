@@ -206,7 +206,7 @@ export async function ensureBrowserPageBudget(context, {
   }
   const missing = unique.some(page => !openPages.includes(page));
   const automationTabCount = unique.length;
-  const reviewerTabCount = new Set(reviewers.filter(page => page !== coordinatorPage)).size;
+  const reviewerTabCount = new Set(reviewers).size;
   let reason = null;
   if (missing) reason = 'one or more owned pages are not present in the browser context';
   else if (reviewerTabCount > maxReviewerTabs) reason = `reviewer tab cap exceeded (${reviewerTabCount}/${maxReviewerTabs})`;

@@ -1584,6 +1584,11 @@ function bucketForPageUrl(url) {
   return null;
 }
 
+function coordinatorPageIsReviewer() {
+  return Boolean(coordinatorPageRef
+    && [...reviewerSlotRegistry.values()].some(slot => slot.page === coordinatorPageRef));
+}
+
 async function createBoundedPage(context) {
   const pending = Promise.resolve().then(() => context.newPage());
   try {
@@ -1621,7 +1626,8 @@ async function ensureBrowserSlots(context) {
     }
     const coordinatorHealth = await classifyReviewerHealth(coordinatorPageRef, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
     browserRuntimeStatus.coordinatorHealth = coordinatorHealth;
-    browserRuntimeStatus.chatgptReady = coordinatorHealth.state === 'HEALTHY';
+    browserRuntimeStatus.chatgptReady = coordinatorHealth.state === 'HEALTHY'
+      || (coordinatorHealth.state === 'GENERATING' && coordinatorPageIsReviewer());
     browserRuntimeStatus.authenticationRequired = coordinatorHealth.state === 'AUTH_REQUIRED';
     return;
   }
@@ -1672,8 +1678,24 @@ async function ensureBrowserSlots(context) {
 
   while (reviewerPages.length < targetReviewerCount) {
     const reusable = projectPages.find(page => !reviewerPages.includes(page) && page !== coordinator);
-    if (reusable) reviewerPages.push(reusable);
-    else reviewerPages.push(await createBoundedPage(context));
+    if (reusable) {
+      reviewerPages.push(reusable);
+      continue;
+    }
+    try {
+      reviewerPages.push(await createBoundedPage(context));
+    } catch (error) {
+      if (error?.code !== 'BROWSER_PAGE_CREATE_TIMEOUT'
+        || targetReviewerCount !== 1
+        || reviewerPages.length !== 0
+        || !coordinator
+        || healthByPage.get(coordinator)?.actualGeneration) throw error;
+      // Firefox can expose its authenticated page while stalling when asked
+      // to create a second tab. With exactly one reviewer slot needed, share
+      // the coordinator page instead of restarting the browser.
+      reviewerPages.push(coordinator);
+      log('Firefox reviewer tab creation timed out; sharing the coordinator tab for the sole reviewer slot');
+    }
   }
 
   if (!currentPageUrl(coordinator).startsWith(config.projectUrl)) {
@@ -1742,7 +1764,8 @@ async function ensureBrowserSlots(context) {
   }
   browserRuntimeStatus.coordinatorTabPresent = true;
   browserRuntimeStatus.coordinatorHealth = coordinatorHealth;
-  browserRuntimeStatus.chatgptReady = coordinatorHealth.state === 'HEALTHY';
+  browserRuntimeStatus.chatgptReady = coordinatorHealth.state === 'HEALTHY'
+    || (coordinatorHealth.state === 'GENERATING' && coordinatorPageIsReviewer());
   browserRuntimeStatus.authenticationRequired = coordinatorHealth.state === 'AUTH_REQUIRED';
   browserRuntimeStatus.reviewerTabCount = budget.reviewerTabCount;
   browserRuntimeStatus.automationTabCount = budget.automationTabCount;
@@ -1831,9 +1854,13 @@ async function refreshReviewerSlotStatus() {
     });
   }
   browserRuntimeStatus.coordinatorTabPresent = Boolean(coordinatorPageRef && !coordinatorPageRef.isClosed());
-  browserRuntimeStatus.reviewerTabCount = slots.filter(slot => slot.present).length;
-  browserRuntimeStatus.automationTabCount = Number(browserRuntimeStatus.reviewerTabCount)
-    + Number(browserRuntimeStatus.coordinatorTabPresent);
+  browserRuntimeStatus.reviewerTabCount = new Set(
+    [...reviewerSlotRegistry.values()].filter(slot => slot.page && !slot.page.isClosed()).map(slot => slot.page),
+  ).size;
+  browserRuntimeStatus.automationTabCount = new Set([
+    coordinatorPageRef,
+    ...[...reviewerSlotRegistry.values()].map(slot => slot.page),
+  ].filter(page => page && !page.isClosed())).size;
   browserRuntimeStatus.liveReviewerGenerations = liveReviewerGenerations;
   browserRuntimeStatus.reviewerSlots = slots;
   return slots;
