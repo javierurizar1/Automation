@@ -1674,7 +1674,25 @@ async function ensureBrowserSlots(context) {
   if (!coordinator && projectPages.length > reviewerPages.length) {
     coordinator = projectPages.find(page => !selected.has(page)) || null;
   }
+  if (!coordinator
+    && targetReviewerCount === 1
+    && reviewerPages.length === 1
+    && projectPages.length === 1) {
+    coordinator = reviewerPages[0];
+  }
   if (!coordinator) coordinator = await createBoundedPage(context);
+
+  if (targetReviewerCount === 1
+    && reviewerPages.length === 0
+    && coordinator
+    && projectPages.length === 1
+    && projectPages[0] === coordinator) {
+    // When only one bucket is eligible, the signed-in ChatGPT landing tab can
+    // serve as its reviewer page too. This avoids a second Firefox tab, which
+    // has repeatedly stalled before loading the existing conversation.
+    reviewerPages.push(coordinator);
+    log('using the signed-in coordinator tab for the sole reviewer slot');
+  }
 
   while (reviewerPages.length < targetReviewerCount) {
     const reusable = projectPages.find(page => !reviewerPages.includes(page) && page !== coordinator);
