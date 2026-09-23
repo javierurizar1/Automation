@@ -76,9 +76,13 @@ export async function classifyReviewerHealth(page, { timeoutMs = DEFAULT_REVIEWE
         && getComputedStyle(element).visibility !== 'hidden'
         && getComputedStyle(element).display !== 'none');
       const stop = selectors.find((selector) => Array.from(document.querySelectorAll(selector)).some(visible)) || null;
-      const bodyText = String(document.body?.innerText || '').slice(0, 12000);
       const composer = Array.from(document.querySelectorAll('[role="textbox"][contenteditable="true"], #prompt-textarea'))
         .some(visible);
+      // A visible composer is enough to establish that the conversation UI is
+      // ready. If it is absent, inspect text without reading innerText, which
+      // forces a full-page layout and can stall Firefox on long conversations
+      // or partially loaded pages before the bounded health probe can finish.
+      const bodyText = composer ? '' : String(document.body?.textContent || '').slice(0, 12000);
       return {
         stopSelector: stop,
         bodyText,

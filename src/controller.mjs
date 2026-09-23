@@ -908,7 +908,7 @@ function isolatedAnomalyContinuationPrompt(bucket) {
   return `Continue Bucket ${bucket} without allowing the previously reported isolated anomaly to freeze the whole bucket. The prior turn reported WRITES_VERIFIED: YES and requested coordinator attention for an anomaly that must not cause an already-terminal registry row to be rewritten. Preserve every existing terminal registry row exactly as-is, including any anomalous or disputed mapping described in the prior response; do not overwrite, relabel, or re-audit that terminalized case merely to reconcile the anomaly. Continue from the next eligible pending owned stable_id and process as many additional cases as this turn can safely complete. If the anomaly truly prevents identifying or processing later eligible cases, return a specific non-NONE blocker describing exactly what is blocked and set TRIGGER_COORDINATOR: YES. Otherwise continue normally and use TRIGGER_COORDINATOR: NO. Persist and readback-verify every new result and end with the required strict six-line AUDIT_TURN_STATUS footer.`;
 }
 
-async function readVisibleMessages(page) {
+async function readVisibleMessages(page, timeoutMs = 15000) {
   return withPageProbeTimeout(page.evaluate(() => {
     const attributedNodes = [...document.querySelectorAll('[data-message-author-role]')];
     if (attributedNodes.length) {
@@ -954,11 +954,11 @@ async function readVisibleMessages(page) {
         text,
       };
     }).filter(Boolean);
-  }), 'readVisibleMessages');
+  }), 'readVisibleMessages', timeoutMs);
 }
 
-async function latestMessage(page, role) {
-  const messages = await readVisibleMessages(page);
+async function latestMessage(page, role, timeoutMs = 15000) {
+  const messages = await readVisibleMessages(page, timeoutMs);
   const matches = messages.filter(message => message.role === role);
   return matches.length ? matches[matches.length - 1].text : '';
 }
@@ -973,17 +973,21 @@ const COMPOSER_SELECTOR = '[role="textbox"][contenteditable="true"], #prompt-tex
 const COMPOSER_LOCATOR_SELECTOR =
   '[role="textbox"][contenteditable="true"]:visible, #prompt-textarea:visible';
 
-async function composerText(page) {
+async function composerText(page, timeoutMs = PAGE_PROBE_TIMEOUT_MS) {
   return withPageProbeTimeout(page.evaluate((selector) => {
     const el = Array.from(document.querySelectorAll(selector))
       .find((candidate) => candidate.getClientRects().length > 0);
     if (!el) return '';
     return (el.innerText || el.textContent || el.value || '').trim();
-  }, COMPOSER_SELECTOR), 'composerText');
+  }, COMPOSER_SELECTOR), 'composerText', timeoutMs);
 }
 
-const PAGE_PROBE_TIMEOUT_MS = 5000;
+const PAGE_PROBE_TIMEOUT_MS = 15000;
 const PAGE_PROBE_STALL_THRESHOLD = 3;
+const SEND_UI_INTERACTION_TIMEOUT_MS = 4000;
+const REVIEWER_HEALTH_PROBE_TIMEOUT_MS = 15000;
+const REVIEWER_NAVIGATION_TIMEOUT_MS = 30000;
+const REVIEWER_PAGE_CREATION_TIMEOUT_MS = 30000;
 const pageProbeTimeoutCounts = new WeakMap();
 const GENERATION_STOP_SELECTORS = [
   'button[data-testid="stop-button"]',
@@ -1009,17 +1013,14 @@ function withPageProbeTimeout(promise, label, timeoutMs = PAGE_PROBE_TIMEOUT_MS)
 
 async function isGenerating(page) {
   try {
-    const generating = await withPageProbeTimeout((async () => {
-      for (const selector of GENERATION_STOP_SELECTORS) {
-        const locator = page.locator(selector).first();
-        if (await locator.count()) {
-          try {
-            if (await locator.isVisible()) return true;
-          } catch {}
-        }
-      }
-      return false;
-    })(), 'isGenerating');
+    const generating = await withPageProbeTimeout(page.evaluate((selectors) => {
+      const visible = element => {
+        if (!element || !element.getClientRects().length) return false;
+        const style = getComputedStyle(element);
+        return style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      return selectors.some(selector => Array.from(document.querySelectorAll(selector)).some(visible));
+    }, GENERATION_STOP_SELECTORS), 'isGenerating', REVIEWER_HEALTH_PROBE_TIMEOUT_MS);
     pageProbeTimeoutCounts.delete(page);
     return generating;
   } catch (error) {
@@ -1068,7 +1069,14 @@ async function conversationRolloverReason(page) {
 
 async function fillComposer(page, text) {
   const composer = page.locator(COMPOSER_LOCATOR_SELECTOR).first();
-  await composer.waitFor({ state: 'visible', timeout: 20000 });
+  try {
+    await composer.waitFor({ state: 'visible', timeout: 20000 });
+  } catch (cause) {
+    const error = new Error(`reviewer composer did not become visible: ${cause.message || cause}`);
+    error.code = 'REVIEWER_COMPOSER_UNAVAILABLE';
+    error.cause = cause;
+    throw error;
+  }
   try {
     await composer.fill(text);
   } catch {
@@ -1088,38 +1096,60 @@ async function fillComposer(page, text) {
   }
 }
 
-async function pressSend(page) {
+async function pressSend(page, marker) {
   assertControlRunning();
   const composer = page.locator(COMPOSER_LOCATOR_SELECTOR).first();
-  const before = await composerText(page);
+  const before = await composerText(page, SEND_UI_INTERACTION_TIMEOUT_MS);
+  if (!before || !before.includes(marker)) {
+    const error = new Error('the expected action marker is not present in the composer');
+    error.code = 'REVIEWER_SEND_INTERACTION_FAILED';
+    throw error;
+  }
   const button = page.locator('button[data-testid="send-button"]:visible, button[aria-label="Send"]:visible').first();
-  if (await button.count()) {
-    try {
-      if (await button.isVisible() && await button.isEnabled()) {
-        assertControlRunning();
-        await button.click();
-        await sleep(1200);
-        const afterClick = await composerText(page);
-        if (!afterClick || afterClick !== before) return;
-      }
-    } catch {}
+  let interactionError = null;
+  try {
+    if (await button.count() && await button.isVisible() && await button.isEnabled()) {
+      assertControlRunning();
+      await button.click({ timeout: SEND_UI_INTERACTION_TIMEOUT_MS });
+      await sleep(500);
+    }
+  } catch (error) {
+    interactionError = error;
   }
 
-  // Some current project pages accept the draft but intermittently ignore the
-  // send-button click. Focused Enter remains the native chat submission path.
+  // Only use Enter as a fallback when the first submit left the exact action
+  // marker in the composer. This avoids submitting an already accepted action
+  // twice after a slow project-page response.
+  let latestUser = '';
+  try {
+    latestUser = await latestMessage(page, 'user', SEND_UI_INTERACTION_TIMEOUT_MS);
+  } catch (error) {
+    if (isBrowserDisconnectedError(error)) throw error;
+    interactionError ||= error;
+  }
+  if (latestUser.includes(marker)) return;
+  let afterClick = '';
+  try {
+    afterClick = await composerText(page, SEND_UI_INTERACTION_TIMEOUT_MS);
+  } catch (error) {
+    if (isBrowserDisconnectedError(error)) throw error;
+    interactionError ||= error;
+  }
+  if (!afterClick || afterClick !== before) return;
+
   assertControlRunning();
-  await composer.focus();
-  await composer.press('Enter');
-  await sleep(1200);
-
-  const afterEnter = await composerText(page);
-  if (!afterEnter || afterEnter !== before) return;
-
-  // Final fallback for pages where the button's React handler is mounted but
-  // the pointer click is swallowed by the project shell.
-  if (await button.count()) {
-    assertControlRunning();
-    await button.dispatchEvent('click');
+  try {
+    await composer.press('Enter', { timeout: SEND_UI_INTERACTION_TIMEOUT_MS });
+  } catch (error) {
+    if (isBrowserDisconnectedError(error)) throw error;
+    interactionError ||= error;
+  }
+  await sleep(500);
+  if (interactionError) {
+    const error = new Error(`reviewer send interaction did not complete: ${interactionError.message || interactionError}`);
+    error.code = 'REVIEWER_SEND_INTERACTION_FAILED';
+    error.cause = interactionError;
+    throw error;
   }
 }
 
@@ -1130,7 +1160,7 @@ function actionMarker(id) {
 async function waitForSentMarker(page, marker, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const latestUser = await latestMessage(page, 'user');
+    const latestUser = await latestMessage(page, 'user', Math.min(5000, Math.max(500, deadline - Date.now())));
     if (latestUser.includes(marker)) return true;
     await sleep(500);
   }
@@ -1242,29 +1272,62 @@ async function sendAction(page, bucket, kind, prompt, responseHash = '') {
     return id;
   }
 
+  const priorModelVerification = bucketState.reviewerModelVerification;
+  const currentChatId = String(bucketState.chatId || '');
+  const reuseVerifiedChatModel = Boolean(
+    currentChatId
+    && bucketState.setupVerified
+    && String(bucketState.setupVerifiedChatId || '') === currentChatId
+    && String(priorModelVerification?.chatId || '') === currentChatId
+    && priorModelVerification?.model === REQUIRED_REVIEWER_MODEL
+    && priorModelVerification?.effort === REQUIRED_REVIEWER_EFFORT,
+  );
   let modelVerification;
-  try {
-    modelVerification = await ensureHighestReviewerModel(page);
-  } catch (error) {
-    if (error.code === 'REVIEWER_MODEL_UNAVAILABLE') {
-      recordIncident(
-        'REVIEWER_MODEL_UNAVAILABLE',
-        bucket,
-        'the required highest available model and High reasoning effort could not be confirmed; action was not sent',
-        { requiredModel: REQUIRED_REVIEWER_MODEL, requiredEffort: REQUIRED_REVIEWER_EFFORT },
-        { wakeCoordinator: false },
-      );
+  if (reuseVerifiedChatModel) {
+    // Model and reasoning effort are conversation-scoped. Once the setup
+    // action verified them for this exact chat, re-opening the selector on
+    // every turn is redundant and can fail after ChatGPT changes its controls
+    // from the new-chat selector to the in-conversation effort picker.
+    modelVerification = {
+      model: priorModelVerification.model,
+      effort: priorModelVerification.effort,
+    };
+    log(`B${bucket}: reusing model verification for the current setup-verified chat`);
+  } else {
+    try {
+      modelVerification = await ensureHighestReviewerModel(page);
+    } catch (error) {
+      if (error.code === 'REVIEWER_MODEL_UNAVAILABLE') {
+        recordIncident(
+          'REVIEWER_MODEL_UNAVAILABLE',
+          bucket,
+          'the required highest available model and High reasoning effort could not be confirmed; action was not sent',
+          {
+            requiredModel: REQUIRED_REVIEWER_MODEL,
+            requiredEffort: REQUIRED_REVIEWER_EFFORT,
+            verificationFailure: {
+              message: error.message || String(error),
+              cause: error.cause?.message || null,
+            },
+          },
+          { wakeCoordinator: false },
+        );
+      }
+      throw error;
     }
-    throw error;
+    bucketState.reviewerModelVerification = {
+      model: modelVerification.model,
+      effort: modelVerification.effort,
+      verifiedAt: now(),
+      actionKind: kind,
+      actionId: id,
+      chatId: bucketState.chatId || null,
+      chatUrl: bucketState.chatUrl || null,
+    };
+    saveState();
   }
-  bucketState.reviewerModelVerification = {
-    model: modelVerification.model,
-    effort: modelVerification.effort,
-    verifiedAt: now(),
-    actionKind: kind,
-  };
-  saveState();
 
+  let sendInteractionError = null;
   const existingDraft = await composerText(page);
   if (existingDraft) {
     if (!existingDraft.includes(marker)) {
@@ -1285,7 +1348,13 @@ async function sendAction(page, bucket, kind, prompt, responseHash = '') {
     };
     saveState();
     assertControlRunning();
-    await pressSend(page);
+    try {
+      await pressSend(page, marker);
+    } catch (error) {
+      if (['CONTROL_PAUSED', 'CONTROL_STOPPED', 'CONTROL_RECONCILIATION_ONLY'].includes(error?.code)) throw error;
+      if (isBrowserDisconnectedError(error)) throw error;
+      sendInteractionError = error;
+    }
   } else {
     state.actions[id] = {
       id,
@@ -1302,24 +1371,78 @@ async function sendAction(page, bucket, kind, prompt, responseHash = '') {
     };
     saveState();
 
-    await fillComposer(page, text);
+    try {
+      await fillComposer(page, text);
+    } catch (error) {
+      if (error?.code === 'REVIEWER_COMPOSER_UNAVAILABLE') {
+        error.bucket = bucket;
+        error.actionId = id;
+        bucketState.lastAction = 'waiting-for-chat-composer';
+        saveState();
+      }
+      throw error;
+    }
     state.actions[id].status = 'DRAFTED';
     state.actions[id].updatedAt = now();
     saveState();
 
     assertControlRunning();
-    await pressSend(page);
+    try {
+      await pressSend(page, marker);
+    } catch (error) {
+      if (['CONTROL_PAUSED', 'CONTROL_STOPPED', 'CONTROL_RECONCILIATION_ONLY'].includes(error?.code)) throw error;
+      if (isBrowserDisconnectedError(error)) throw error;
+      sendInteractionError = error;
+    }
   }
 
-  const delivered = await waitForSentMarker(page, marker, 15000);
+  let submissionError = sendInteractionError;
+  let delivered = false;
+  try {
+    delivered = await waitForSentMarker(page, marker, 15000);
+  } catch (error) {
+    if (['CONTROL_PAUSED', 'CONTROL_STOPPED', 'CONTROL_RECONCILIATION_ONLY'].includes(error?.code)) throw error;
+    if (isBrowserDisconnectedError(error)) throw error;
+    submissionError = error;
+  }
   if (!delivered) {
-    state.actions[id].status = 'DRAFTED';
-    state.actions[id].updatedAt = now();
-    state.actions[id].deliveryVerified = false;
-    saveState();
-    const error = new Error(`send action ${id} was not observed in the chat after 15 seconds`);
-    error.code = 'SEND_NOT_OBSERVED';
-    throw error;
+    let finalLatestUser = '';
+    let finalMessageRead = false;
+    let finalComposer = '';
+    let finalComposerRead = false;
+    try {
+      finalLatestUser = await latestMessage(page, 'user', SEND_UI_INTERACTION_TIMEOUT_MS);
+      finalMessageRead = true;
+    } catch (error) {
+      if (isBrowserDisconnectedError(error)) throw error;
+      submissionError ||= error;
+    }
+    if (finalLatestUser.includes(marker)) delivered = true;
+    if (!delivered) {
+      try {
+        finalComposer = await composerText(page, SEND_UI_INTERACTION_TIMEOUT_MS);
+        finalComposerRead = true;
+      } catch (error) {
+        if (isBrowserDisconnectedError(error)) throw error;
+        submissionError ||= error;
+      }
+    }
+    if (!delivered) {
+      state.actions[id].status = 'DRAFTED';
+      state.actions[id].updatedAt = now();
+      state.actions[id].deliveryVerified = false;
+      saveState();
+      const error = new Error(`send action ${id} was not observed in the chat after 15 seconds`);
+      error.code = 'SEND_NOT_OBSERVED';
+      error.bucket = bucket;
+      error.actionId = id;
+      error.deliveryState = finalMessageRead && !finalLatestUser.includes(marker)
+        && finalComposerRead && finalComposer.includes(marker)
+        ? 'DRAFT_REMAINS'
+        : 'AMBIGUOUS';
+      error.cause = submissionError;
+      throw error;
+    }
   }
 
   const sentAt = now();
@@ -1327,6 +1450,7 @@ async function sendAction(page, bucket, kind, prompt, responseHash = '') {
   state.actions[id].updatedAt = sentAt;
   state.actions[id].sentAt = sentAt;
   state.actions[id].deliveryVerified = true;
+  state.actions[id].nextRetryAt = null;
   bucketState.lastSentAt = Date.parse(sentAt);
   bucketState.lastMessageSentAt = sentAt;
   bucketState.lastMessageSentKind = kind;
@@ -1360,9 +1484,9 @@ async function inspectLiveGeneratingByBucket(context) {
   for (const slot of reviewerSlotRegistry.values()) {
     if (!slot.bucket || isSchedulingBlockedBucket(slot.bucket)) continue;
     try {
-      const generation = await findActualGeneration(slot.page, { timeoutMs: 2500 });
+      const generation = await findActualGeneration(slot.page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
       const actualGeneration = Boolean(generation.active);
-      slot.health = await classifyReviewerHealth(slot.page, { timeoutMs: 2500 });
+      slot.health = await classifyReviewerHealth(slot.page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
       liveGeneratingByBucket[slot.bucket] = actualGeneration;
     } catch {
       // An unprobeable slot is not proof of a live generation. The health
@@ -1401,6 +1525,20 @@ function currentPageUrl(page) {
   try { return String(page?.url?.() || ''); } catch { return ''; }
 }
 
+function currentPageMatchesTarget(page, targetUrl, { exactPath = false } = {}) {
+  const currentUrl = currentPageUrl(page);
+  if (!exactPath) return currentUrl.startsWith(targetUrl);
+  try {
+    const current = new URL(currentUrl);
+    const target = new URL(targetUrl);
+    const normalizedPath = value => value.replace(/\/+$/, '') || '/';
+    return current.origin === target.origin
+      && normalizedPath(current.pathname) === normalizedPath(target.pathname);
+  } catch {
+    return false;
+  }
+}
+
 function isProjectPage(page) {
   const url = currentPageUrl(page);
   if (url === AUTOMATION_BOOTSTRAP_URL) return true;
@@ -1425,12 +1563,13 @@ function bucketForPageUrl(url) {
 async function createBoundedPage(context) {
   const pending = Promise.resolve().then(() => context.newPage());
   try {
-    return await withPageProbeTimeout(pending, 'browser newPage', 10000);
+    return await withPageProbeTimeout(pending, 'browser newPage', REVIEWER_PAGE_CREATION_TIMEOUT_MS);
   } catch (error) {
     // Playwright cannot cancel a pending newPage call. Close a page if the
     // underlying call resolves after its deadline so it cannot leak tab 4.
     pending.then(page => page?.close?.({ runBeforeUnload: false })).catch(() => {});
-    error.code = error.code || 'BROWSER_PAGE_CREATE_TIMEOUT';
+    if (error?.code === 'PAGE_PROBE_TIMEOUT') error.code = 'BROWSER_PAGE_CREATE_TIMEOUT';
+    else error.code = error.code || 'BROWSER_PAGE_CREATE_TIMEOUT';
     throw error;
   }
 }
@@ -1453,7 +1592,7 @@ async function ensureBrowserSlots(context) {
       error.code = 'AUTOMATION_TAB_CAP_EXCEEDED';
       throw error;
     }
-    const coordinatorHealth = await classifyReviewerHealth(coordinatorPageRef, { timeoutMs: 2500 });
+    const coordinatorHealth = await classifyReviewerHealth(coordinatorPageRef, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
     browserRuntimeStatus.coordinatorHealth = coordinatorHealth;
     browserRuntimeStatus.chatgptReady = coordinatorHealth.state === 'HEALTHY';
     browserRuntimeStatus.authenticationRequired = coordinatorHealth.state === 'AUTH_REQUIRED';
@@ -1467,7 +1606,7 @@ async function ensureBrowserSlots(context) {
   const projectPages = currentPages.filter(isProjectPage);
   const healthByPage = new Map();
   for (const page of projectPages) {
-    healthByPage.set(page, await classifyReviewerHealth(page, { timeoutMs: 2500 }));
+    healthByPage.set(page, await classifyReviewerHealth(page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS }));
   }
   const generatingPages = projectPages.filter(page => healthByPage.get(page)?.actualGeneration);
   if (generatingPages.length > MAX_REVIEWER_TABS) {
@@ -1511,12 +1650,12 @@ async function ensureBrowserSlots(context) {
 
   if (!currentPageUrl(coordinator).startsWith(config.projectUrl)) {
     try {
-      await coordinator.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await coordinator.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: REVIEWER_NAVIGATION_TIMEOUT_MS });
     } catch (error) {
       // A normal landing page can load enough DOM for the auth marker even
       // when navigation's domcontentloaded deadline expires. Preserve that
       // visible page and let the operator authenticate instead of killing it.
-      const authHealth = await classifyReviewerHealth(coordinator, { timeoutMs: 2500 });
+      const authHealth = await classifyReviewerHealth(coordinator, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
       if (authHealth.state === 'AUTH_REQUIRED') {
         healthByPage.set(coordinator, authHealth);
       } else {
@@ -1541,7 +1680,7 @@ async function ensureBrowserSlots(context) {
     }
   }
   coordinatorPageRef = coordinator;
-  const coordinatorHealth = await classifyReviewerHealth(coordinatorPageRef, { timeoutMs: 2500 });
+  const coordinatorHealth = await classifyReviewerHealth(coordinatorPageRef, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
 
   // Retire excess known project tabs only after checking that none is carrying
   // a live generation. Conversation URLs remain durable in state and are
@@ -1549,7 +1688,7 @@ async function ensureBrowserSlots(context) {
   const keep = new Set([coordinatorPageRef, ...reviewerPages]);
   for (const page of projectPages) {
     if (keep.has(page)) continue;
-    const health = healthByPage.get(page) || await classifyReviewerHealth(page, { timeoutMs: 2500 });
+    const health = healthByPage.get(page) || await classifyReviewerHealth(page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
     if (health.actualGeneration) {
       const error = new Error('an extra project tab still has a live generation; safe tab-budget recovery is deferred');
       error.code = 'REVIEWER_GENERATION_CAP_EXCEEDED';
@@ -1600,22 +1739,23 @@ async function reviewerSlotForBucket(context, bucket, { allowUninitialized = fal
   const existing = [...reviewerSlotRegistry.values()].find(slot => slot.bucket === bucketKey);
   if (existing) {
     const targetUrl = bucketState?.chatUrl || (allowUninitialized ? config.projectUrl : null);
-    if (targetUrl && !currentPageUrl(existing.page).startsWith(targetUrl)) {
-      const health = await classifyReviewerHealth(existing.page, { timeoutMs: 2500 });
+    const targetIsLandingPage = allowUninitialized && !bucketState?.chatUrl;
+    if (targetUrl && !currentPageMatchesTarget(existing.page, targetUrl, { exactPath: targetIsLandingPage })) {
+      const health = await classifyReviewerHealth(existing.page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
       if (health.actualGeneration) {
         const error = new Error(`reviewer slot ${existing.slotId} is generating and cannot navigate to B${bucket}`);
         error.code = 'REVIEWER_SLOTS_BUSY';
         throw error;
       }
-      await existing.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await existing.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: REVIEWER_NAVIGATION_TIMEOUT_MS });
     }
-    existing.health = await classifyReviewerHealth(existing.page, { timeoutMs: 2500 });
+    existing.health = await classifyReviewerHealth(existing.page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
     return existing;
   }
 
   const candidates = [...reviewerSlotRegistry.values()];
   for (const slot of candidates) {
-    const health = await classifyReviewerHealth(slot.page, { timeoutMs: 2500 });
+    const health = await classifyReviewerHealth(slot.page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
     slot.health = health;
     if (health.actualGeneration) continue;
     const previousBucket = slot.bucket;
@@ -1628,15 +1768,16 @@ async function reviewerSlotForBucket(context, bucket, { allowUninitialized = fal
     saveState();
     const targetUrl = bucketState?.chatUrl || (allowUninitialized ? config.projectUrl : null);
     if (!targetUrl) return slot;
-    if (!currentPageUrl(slot.page).startsWith(targetUrl)) {
+    const targetIsLandingPage = allowUninitialized && !bucketState?.chatUrl;
+    if (!currentPageMatchesTarget(slot.page, targetUrl, { exactPath: targetIsLandingPage })) {
       try {
-        await slot.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await slot.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: REVIEWER_NAVIGATION_TIMEOUT_MS });
       } catch (error) {
         error.code = error.code || 'REVIEWER_PAGE_NAVIGATION_FAILED';
         throw error;
       }
     }
-    slot.health = await classifyReviewerHealth(slot.page, { timeoutMs: 2500 });
+    slot.health = await classifyReviewerHealth(slot.page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
     return slot;
   }
   const error = new Error(`both reusable reviewer slots are occupied by live generations; cannot load B${bucket}`);
@@ -1648,7 +1789,7 @@ async function refreshReviewerSlotStatus() {
   const slots = [];
   let liveReviewerGenerations = 0;
   for (const slot of reviewerSlotRegistry.values()) {
-    const health = await classifyReviewerHealth(slot.page, { timeoutMs: 2500 });
+    const health = await classifyReviewerHealth(slot.page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
     slot.health = health;
     if (health.actualGeneration) liveReviewerGenerations += 1;
     slots.push({
@@ -1859,13 +2000,13 @@ async function ensurePage(context, bucketState) {
   if (bucket === undefined) return null;
   const slot = await reviewerSlotForBucket(context, Number(bucket));
   if (!currentPageUrl(slot.page).startsWith(bucketState.chatUrl)) {
-    const health = await classifyReviewerHealth(slot.page, { timeoutMs: 2500 });
+    const health = await classifyReviewerHealth(slot.page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
     if (health.actualGeneration) {
       const error = new Error(`reviewer slot ${slot.slotId} has a live generation and cannot navigate to B${bucket}`);
       error.code = 'REVIEWER_SLOTS_BUSY';
       throw error;
     }
-    await slot.page.goto(bucketState.chatUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await slot.page.goto(bucketState.chatUrl, { waitUntil: 'domcontentloaded', timeout: REVIEWER_NAVIGATION_TIMEOUT_MS });
   }
   return slot.page;
 }
@@ -2112,7 +2253,12 @@ async function createReviewer(context, bucket) {
   try {
     slot = await reviewerSlotForBucket(context, bucket, { allowUninitialized: true });
     page = slot.page;
-    await page.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    // reviewerSlotForBucket already navigates to the landing page when needed.
+    // Repeating goto here reloads ChatGPT immediately after hydration and can
+    // leave a fresh reviewer page without its composer.
+    if (!currentPageMatchesTarget(page, config.projectUrl, { exactPath: true })) {
+      await page.goto(config.projectUrl, { waitUntil: 'domcontentloaded', timeout: REVIEWER_NAVIGATION_TIMEOUT_MS });
+    }
     slot.bucket = String(bucket);
     bucketState.reviewerSlotId = slot.slotId;
     bucketState.newChatCreation.status = 'READY_TO_SEND';
@@ -2122,16 +2268,32 @@ async function createReviewer(context, bucket) {
     throw error;
   }
 
-  if (await isGenerating(page)) {
+  const newChatHealth = await classifyReviewerHealth(page, { timeoutMs: REVIEWER_HEALTH_PROBE_TIMEOUT_MS });
+  if (newChatHealth.state === 'GENERATING' || newChatHealth.actualGeneration) {
     bucketState.newChatCreation.status = 'BUSY';
     recordIncident(
       'NEW_CHAT_BUSY',
       bucket,
       'new project chat unexpectedly shows an active generation; no setup prompt was sent',
-      { creationStatus: 'BUSY' },
+      { creationStatus: 'BUSY', healthEvidence: newChatHealth.evidence || null },
       { wakeCoordinator: false },
     );
     return;
+  }
+  if (newChatHealth.state !== 'HEALTHY') {
+    await closeUnsentReviewerPage(page, bucketState, bucket);
+    const evidence = newChatHealth.evidence || {};
+    const safeEvidence = {
+      url: evidence.url || currentPageUrl(page),
+      title: evidence.title || null,
+      readyState: evidence.readyState || null,
+      composer: evidence.composer ?? null,
+      authenticationRequired: evidence.authenticationRequired ?? null,
+      challengeMarkers: evidence.challengeMarkers || [],
+    };
+    const error = new Error(`new project chat is not ready for protocol setup: ${newChatHealth.reason}; evidence=${JSON.stringify(safeEvidence)}`);
+    error.code = 'NEW_CHAT_PAGE_NOT_READY';
+    throw error;
   }
 
   try {
@@ -2184,6 +2346,11 @@ async function createReviewer(context, bucket) {
       const chatId = match[1];
       bucketState.chatId = chatId;
       bucketState.chatUrl = url.split('?')[0];
+      if (bucketState.reviewerModelVerification?.actionKind === 'PROTOCOL_SETUP'
+        && bucketState.reviewerModelVerification.actionId === id) {
+        bucketState.reviewerModelVerification.chatId = chatId;
+        bucketState.reviewerModelVerification.chatUrl = bucketState.chatUrl;
+      }
       bucketState.newChatCreation = null;
       resetPerChatObservationState(bucketState);
       bucketState.setupVerified = false;
@@ -3086,7 +3253,9 @@ function recoverSourcePackHolds() {
 }
 
 async function sendPendingSourcePackContinuations(context) {
+  if (readControl().desiredState !== 'RUNNING' || !preDispatchReady) return;
   for (const [bucket, bucketState] of Object.entries(state.buckets).sort((a, b) => Number(a[0]) - Number(b[0]))) {
+    if (readControl().desiredState !== 'RUNNING' || !preDispatchReady) return;
     if (isSchedulingBlockedBucket(bucket)) continue;
     if (!isVerifiedSourcePackCursor(bucket, bucketState)) continue;
     if (!bucketState.sourcePackResumePending
@@ -3180,6 +3349,15 @@ async function sendPendingSourcePackContinuations(context) {
       saveState();
       continue;
     }
+
+    const pendingDraft = Object.values(state.actions).find(action => (
+      Number(action?.bucket) === Number(bucket)
+      && action?.kind === 'SOURCE_PACK_CONTINUE'
+      && action?.status === 'DRAFTED'
+      && action?.sourcePackTargetFilename === filename
+    ));
+    const retryAt = Date.parse(pendingDraft?.nextRetryAt || '');
+    if (Number.isFinite(retryAt) && Date.now() < retryAt) continue;
 
     if (sourcePackContinuationAlreadySent(bucketState, state.actions, targetNumber, incidentId)) {
       bucketState.sourcePackResumePending = false;
@@ -5308,6 +5486,42 @@ async function main() {
   let browser = null;
   let context = null;
   let browserRetryAttempt = 0;
+  // Long Firefox navigation, page creation, and ChatGPT response probes can
+  // take longer than the watchdog's stale-heartbeat threshold. Keep the
+  // heartbeat fresh while those async browser operations are in flight so the
+  // watchdog only restarts a controller whose event loop has actually stopped.
+  const heartbeatTimer = setInterval(() => {
+    try {
+      const heartbeatAt = now();
+      const control = readControl();
+      const previousStatus = loadJson(STATUS_PATH, {});
+      let browserConnected = false;
+      try { browserConnected = Boolean(browser?.isConnected?.()); } catch {}
+      saveJsonAtomic(STATUS_PATH, {
+        ...previousStatus,
+        updatedAt: heartbeatAt,
+        heartbeatAt,
+        controllerPid: process.pid,
+        startedAt: controllerStartedAt,
+        controllerState: controllerLifecycleState,
+        runState: control.desiredState === 'RUNNING' ? state.runState : control.desiredState,
+        control: {
+          ...(previousStatus.control || {}),
+          desiredState: control.desiredState,
+          present: control.present,
+          requestedAt: control.requestedAt,
+          requestedBy: control.requestedBy,
+        },
+        browserConnected,
+        chatgptReady: Boolean(browserConnected && browserRuntimeStatus.chatgptReady),
+        authenticationRequired: Boolean(browserRuntimeStatus.authenticationRequired),
+        preDispatchReady,
+        preDispatchMode: preDispatchReady ? 'DISPATCH_READY' : 'RECONCILIATION_ONLY',
+        dispatchEnabled: Boolean(preDispatchReady && control.desiredState === 'RUNNING'),
+      });
+    } catch {}
+  }, 30_000);
+  heartbeatTimer.unref();
 
   while (true) {
     const control = syncControlState();
@@ -5484,6 +5698,190 @@ async function main() {
         writeStatus({ allComplete: false });
       }
     } catch (error) {
+      if (['CONTROL_PAUSED', 'CONTROL_STOPPED', 'CONTROL_RECONCILIATION_ONLY'].includes(error?.code)) {
+        const desiredState = readControl().desiredState;
+        const readinessWithdrawn = desiredState === 'RUNNING' && !preDispatchReady;
+        controllerLifecycleState = desiredState === 'PAUSED'
+          ? 'PAUSED'
+          : desiredState === 'STOPPED'
+            ? 'STOPPED'
+            : 'RECOVERING';
+        log(`dispatch gate changed during browser cycle; no further action will be submitted; desiredState=${desiredState}; readinessWithdrawn=${readinessWithdrawn}`);
+        writeStatus({
+          connected: Boolean(browser?.isConnected?.()),
+          controllerState: controllerLifecycleState,
+          browserConnected: Boolean(browser?.isConnected?.()),
+          dispatchEnabled: false,
+          preDispatchReady,
+          preDispatchBlockers: preDispatchEvidence.blockers,
+        });
+        if (desiredState === 'STOPPED') continue;
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
+      if (error?.code === 'REVIEWER_MODEL_UNAVAILABLE') {
+        const verificationFailure = [
+          error.message || String(error),
+          error.cause?.message ? `cause: ${error.cause.message}` : null,
+        ].filter(Boolean).join(' | ');
+        controllerLifecycleState = 'DEGRADED';
+        preDispatchReady = false;
+        startupReconciliationComplete = false;
+        preDispatchEvidence = {
+          ready: false,
+          checkedAt: now(),
+          blockers: ['REVIEWER_MODEL_UNAVAILABLE'],
+          eligibleBuckets: [],
+          bucketExclusions: {},
+        };
+        log(`reviewer model verification failed; affected bucket remains held and action was not sent: ${verificationFailure}`);
+        writeStatus({
+          connected: Boolean(browser?.isConnected?.()),
+          controllerState: 'DEGRADED',
+          browserState: 'REVIEWER_MODEL_UNAVAILABLE',
+          browserError: verificationFailure,
+          browserConnected: Boolean(browser?.isConnected?.()),
+          dispatchEnabled: false,
+          preDispatchReady: false,
+          preDispatchBlockers: preDispatchEvidence.blockers,
+        });
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
+      if (error?.code === 'REVIEWER_COMPOSER_UNAVAILABLE') {
+        const bucket = String(error.bucket ?? '');
+        const bucketState = state.buckets[bucket];
+        const preparedAction = error.actionId ? state.actions[error.actionId] : null;
+        if (preparedAction?.status === 'PREPARED') {
+          preparedAction.lastAttemptFailedAt = now();
+          preparedAction.lastAttemptFailure = 'composer unavailable before draft entry; action remains unsent';
+        }
+        if (bucketState) bucketState.lastAction = 'waiting-for-chat-composer';
+        saveState();
+        controllerLifecycleState = 'DEGRADED';
+        preDispatchReady = false;
+        startupReconciliationComplete = false;
+        preDispatchEvidence = {
+          ready: false,
+          checkedAt: now(),
+          blockers: ['REVIEWER_COMPOSER_UNAVAILABLE'],
+          eligibleBuckets: [],
+          bucketExclusions: bucket ? { [bucket]: 'REVIEWER_COMPOSER_UNAVAILABLE' } : {},
+        };
+        const failure = [
+          error.message || String(error),
+          error.cause?.message ? `cause: ${error.cause.message}` : null,
+        ].filter(Boolean).join(' | ');
+        log(`B${bucket || '?'}: composer disappeared before draft entry; action remains unsent and controller will retry after readiness returns: ${failure}`);
+        writeStatus({
+          connected: Boolean(browser?.isConnected?.()),
+          controllerState: 'DEGRADED',
+          browserState: 'REVIEWER_COMPOSER_UNAVAILABLE',
+          browserError: failure,
+          browserConnected: Boolean(browser?.isConnected?.()),
+          dispatchEnabled: false,
+          preDispatchReady: false,
+          preDispatchBlockers: preDispatchEvidence.blockers,
+        });
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
+      if (error?.code === 'SEND_NOT_OBSERVED') {
+        const bucket = String(error.bucket ?? '');
+        const bucketState = state.buckets[bucket];
+        const pendingAction = error.actionId ? state.actions[error.actionId] : null;
+        const attemptCount = Math.max(0, Number(pendingAction?.sendAttemptCount || 0)) + 1;
+        const failure = [
+          error.message || String(error),
+          error.cause?.message ? `interaction: ${error.cause.message}` : null,
+        ].filter(Boolean).join(' | ');
+        if (pendingAction) {
+          pendingAction.sendAttemptCount = attemptCount;
+          pendingAction.lastAttemptFailedAt = now();
+          pendingAction.lastAttemptFailure = failure;
+        }
+        if (bucketState && error.deliveryState === 'DRAFT_REMAINS' && attemptCount < 3) {
+          const delayMs = Math.min(30_000 * (2 ** (attemptCount - 1)), 120_000);
+          const nextRetryAt = new Date(Date.now() + delayMs).toISOString();
+          if (pendingAction) pendingAction.nextRetryAt = nextRetryAt;
+          bucketState.lastAction = `send-retry-deferred:${error.actionId}:${nextRetryAt}`;
+          saveState();
+          controllerLifecycleState = 'RUNNING';
+          log(`B${bucket}: send was not observed, but the exact action remains in the composer; deferred idempotent retry ${attemptCount}/2 until ${nextRetryAt}: ${failure}`);
+          writeStatus({
+            connected: Boolean(browser?.isConnected?.()),
+            controllerState: 'RUNNING',
+            browserState: null,
+            browserError: null,
+            browserConnected: Boolean(browser?.isConnected?.()),
+            dispatchEnabled: Boolean(preDispatchReady && readControl().desiredState === 'RUNNING'),
+            preDispatchReady,
+            preDispatchBlockers: preDispatchEvidence.blockers,
+          });
+        } else {
+          if (pendingAction) pendingAction.nextRetryAt = null;
+          if (bucketState) {
+            recordIncident(
+              'REVIEWER_SEND_UNCONFIRMED',
+              Number(bucket),
+              'a source-pack action could not be confirmed in the chat; automatic retries are held to prevent duplicate delivery',
+              {
+                actionId: error.actionId || null,
+                deliveryState: error.deliveryState || 'AMBIGUOUS',
+                attemptCount,
+                interactionFailure: error.cause?.message || null,
+              },
+              {
+                wakeCoordinator: false,
+                holdType: 'USER',
+                validation: { kind: 'REVIEWER_CHAT_REACHABLE', bucket: Number(bucket) },
+              },
+            );
+          } else {
+            saveState();
+          }
+          controllerLifecycleState = 'DEGRADED';
+          log(`B${bucket || '?'}: source-pack delivery remains unconfirmed; bucket held for chat reconciliation: ${failure}`);
+          writeStatus({
+            connected: Boolean(browser?.isConnected?.()),
+            controllerState: 'DEGRADED',
+            browserState: 'SEND_NOT_OBSERVED',
+            browserError: failure,
+            browserConnected: Boolean(browser?.isConnected?.()),
+            dispatchEnabled: Boolean(preDispatchReady && readControl().desiredState === 'RUNNING'),
+            preDispatchReady,
+            preDispatchBlockers: preDispatchEvidence.blockers,
+          });
+        }
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
+      if (error?.code === 'PAGE_PROBE_TIMEOUT') {
+        const failure = error.message || String(error);
+        controllerLifecycleState = 'DEGRADED';
+        preDispatchReady = false;
+        startupReconciliationComplete = false;
+        preDispatchEvidence = {
+          ready: false,
+          checkedAt: now(),
+          blockers: ['PAGE_PROBE_TIMEOUT'],
+          eligibleBuckets: [],
+          bucketExclusions: {},
+        };
+        log(`reviewer page probe timed out; controller remains alive in reconciliation mode: ${failure}`);
+        writeStatus({
+          connected: Boolean(browser?.isConnected?.()),
+          controllerState: 'DEGRADED',
+          browserState: 'PAGE_PROBE_TIMEOUT',
+          browserError: failure,
+          browserConnected: Boolean(browser?.isConnected?.()),
+          dispatchEnabled: false,
+          preDispatchReady: false,
+          preDispatchBlockers: preDispatchEvidence.blockers,
+        });
+        await sleep(Math.max(1000, Number(config.pollSeconds || 12) * 1000));
+        continue;
+      }
       if (isReviewerCapacitySafetyError(error)) {
         controllerLifecycleState = 'DEGRADED';
         writeStatus({

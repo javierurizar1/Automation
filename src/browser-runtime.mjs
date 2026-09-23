@@ -8,6 +8,7 @@ import { chromium, firefox } from 'playwright-core';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 45000;
+const MAX_STARTUP_TIMEOUT_MS = 120000;
 const DEFAULT_RETRY_INTERVAL_MS = 500;
 // A spawned browser needs a small finite process-start grace before its CDP
 // endpoint can be observed. Keep this separate from the normal attach retry
@@ -748,7 +749,7 @@ async function launchPersistentContextBounded(playwrightChromium, userDataDir, o
   if (typeof launcher !== 'function') {
     throw codedError('BROWSER_PERSISTENT_UNSUPPORTED', 'Playwright persistent context launch is unavailable');
   }
-  const boundedTimeoutMs = boundedMs(timeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 30000);
+  const boundedTimeoutMs = boundedMs(timeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS);
   let timer;
   let pending;
   try {
@@ -774,7 +775,7 @@ async function ensureBootstrapPageBounded(context, timeoutMs) {
   const pages = typeof context?.pages === 'function' ? context.pages() : [];
   let page = pages.find(candidate => !candidate?.isClosed?.()) || null;
   if (!page && typeof context?.newPage === 'function') {
-    const boundedTimeoutMs = boundedMs(timeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 30000);
+    const boundedTimeoutMs = boundedMs(timeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS);
     let timer;
     let pending;
     try {
@@ -798,7 +799,7 @@ async function ensureBootstrapPageBounded(context, timeoutMs) {
   if (currentUrl !== AUTOMATION_BOOTSTRAP_URL) {
     await page.goto(AUTOMATION_BOOTSTRAP_URL, {
       waitUntil: 'domcontentloaded',
-      timeout: Math.min(boundedMs(timeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 30000), 15000),
+      timeout: Math.min(boundedMs(timeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS), 15000),
     });
   }
   return page;
@@ -891,7 +892,7 @@ export async function connectOrLaunchBrowser({
 } = {}) {
   const selectedProfileMode = normalizeBrowserProfileMode(profileMode);
   const connectMs = boundedMs(connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS, 15000);
-  const startupMs = boundedMs(startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 30000);
+  const startupMs = boundedMs(startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS);
   const retryMs = boundedMs(retryIntervalMs, DEFAULT_RETRY_INTERVAL_MS, 3000);
   const endpoint = configuredEndpoint || (Number.isInteger(Number(cdpPort)) && Number(cdpPort) > 0
     ? `http://127.0.0.1:${Number(cdpPort)}`
@@ -1099,14 +1100,31 @@ export async function connectOrLaunchBrowser({
   // no Chromium profile or process is touched by this path.
   if (firefoxFallbackEnabled && typeof playwrightFirefox?.launchPersistentContext === 'function') {
     const firefoxProfile = path.resolve(firefoxProfileDir || defaultFirefoxProfileDirectory({ platform, env }));
-    const firefoxBrowserCandidates = discoverFirefoxCandidates({
-      preferredExecutable: firefoxExecutable,
-      candidateExecutables: firefoxCandidates,
-      platform,
-      env,
-    });
+    const hasExplicitFirefoxExecutable = Boolean(firefoxExecutable)
+      || (Array.isArray(firefoxCandidates) && firefoxCandidates.length > 0);
+    const bundledFirefoxExecutable = typeof playwrightFirefox.executablePath === 'function'
+      ? playwrightFirefox.executablePath()
+      : null;
+    // Playwright's Firefox automation protocol requires its patched browser
+    // build. Use configured binaries only when an operator explicitly opts in;
+    // otherwise use the browser paired with this Playwright installation.
+    const firefoxBrowserCandidates = hasExplicitFirefoxExecutable
+      ? discoverFirefoxCandidates({
+        preferredExecutable: firefoxExecutable,
+        candidateExecutables: firefoxCandidates,
+        platform,
+        env,
+      })
+      : bundledFirefoxExecutable && fs.existsSync(bundledFirefoxExecutable)
+        ? [bundledFirefoxExecutable]
+        : [];
     if (!firefoxBrowserCandidates.length) {
-      attempts.push({ phase: 'firefox-discovery', error: 'No installed Firefox browser was found' });
+      attempts.push({
+        phase: 'firefox-discovery',
+        error: hasExplicitFirefoxExecutable
+          ? 'No configured Firefox browser was found'
+          : 'Playwright-compatible Firefox is not installed',
+      });
     } else {
       try {
         if (samePath(firefoxProfile, persistentProfileDir)) {
@@ -1127,7 +1145,6 @@ export async function connectOrLaunchBrowser({
               {
                 headless: false,
                 executablePath: executable,
-                channel: 'moz-firefox',
                 timeout: startupMs,
                 viewport: null,
                 args: [],

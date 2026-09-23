@@ -1,6 +1,8 @@
 const SELECTOR_BUTTON_NAME = 'Select ChatGPT model';
 export const REQUIRED_REVIEWER_MODEL = 'GPT-5.6 Sol';
 export const REQUIRED_REVIEWER_EFFORT = 'High';
+const MODEL_SELECTOR_TIMEOUT_MS = 30000;
+const MODEL_MENU_TIMEOUT_MS = 10000;
 const REQUIRED_POWER_VALUE = 2;
 const REQUIRED_REVIEWER_EFFORT_STATUS = /^High,\s*3 of 3\.?$/;
 
@@ -29,7 +31,7 @@ export async function ensureHighestReviewerModel(page) {
   let menuOpened = false;
   try {
     const selector = page.getByRole('button', { name: SELECTOR_BUTTON_NAME });
-    await selector.waitFor({ state: 'visible', timeout: 15000 });
+    await selector.waitFor({ state: 'visible', timeout: MODEL_SELECTOR_TIMEOUT_MS });
     if (await selector.count() !== 1) {
       throw modelUnavailable('ChatGPT model selector was not found exactly once');
     }
@@ -37,7 +39,7 @@ export async function ensureHighestReviewerModel(page) {
     menuOpened = true;
 
     let menu = page.getByRole('menu').last();
-    await menu.waitFor({ state: 'visible', timeout: 5000 });
+    await menu.waitFor({ state: 'visible', timeout: MODEL_MENU_TIMEOUT_MS });
     let modelOption = await findModelOption(menu);
     if (!modelOption) {
       throw modelUnavailable(`${REQUIRED_REVIEWER_MODEL} is not available in the model menu`);
@@ -51,7 +53,7 @@ export async function ensureHighestReviewerModel(page) {
       if (!(await menu.isVisible().catch(() => false))) {
         await selector.click();
         menu = page.getByRole('menu').last();
-        await menu.waitFor({ state: 'visible', timeout: 5000 });
+        await menu.waitFor({ state: 'visible', timeout: MODEL_MENU_TIMEOUT_MS });
       }
       modelOption = await findModelOption(menu);
       if (!modelOption || (await modelOption.getAttribute('aria-checked')) !== 'true') {
