@@ -1,34 +1,322 @@
 {
   "version": 1,
   "kind": "R433_CONSERVATIVE_RECONCILIATION",
-  "generatedAt": "2026-09-22T00:00:00.000Z",
+  "generatedAt": "2026-09-24T01:51:01.888Z",
   "auditablePopulation": 65720,
-  "source": "population-reconciliation.md and pack-scan-B4-B5.md",
+  "source": "Live DRIVE_PACK_INDEX stable_ids from verified prefix files, checked against current owner-shard terminal classifications; prefix files were confirmed unchanged since index validation; next target files were confirmed present in Drive. Read-only; no registry rows changed.",
   "buckets": {
     "0": {
-      "decision": "PROTECTED_HOLD",
-      "reason": "UNRESOLVED_SOURCE_PACK_PREFIX"
+      "decision": "CONSERVATIVE_RESUME",
+      "reconciliationId": "R433-B0-PACK-PREFIX-20260924",
+      "reason": "TERMINAL_PREFIX_PROVEN",
+      "evidenceReadAt": "2026-09-24T01:51:01.888Z",
+      "nextPack": 2,
+      "nextFilename": "pack_000002.jsonl",
+      "nextTargetFileVerifiedAvailable": true,
+      "boundary": {
+        "firstPack": 1,
+        "terminalThroughPack": 1,
+        "nextPack": 2
+      },
+      "terminalPrefix": {
+        "startPack": 1,
+        "endPack": 1,
+        "packIndexRecordCount": 50,
+        "contentScanRecordCount": 50,
+        "terminalRecordCount": 50
+      },
+      "packIndexPrefix": {
+        "startPack": 1,
+        "endPack": 1,
+        "recordCount": 50,
+        "registryTerminalCount": 50,
+        "missingTerminalCount": 0,
+        "validationBasis": "DRIVE_PACK_INDEX stable_ids from PARSED_OWNERSHIP_VERIFIED or VALIDATED rows; each list matched the expected count, unique IDs, bucket ownership, and a single allowed terminal classification in the live registry shard.",
+        "crossPackDuplicateCount": 0,
+        "verifiedFileContentsUnchangedSinceIndexCheck": true
+      },
+      "contentScan": {
+        "startPack": 1,
+        "endPack": 1,
+        "recordCount": 50,
+        "validRecordCount": 50,
+        "terminalRecordCount": 50,
+        "pendingRecordCount": 0,
+        "malformedRecordCount": 0,
+        "duplicateRecordCount": 0,
+        "ownershipMismatchCount": 0,
+        "scanBasis": "Complete stable_ids manifest from the Drive index, cross-checked against live owner-shard rows; raw source text was not retained."
+      },
+      "registry": {
+        "registryTerminalSetAuthoritative": true,
+        "terminalRowsChanged": 0,
+        "substantiveFieldsChanged": 0,
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      },
+      "safety": {
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      }
     },
     "1": {
-      "decision": "PROTECTED_HOLD",
-      "reason": "UNRESOLVED_SOURCE_PACK_PREFIX"
+      "decision": "CONSERVATIVE_RESUME",
+      "reconciliationId": "R433-B1-PACK-PREFIX-20260924",
+      "reason": "TERMINAL_PREFIX_PROVEN",
+      "evidenceReadAt": "2026-09-24T01:51:01.888Z",
+      "nextPack": 3,
+      "nextFilename": "pack_000003.jsonl",
+      "nextTargetFileVerifiedAvailable": true,
+      "boundary": {
+        "firstPack": 1,
+        "terminalThroughPack": 2,
+        "nextPack": 3
+      },
+      "terminalPrefix": {
+        "startPack": 1,
+        "endPack": 2,
+        "packIndexRecordCount": 100,
+        "contentScanRecordCount": 100,
+        "terminalRecordCount": 100
+      },
+      "packIndexPrefix": {
+        "startPack": 1,
+        "endPack": 2,
+        "recordCount": 100,
+        "registryTerminalCount": 100,
+        "missingTerminalCount": 0,
+        "validationBasis": "DRIVE_PACK_INDEX stable_ids from PARSED_OWNERSHIP_VERIFIED or VALIDATED rows; each list matched the expected count, unique IDs, bucket ownership, and a single allowed terminal classification in the live registry shard.",
+        "crossPackDuplicateCount": 0,
+        "verifiedFileContentsUnchangedSinceIndexCheck": true
+      },
+      "contentScan": {
+        "startPack": 1,
+        "endPack": 2,
+        "recordCount": 100,
+        "validRecordCount": 100,
+        "terminalRecordCount": 100,
+        "pendingRecordCount": 0,
+        "malformedRecordCount": 0,
+        "duplicateRecordCount": 0,
+        "ownershipMismatchCount": 0,
+        "scanBasis": "Complete stable_ids manifest from the Drive index, cross-checked against live owner-shard rows; raw source text was not retained."
+      },
+      "registry": {
+        "registryTerminalSetAuthoritative": true,
+        "terminalRowsChanged": 0,
+        "substantiveFieldsChanged": 0,
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      },
+      "safety": {
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      }
     },
     "2": {
-      "decision": "PROTECTED_HOLD",
-      "reason": "UNRESOLVED_SOURCE_PACK_PREFIX"
+      "decision": "CONSERVATIVE_RESUME",
+      "reconciliationId": "R433-B2-PACK-PREFIX-20260924",
+      "reason": "TERMINAL_PREFIX_PROVEN",
+      "evidenceReadAt": "2026-09-24T01:51:01.888Z",
+      "nextPack": 7,
+      "nextFilename": "pack_000007.jsonl",
+      "nextTargetFileVerifiedAvailable": true,
+      "boundary": {
+        "firstPack": 1,
+        "terminalThroughPack": 6,
+        "nextPack": 7
+      },
+      "terminalPrefix": {
+        "startPack": 1,
+        "endPack": 6,
+        "packIndexRecordCount": 300,
+        "contentScanRecordCount": 300,
+        "terminalRecordCount": 300
+      },
+      "packIndexPrefix": {
+        "startPack": 1,
+        "endPack": 6,
+        "recordCount": 300,
+        "registryTerminalCount": 300,
+        "missingTerminalCount": 0,
+        "validationBasis": "DRIVE_PACK_INDEX stable_ids from PARSED_OWNERSHIP_VERIFIED or VALIDATED rows; each list matched the expected count, unique IDs, bucket ownership, and a single allowed terminal classification in the live registry shard.",
+        "crossPackDuplicateCount": 0,
+        "verifiedFileContentsUnchangedSinceIndexCheck": true
+      },
+      "contentScan": {
+        "startPack": 1,
+        "endPack": 6,
+        "recordCount": 300,
+        "validRecordCount": 300,
+        "terminalRecordCount": 300,
+        "pendingRecordCount": 0,
+        "malformedRecordCount": 0,
+        "duplicateRecordCount": 0,
+        "ownershipMismatchCount": 0,
+        "scanBasis": "Complete stable_ids manifest from the Drive index, cross-checked against live owner-shard rows; raw source text was not retained."
+      },
+      "registry": {
+        "registryTerminalSetAuthoritative": true,
+        "terminalRowsChanged": 0,
+        "substantiveFieldsChanged": 0,
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      },
+      "safety": {
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      }
     },
     "3": {
-      "decision": "PROTECTED_HOLD",
-      "reason": "UNRESOLVED_CURSOR_HISTORY"
+      "decision": "CONSERVATIVE_RESUME",
+      "reconciliationId": "R433-B3-PACK-PREFIX-20260924",
+      "reason": "TERMINAL_PREFIX_PROVEN",
+      "evidenceReadAt": "2026-09-24T01:51:01.888Z",
+      "nextPack": 6,
+      "nextFilename": "pack_000006.jsonl",
+      "nextTargetFileVerifiedAvailable": true,
+      "boundary": {
+        "firstPack": 1,
+        "terminalThroughPack": 5,
+        "nextPack": 6
+      },
+      "terminalPrefix": {
+        "startPack": 1,
+        "endPack": 5,
+        "packIndexRecordCount": 250,
+        "contentScanRecordCount": 250,
+        "terminalRecordCount": 250
+      },
+      "packIndexPrefix": {
+        "startPack": 1,
+        "endPack": 5,
+        "recordCount": 250,
+        "registryTerminalCount": 250,
+        "missingTerminalCount": 0,
+        "validationBasis": "DRIVE_PACK_INDEX stable_ids from PARSED_OWNERSHIP_VERIFIED or VALIDATED rows; each list matched the expected count, unique IDs, bucket ownership, and a single allowed terminal classification in the live registry shard.",
+        "crossPackDuplicateCount": 0,
+        "verifiedFileContentsUnchangedSinceIndexCheck": true
+      },
+      "contentScan": {
+        "startPack": 1,
+        "endPack": 5,
+        "recordCount": 250,
+        "validRecordCount": 250,
+        "terminalRecordCount": 250,
+        "pendingRecordCount": 0,
+        "malformedRecordCount": 0,
+        "duplicateRecordCount": 0,
+        "ownershipMismatchCount": 0,
+        "scanBasis": "Complete stable_ids manifest from the Drive index, cross-checked against live owner-shard rows; raw source text was not retained."
+      },
+      "registry": {
+        "registryTerminalSetAuthoritative": true,
+        "terminalRowsChanged": 0,
+        "substantiveFieldsChanged": 0,
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      },
+      "safety": {
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      }
     },
     "4": {
-      "decision": "PROTECTED_HOLD",
-      "reason": "INDEXED_PREFIX_GAP",
-      "gap": {
+      "decision": "CONSERVATIVE_RESUME",
+      "reconciliationId": "R433-B4-PACK-PREFIX-20260924",
+      "reason": "TERMINAL_PREFIX_PROVEN",
+      "evidenceReadAt": "2026-09-24T01:51:01.888Z",
+      "nextPack": 3,
+      "nextFilename": "pack_000003.jsonl",
+      "nextTargetFileVerifiedAvailable": true,
+      "boundary": {
+        "firstPack": 1,
+        "terminalThroughPack": 2,
+        "nextPack": 3
+      },
+      "terminalPrefix": {
+        "startPack": 1,
+        "endPack": 2,
+        "packIndexRecordCount": 100,
+        "contentScanRecordCount": 100,
+        "terminalRecordCount": 100
+      },
+      "packIndexPrefix": {
+        "startPack": 1,
+        "endPack": 2,
+        "recordCount": 100,
+        "registryTerminalCount": 100,
+        "missingTerminalCount": 0,
+        "validationBasis": "DRIVE_PACK_INDEX stable_ids from PARSED_OWNERSHIP_VERIFIED or VALIDATED rows; each list matched the expected count, unique IDs, bucket ownership, and a single allowed terminal classification in the live registry shard.",
+        "crossPackDuplicateCount": 0,
+        "verifiedFileContentsUnchangedSinceIndexCheck": true
+      },
+      "contentScan": {
+        "startPack": 1,
+        "endPack": 2,
+        "recordCount": 100,
+        "validRecordCount": 100,
+        "terminalRecordCount": 100,
+        "pendingRecordCount": 0,
+        "malformedRecordCount": 0,
+        "duplicateRecordCount": 0,
+        "ownershipMismatchCount": 0,
+        "scanBasis": "Complete stable_ids manifest from the Drive index, cross-checked against live owner-shard rows; raw source text was not retained."
+      },
+      "registry": {
+        "registryTerminalSetAuthoritative": true,
+        "terminalRowsChanged": 0,
+        "substantiveFieldsChanged": 0,
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      },
+      "safety": {
+        "skipTerminalStableIds": true,
+        "overwriteTerminalRows": false,
+        "readbackVerifyNewWrites": true,
+        "fullCorpusReconciled": false,
+        "actionAwareCursorProven": false,
+        "boundaryMonotonic": true
+      },
+      "knownPendingAfterBoundary": {
         "pack": 5,
-        "missingStableIdCount": 9,
-        "registryTerminalCount": 841,
-        "indexedRecordCount": 850
+        "missingStableIdCount": 9
       }
     },
     "5": {

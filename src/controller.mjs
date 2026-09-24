@@ -658,102 +658,130 @@ function saveState() {
 
 function applyDurableConservativeReconciliation() {
   const record = loadJson(RECONCILIATION_EVIDENCE_PATH, null);
-  const validation = validateConservativeSourcePackBoundary(5, record, {
-    expectedAuditablePopulation: config.auditablePopulation,
-  });
-  const bucketState = state.buckets?.['5'];
-  if (!bucketState) return { applied: false, valid: false, reason: 'B5_STATE_MISSING' };
+  if (!record || typeof record !== 'object' || !state.buckets) {
+    return { applied: false, valid: false, reason: 'RECONCILIATION_RECORD_MISSING' };
+  }
 
-  const proof = bucketState.sourcePackCursorEvidence;
-  const staticProof = proof?.evidenceKind === 'CONSERVATIVE_RECONCILIATION';
-  if (!validation.valid) {
-    // A previously projected proof must fail closed if its committed source
-    // record is removed or altered.  Existing action-attributed evidence is
-    // left alone; it is independently validated by isVerifiedSourcePackCursor.
-    if (staticProof) {
-      bucketState.sourcePackCursorEvidence = null;
-      bucketState.sourcePackCursorReconciliationRequired = true;
-      bucketState.sourcePackResumePending = false;
-      bucketState.sourcePackTargetNumber = null;
-      bucketState.sourcePackTargetFilename = null;
-      bucketState.sourcePackLastConsumedNumber = null;
-      bucketState.sourcePackLastVisibleNumber = null;
-      bucketState.sourcePackResumeIncidentId = null;
-      bucketState.phase = 'HOLD';
-      bucketState.hold = createHoldRecord({
-        type: 'INTEGRITY',
-        reason: 'CONSERVATIVE_RECONCILIATION_RECORD_INVALID',
-        bucket: 5,
-      });
-      bucketState.lastAction = `conservative-reconciliation-rejected:${validation.reason}`;
-      saveState();
+  let changed = false;
+  let lastValidationReason = null;
+  for (const [bucket, bucketState] of Object.entries(state.buckets)) {
+    const bucketNumber = Number(bucket);
+    if (!Number.isInteger(bucketNumber)) continue;
+    const validation = validateConservativeSourcePackBoundary(bucketNumber, record, {
+      expectedAuditablePopulation: config.auditablePopulation,
+    });
+    const proof = bucketState.sourcePackCursorEvidence;
+    const staticProof = proof?.evidenceKind === 'CONSERVATIVE_RECONCILIATION';
+
+    if (!validation.valid) {
+      lastValidationReason ||= validation.reason;
+      // A previously projected proof must fail closed if its committed source
+      // record is removed or altered. Action-attributed evidence is independent.
+      if (staticProof) {
+        bucketState.sourcePackCursorEvidence = null;
+        bucketState.sourcePackCursorReconciliationRequired = true;
+        bucketState.sourcePackResumePending = false;
+        bucketState.sourcePackTargetNumber = null;
+        bucketState.sourcePackTargetFilename = null;
+        bucketState.sourcePackLastConsumedNumber = null;
+        bucketState.sourcePackLastVisibleNumber = null;
+        bucketState.sourcePackResumeIncidentId = null;
+        bucketState.phase = 'HOLD';
+        bucketState.hold = createHoldRecord({
+          type: 'INTEGRITY',
+          reason: 'CONSERVATIVE_RECONCILIATION_RECORD_INVALID',
+          bucket: bucketNumber,
+        });
+        bucketState.lastAction = `conservative-reconciliation-rejected:${validation.reason}`;
+        changed = true;
+      }
+      continue;
     }
-    return { applied: false, valid: false, reason: validation.reason };
+
+    const target = validation.nextPack;
+    const consumed = validation.terminalThroughPack;
+    const hasCursorFields = [
+      bucketState.sourcePackTargetNumber,
+      bucketState.sourcePackTargetFilename,
+      bucketState.sourcePackLastConsumedNumber,
+      bucketState.sourcePackLastVisibleNumber,
+      bucketState.sourcePackLastDeliveredNumber,
+    ].some(value => value !== null && value !== undefined && value !== '');
+    const hasPackActionRecord = Object.values(state.actions || {}).some(action => (
+      Number(action?.bucket) === bucketNumber
+      && (isSourcePackContinuationEvidenceKind(action?.kind)
+        || action?.kind === 'WRITE_RECOVERY'
+        || Boolean(action?.sourcePackTargetFilename))
+      && (['PREPARED', 'DRAFTED', 'SENT'].includes(action?.status)
+        || action?.deliveryVerified === true)
+    ));
+    if ((proof && !staticProof) || hasPackActionRecord || (hasCursorFields && !staticProof)) {
+      // A later action-attributed cursor always outranks this startup record.
+      continue;
+    }
+    if (staticProof) {
+      const existingConsumed = Number(proof.terminalThroughPack ?? proof.consumedNumber);
+      const sameBoundary = String(proof.reconciliationId || '') === validation.reconciliationId
+        && Number(proof.targetNumber) === target
+        && proof.targetFilename === validation.nextFilename;
+      if (sameBoundary
+        || !Number.isInteger(existingConsumed)
+        || consumed < existingConsumed) continue;
+    }
+
+    const cursorHold = bucketState.hold?.type === 'INTEGRITY'
+      && bucketState.hold.reason === 'SOURCE_PACK_CURSOR_RECONCILIATION_REQUIRED';
+    if ((bucketState.hold && !cursorHold) || bucketState.complete || bucketState.phase === 'COMPLETE') continue;
+
+    const verifiedAt = record.generatedAt || now();
+    bucketState.sourcePackTargetNumber = target;
+    bucketState.sourcePackTargetFilename = validation.nextFilename;
+    bucketState.sourcePackLastConsumedNumber = consumed;
+    bucketState.sourcePackLastVisibleNumber = consumed;
+    bucketState.sourcePackLastDeliveredNumber = null;
+    bucketState.sourcePackLastDeliveredIncidentId = null;
+    bucketState.sourcePackLastDeliveredActionId = null;
+    bucketState.sourcePackResumeIncidentId = validation.reconciliationId;
+    bucketState.sourcePackResumePending = true;
+    bucketState.sourcePackCursorReconciliationRequired = false;
+    bucketState.sourcePackAccessVerified = false;
+    bucketState.sourcePackAccessVerifiedAt = null;
+    bucketState.sourcePackRequestActionId = null;
+    bucketState.sourcePackCursorEvidence = {
+      evidenceKind: 'CONSERVATIVE_RECONCILIATION',
+      reconciliationStatus: 'CONSERVATIVE_RESUME',
+      reconciliationId: validation.reconciliationId,
+      bucket: bucketNumber,
+      targetNumber: target,
+      targetFilename: validation.nextFilename,
+      sourceActionTargetFilename: validation.nextFilename,
+      consumedNumber: consumed,
+      terminalThroughPack: consumed,
+      registryTerminalSetAuthoritative: true,
+      registryTerminalRowsChanged: 0,
+      registrySubstantiveFieldsChanged: 0,
+      skipTerminalStableIds: true,
+      overwriteTerminalRows: false,
+      readbackVerifyNewWrites: true,
+      fullCorpusReconciled: false,
+      actionAwareCursorProven: false,
+      boundaryMonotonic: true,
+      verifiedAt,
+    };
+    bucketState.hold = bucketState.sourcePackDeferredHold || null;
+    bucketState.sourcePackDeferredHold = null;
+    bucketState.phase = bucketState.hold ? 'HOLD' : (bucketState.chatUrl ? 'ACTIVE' : 'PENDING');
+    bucketState.lastAction = `conservative-reconciliation-applied:pack-${target}`;
+    log(`B${bucketNumber}: applied validated conservative source-pack boundary; exact next target=${validation.nextFilename}`);
+    changed = true;
   }
 
-  const target = validation.nextPack;
-  const consumed = validation.terminalThroughPack;
-  const hasCursorFields = [
-    bucketState.sourcePackTargetNumber,
-    bucketState.sourcePackTargetFilename,
-    bucketState.sourcePackLastConsumedNumber,
-    bucketState.sourcePackLastVisibleNumber,
-    bucketState.sourcePackLastDeliveredNumber,
-  ].some(value => value !== null && value !== undefined && value !== '');
-  const hasIndependentProof = proof && !staticProof;
-  if (hasIndependentProof || (hasCursorFields && !staticProof)) {
-    // A later action-attributed cursor always outranks this conservative
-    // startup record. Never rewind a bucket that has already progressed.
-    return { applied: false, valid: true, reason: 'EXISTING_CURSOR_PRESERVED' };
-  }
-  if (staticProof) return { applied: true, valid: true, reason: 'ALREADY_APPLIED' };
-  if (bucketState.hold
-    && !(bucketState.hold.type === 'INTEGRITY'
-      && bucketState.hold.reason === 'SOURCE_PACK_CURSOR_RECONCILIATION_REQUIRED')) {
-    return { applied: false, valid: true, reason: 'EXISTING_HOLD_PRESERVED' };
-  }
-
-  const verifiedAt = record.generatedAt || now();
-  bucketState.sourcePackTargetNumber = target;
-  bucketState.sourcePackTargetFilename = validation.nextFilename;
-  bucketState.sourcePackLastConsumedNumber = consumed;
-  bucketState.sourcePackLastVisibleNumber = consumed;
-  bucketState.sourcePackLastDeliveredNumber = null;
-  bucketState.sourcePackLastDeliveredIncidentId = null;
-  bucketState.sourcePackLastDeliveredActionId = null;
-  bucketState.sourcePackResumeIncidentId = validation.reconciliationId;
-  bucketState.sourcePackResumePending = true;
-  bucketState.sourcePackCursorReconciliationRequired = false;
-  bucketState.sourcePackAccessVerified = false;
-  bucketState.sourcePackAccessVerifiedAt = null;
-  bucketState.sourcePackRequestActionId = null;
-  bucketState.sourcePackCursorEvidence = {
-    evidenceKind: 'CONSERVATIVE_RECONCILIATION',
-    reconciliationStatus: 'CONSERVATIVE_RESUME',
-    reconciliationId: validation.reconciliationId,
-    bucket: 5,
-    targetNumber: target,
-    targetFilename: validation.nextFilename,
-    sourceActionTargetFilename: validation.nextFilename,
-    consumedNumber: consumed,
-    terminalThroughPack: consumed,
-    registryTerminalSetAuthoritative: true,
-    registryTerminalRowsChanged: 0,
-    registrySubstantiveFieldsChanged: 0,
-    skipTerminalStableIds: true,
-    overwriteTerminalRows: false,
-    readbackVerifyNewWrites: true,
-    fullCorpusReconciled: false,
-    actionAwareCursorProven: false,
-    boundaryMonotonic: true,
-    verifiedAt,
+  if (changed) saveState();
+  return {
+    applied: changed,
+    valid: lastValidationReason === null,
+    reason: changed ? 'APPLIED' : (lastValidationReason || 'NO_CHANGE'),
   };
-  bucketState.hold = null;
-  bucketState.phase = bucketState.chatUrl ? 'ACTIVE' : 'PENDING';
-  bucketState.lastAction = `conservative-reconciliation-applied:pack-${target}`;
-  saveState();
-  log(`B5: applied validated conservative source-pack boundary; exact next target=${validation.nextFilename}`);
-  return { applied: true, valid: true, reason: 'APPLIED' };
 }
 
 function updateWorkingClock(nextState) {
