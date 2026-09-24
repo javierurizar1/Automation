@@ -6183,6 +6183,11 @@ async function main() {
   }
 }
 
+// Playwright handles SIGTERM for its browser, but does not stop this controller's
+// polling loop. Exit immediately so systemd cannot leave it dispatching during
+// a restart; synchronous atomic state writes remain available for reconciliation.
+process.once('SIGTERM', () => process.exit(0));
+
 main().then(() => {
   process.exit(0);
 }).catch(error => {
