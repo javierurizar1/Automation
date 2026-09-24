@@ -2160,6 +2160,18 @@ function queueCoordinatorStatus(incidentId, detectedAt, kind) {
 }
 
 function wakeCodex(incidentPath) {
+  if (process.platform !== 'win32') {
+    const error = `Coordinator wake requires Windows PowerShell (running on ${process.platform})`;
+    saveJsonAtomic(COORDINATOR_STATUS_PATH, {
+      ...loadJson(COORDINATOR_STATUS_PATH, {}),
+      status: 'UNAVAILABLE',
+      completedAt: now(),
+      exitCode: null,
+      error,
+    });
+    log(`${error}; incident ${path.basename(incidentPath)} is available in the dashboard`);
+    return;
+  }
   try {
     const stdout = fs.openSync(COORDINATOR_WAKE_STDOUT, 'a');
     const stderr = fs.openSync(COORDINATOR_WAKE_STDERR, 'a');
@@ -2301,6 +2313,7 @@ function ensureCoordinatorWakeProgress() {
 
   if (status === 'RUNNING') return;
   if (sameIncident && status === 'COMPLETED') return;
+  if (process.platform !== 'win32' && sameIncident && status === 'UNAVAILABLE') return;
 
   const statusAt = Date.parse(
     coordinatorStatus?.startedAt
