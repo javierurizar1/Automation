@@ -1950,6 +1950,13 @@ async function reconcileOutstandingResponses(context, liveGeneratingByBucket) {
       if (!page) continue;
       if (isAuthenticationPage(page)) continue;
 
+      const rolloverReason = await conversationRolloverReason(page);
+      if (rolloverReason) {
+        log(`B${bucket}: explicit conversation rollover state found during response reconciliation`);
+        await rolloverReviewer(context, Number(bucket), rolloverReason);
+        continue;
+      }
+
       if (await isGenerating(page)) {
         bucketState.transientFailures = 0;
         noteGenerationObserved(bucketState);
@@ -3486,7 +3493,16 @@ async function sendPendingSourcePackContinuations(context) {
       ? partialWriteRecoveryPrompt(Number(bucket), footer)
       : sourcePackContinuationPrompt(Number(bucket), source);
 
-    const actionIdSent = await sendAction(page, Number(bucket), kind, prompt, responseHash);
+    let actionIdSent;
+    try {
+      actionIdSent = await sendAction(page, Number(bucket), kind, prompt, responseHash);
+    } catch (error) {
+      if (error?.code === 'CHAT_ROLLOVER_REQUIRED') {
+        await rolloverReviewer(context, Number(bucket), error.message || 'reviewer chat requires rollover');
+        continue;
+      }
+      throw error;
+    }
     if (!needsWriteRecovery) {
       bucketState.sourcePackLastDeliveredNumber = targetNumber;
       bucketState.sourcePackLastDeliveredIncidentId = incidentId;
