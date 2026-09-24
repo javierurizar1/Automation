@@ -1,32 +1,42 @@
-# Node
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Runtime state / logs (may contain private chat URLs or session data)
-data/*.json
-data/*.log
-logs/
-*.log
-
-# Browser/session/auth material
-.user-data/
-browser-profile/
+# Private runtime configuration and state
+/config.json
+/data/
+/logs/
+/chrome-profile/
+/.user-data/
+/browser-profile/
+/cookies/
+/sessions/
 cookies*
 session*
 *.token
 *.secret
 .env
 .env.*
+credentials.json
+client_secret.json
 
-# OS/editor
+# Local execution and source data
+node_modules/
+archive/
+scratch/
+corpus/
+case-data/
+source-data/
+*.jsonl
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+*.tmp
+tmp/
+temp/
+
+# Python and editor files
+__pycache__/
+*.py[cod]
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-
-# Temporary files
-tmp/
-temp/
-*.tmp

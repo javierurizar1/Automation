@@ -5,7 +5,7 @@
  * It contains only behavior derivable from documented project invariants.
  */
 
-export const AUDITABLE_POPULATION = 65_720;
+export const AUDITABLE_POPULATION = null;
 export const BUCKET_COUNT = 6;
 export const MAX_ACTIVE_REVIEWERS = 2;
 export const POST_GENERATION_STALL_MINUTES = 90;
@@ -82,14 +82,26 @@ export function formatAuditTurnStatus({status, newCases, writesVerified, blocker
   ].join("\n");
 }
 
-export function completionEvidence({fullCorpusReconciled, auditablePopulation, ownedPendingCases, unresolvedWrites = 0}) {
-  const complete = fullCorpusReconciled === true && auditablePopulation === AUDITABLE_POPULATION && ownedPendingCases === 0 && unresolvedWrites === 0;
+export function completionEvidence({
+  fullCorpusReconciled,
+  auditablePopulation,
+  expectedPopulation,
+  ownedPendingCases,
+  unresolvedWrites = 0,
+}) {
+  const populationVerified = Number.isSafeInteger(expectedPopulation)
+    && expectedPopulation >= 0
+    && auditablePopulation === expectedPopulation;
+  const complete = fullCorpusReconciled === true
+    && populationVerified
+    && ownedPendingCases === 0
+    && unresolvedWrites === 0;
   return {
     complete,
     lines: [
-      `FULL_CORPUS_RECONCILED: ${fullCorpusReconciled ? "YES" : "NO"}`,
-      `FULL_CORPUS_AUDITABLE_POPULATION: ${auditablePopulation}`,
-      `OWNED_PENDING_CASES: ${ownedPendingCases}`,
+      "FULL_CORPUS_RECONCILED: " + (fullCorpusReconciled ? "YES" : "NO"),
+      "FULL_CORPUS_AUDITABLE_POPULATION: " + (Number.isSafeInteger(auditablePopulation) ? auditablePopulation : "UNSPECIFIED"),
+      "OWNED_PENDING_CASES: " + ownedPendingCases,
     ],
   };
 }

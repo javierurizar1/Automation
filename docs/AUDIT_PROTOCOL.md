@@ -1,68 +1,33 @@
-# R4.3.3 Audit Protocol
+# Audit protocol
 
-## Ownership and authoritative state
+## Ownership and scheduling
 
-For every case: `bucket = int(stable_id, 16) % 6`.
+- Assign each stable record identifier to one permanent bucket using its hexadecimal value modulo six.
+- Permit at most two simultaneous reviewer generations.
+- Keep at most five managed bucket conversations in the rotation.
+- Treat each source pack as an input boundary, not proof that a bucket or the full population is complete.
+- If a source-pack cursor is absent, initialize from the configured first pack only after an explicit `NEXT_SOURCE_PACKS_REQUIRED` boundary and when no pack delivery was recorded. Historical case totals do not identify a source-pack cursor; the reviewer must still skip all valid terminal registry rows.
+- If the next target is beyond the verified uploaded pack inventory, request full-population reconciliation instead of retrying a nonexistent filename. If reconciliation finds pending owned records but no exact later pack, hold the bucket and surface the unresolved source requirement.
 
-The canonical registry is authoritative for terminalization. Before review, reconcile `stable_id` against its owning `R433_AUDIT_SHARD_N` tab.
+## Review and writes
 
-- Skip every valid terminalized `stable_id`.
-- Preserve existing terminal rows exactly unless a targeted recovery proves the write itself is defective.
-- Do not re-audit a terminalized case merely to make controller state consistent.
-- One terminal row per `stable_id` in its owning tab.
-- Every new write must be read back and verified.
-- The live workflow used `reviewed` as the terminalization flag.
+Review only the exact source record supplied for the current action. Do not infer missing source material or substitute another pack. Write at most one terminal result for a stable identifier in its owning registry area. Preserve an existing valid terminal result rather than re-auditing or overwriting it.
 
-## Exact source requirements
+Verify each new registry write by reading it back. Completion requires explicit full-population reconciliation, no owned records pending, and no unresolved writes. The expected population is private runtime configuration and is not embedded in this public handoff.
 
-1. Use connected Google Drive access.
-2. Open the exact shard folder.
-3. List/paginate until the exact requested `pack_NNNNNN.jsonl` is found or the folder listing is fully exhausted.
-4. A failed exact-name Drive search alone is not proof that the raw JSONL file is absent.
-5. Do not substitute another pack.
-6. Do not infer source contents from prior context, READMEs, manifests, or metadata.
-7. Only `.jsonl` files are substantive source inputs.
-8. Review each eligible case using both `summary_text` and `source_text`; never summary-only.
-9. Do not call Qwen, regenerate summaries, modify the production corpus, or rewrite source judgments.
+## Response footer
 
-## Terminal classifications
+Each completed turn ends with the strict six-line footer:
 
-`PASS`, `MINOR`, `FAIL`, `SOURCE_UNAVAILABLE`, `TECHNICAL_REVIEW_FAILURE`.
-
-## Continuation semantics
-
-There is no voluntary per-turn case quota. Continue across case, pack, group, and run boundaries as long as the turn can safely proceed. If currently visible packs are exhausted while owned cases remain pending, use blocker `NEXT_SOURCE_PACKS_REQUIRED`; this is not completion.
-
-## Strict six-line footer
-
-```text
 AUDIT_TURN_STATUS
-STATUS: NORMAL / ERROR / COMPLETE
-NEW_CASES: <number>
-WRITES_VERIFIED: YES / NO / PARTIAL
-BLOCKER: NONE or <brief blocker>
-TRIGGER_COORDINATOR: YES / NO
-```
+STATUS: NORMAL | ERROR | COMPLETE
+NEW_CASES: non-negative integer
+WRITES_VERIFIED: YES | NO | PARTIAL
+BLOCKER: non-empty text
+TRIGGER_COORDINATOR: YES | NO
 
-Use one concrete value per line. Meaningful blockers include `NEXT_SOURCE_PACKS_REQUIRED`, `SOURCE_PACK_UNAVAILABLE_OR_UNVERIFIED`, or a specific unresolved write/reconciliation failure.
+A COMPLETE response also requires separate full-reconciliation evidence immediately before the footer. Pack exhaustion alone is insufficient.
 
-## COMPLETE semantics
+## Reviewer model
 
-`STATUS: COMPLETE` is permitted only after reconciliation against all **65,720** finalized summaries proves every owned ID is terminalized, `OWNED_PENDING_CASES: 0`, and no unresolved writes remain. Pack exhaustion alone is never enough.
-
-Completion-candidate evidence immediately before the footer:
-
-```text
-FULL_CORPUS_RECONCILED: YES
-FULL_CORPUS_AUDITABLE_POPULATION: 65720
-OWNED_PENDING_CASES: 0
-```
-
-Corpus-wide reconciliation must also avoid duplicate reviewed IDs across shards and missing assigned IDs.
-
-## Systematic-pattern rules
-
-- same `FAIL` family >= 3 within a shard; or
-- same `MINOR/FAIL` family >= 5 within a shard.
-
-Known families include S3/S4/S5/S6, party/court/date/ID, omission, hallucination, contradiction, overstatement, and understatement.
+Every controller send verifies GPT-5.6 Sol and High reasoning effort. This was the highest selectable option in the connected account at the time of the repair. If the selector cannot confirm that exact policy, the action is not sent and the bucket enters HOLD.

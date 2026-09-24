@@ -1,0 +1,107 @@
+{
+  "recordedAtUtc": "2026-09-20T04:53:15Z",
+  "sourceRevision": "65d2e726fbf3497f97b8457da44dd99c6d7eb305",
+  "policy": {
+    "maxConcurrentGenerations": 2,
+    "maxManagedBucketChats": 5,
+    "requiredModel": "GPT-5.6 Sol",
+    "requiredReasoningEffort": "High",
+    "fallbackAllowed": false,
+    "modelVerifiedBeforeEverySend": true
+  },
+  "liveUiReadback": {
+    "observedAtUtc": "2026-09-20T02:58:39Z",
+    "managedBucketChatsChecked": 5,
+    "model": "GPT-5.6 Sol",
+    "reasoningEffort": "High",
+    "messagesSentDuringReadback": false,
+    "retiredTrackedTabsStillOpen": 0
+  },
+  "liveController": {
+    "observedAtUtc": "2026-09-20T04:53:15Z",
+    "runState": "RUNNING",
+    "connected": true,
+    "managedBucketChats": 5,
+    "maxConcurrentGenerations": 2,
+    "liveGenerationsAtCapture": 2,
+    "scheduledSlotsAtCapture": 2,
+    "availableSlotsAtCapture": 0,
+    "liveBucketsAtCapture": [
+      "2",
+      "3"
+    ],
+    "reviewerModelPolicy": {
+      "model": "GPT-5.6 Sol",
+      "reasoningEffort": "High",
+      "verifiedBeforeEverySend": true,
+      "fallbackAllowed": false
+    },
+    "dashboardHttpStatus": 200,
+    "dashboardShowsAwaitingResponseReservations": true,
+    "slotRecoveryPatchLoaded": false
+  },
+  "priorControllerSnapshot": {
+    "observedAtUtc": "2026-09-20T02:58:39Z",
+    "runState": "RUNNING",
+    "connected": true,
+    "managedBucketChats": 5,
+    "maxConcurrentGenerations": 2,
+    "liveGenerationsAtCapture": 1,
+    "writeRecovery": {
+      "kind": "WRITE_RECOVERY",
+      "model": "GPT-5.6 Sol",
+      "reasoningEffort": "High",
+      "recoveryCompleted": true,
+      "holdCleared": true,
+      "registryReadback": "flagged range present and reviewed; case content excluded",
+      "newCaseWritesDuringRecovery": 0
+    },
+    "activeWork": {
+      "bucket": "3",
+      "kind": "CONTINUE",
+      "model": "GPT-5.6 Sol",
+      "reasoningEffort": "High",
+      "generationActiveAtCapture": true
+    },
+    "waitingWork": {
+      "bucket1": "source pack unavailable; retry backoff pending",
+      "bucket2": "stalled; no recent audit progress"
+    },
+    "dashboardHttpStatus": 200,
+    "dashboardShowsPerBucketModelCheck": true
+  },
+  "chatCreation": {
+    "ambiguousSetup": "preserve tab, hold bucket, disable automatic retry",
+    "legacyRetryState": "migrate to hold",
+    "retiredTrackedTab": "closed before replacement",
+    "unrelatedTabs": "not matched or closed"
+  },
+  "priorAction": {
+    "completedBeforeRepair": true,
+    "selectedTier": "Instant",
+    "existingVerifiedWritesPreserved": true,
+    "retroactiveRewrite": false
+  },
+  "validation": {
+    "command": "npm test",
+    "publicSuite": {
+      "tests": 161,
+      "passed": 161,
+      "failed": 0
+    },
+    "localApplicationSuite": {
+      "tests": 156,
+      "passed": 156,
+      "failed": 0
+    },
+    "gitDiffCheck": "passed",
+    "publicDiffPrivacyScan": "passed",
+    "dashboardShowsAwaitingResponseReservations": true
+  },
+  "runtimePatchActivation": {
+    "status": "PENDING_SAFE_RESTART",
+    "reason": "The running controller was left undisturbed while two generations were live; its process must reload the slot-recovery patch after those generations finish."
+  },
+  "operationalLimit": "The source-pack inventory was verified complete and the controller reconciles beyond that inventory instead of retrying a phantom pack. If reconciliation finds pending cases but no later exact pack exists, it holds visibly rather than marking completion.",
+  "privateRuntimeData": "excluded"
+}

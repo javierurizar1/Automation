@@ -19,9 +19,9 @@ test("bucket ownership is stable modulo 6", () => {
 });
 
 test("pack helpers preserve six-digit naming", () => {
-  assert.equal(parsePackNumber("pack_000217.jsonl"), 217);
-  assert.equal(packName(54), "pack_000054.jsonl");
-  assert.equal(nextPackName("pack_000053.jsonl"), "pack_000054.jsonl");
+  assert.equal(parsePackNumber("pack_000007.jsonl"), 7);
+  assert.equal(packName(5), "pack_000005.jsonl");
+  assert.equal(nextPackName("pack_000004.jsonl"), "pack_000005.jsonl");
 });
 
 test("status footer has exactly six lines", () => {
@@ -30,9 +30,10 @@ test("status footer has exactly six lines", () => {
   assert.match(footer, /^AUDIT_TURN_STATUS\nSTATUS: NORMAL/);
 });
 
-test("completion requires full 65720 population and zero pending/unresolved", () => {
-  assert.equal(completionEvidence({fullCorpusReconciled:true, auditablePopulation:65720, ownedPendingCases:0}).complete, true);
-  assert.equal(completionEvidence({fullCorpusReconciled:true, auditablePopulation:65720, ownedPendingCases:1}).complete, false);
+test("completion requires a verified configured population and zero pending/unresolved", () => {
+  assert.equal(completionEvidence({fullCorpusReconciled:true, auditablePopulation:123, expectedPopulation:123, ownedPendingCases:0}).complete, true);
+  assert.equal(completionEvidence({fullCorpusReconciled:true, auditablePopulation:123, expectedPopulation:123, ownedPendingCases:1}).complete, false);
+  assert.equal(completionEvidence({fullCorpusReconciled:true, auditablePopulation:123, ownedPendingCases:0}).complete, false);
 });
 
 test("response dedup key is action-aware", () => {

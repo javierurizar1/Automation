@@ -1,0 +1,22 @@
+[Unit]
+Description=R4.3.3 Local Operations Dashboard
+After=network.target
+StartLimitIntervalSec=5min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=@APP_ROOT@
+Environment="PATH=@NODE_BIN_DIR@:/usr/local/bin:/usr/bin:/bin"
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/env node src/dashboard.mjs
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=20s
+TimeoutStopSec=15s
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

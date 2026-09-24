@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>R4.3.3 Audit Controller — Operations</title>
+  <style>
+    :root { color-scheme: dark; font: 14px/1.45 system-ui, sans-serif; background: #0d141c; color: #e7edf4; }
+    * { box-sizing: border-box; }
+    body { margin: 0 auto; padding: 22px; max-width: 1720px; }
+    h1,h2,h3,p { margin: 0; }
+    h1 { font-size: 23px; letter-spacing: .01em; }
+    h2 { font-size: 15px; color: #a9bfd1; margin-bottom: 12px; }
+    h3 { font-size: 14px; }
+    .toolbar,.panel,.card,.metric { border: 1px solid #293b4b; border-radius: 10px; background: #17212c; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; padding: 14px 16px; margin-bottom: 14px; }
+    .title { min-width: 250px; margin-right: auto; }
+    .subtle { color: #93a8ba; font-size: 12px; }
+    #runState { font-size: 14px; font-weight: 700; }
+    button { border: 0; border-radius: 6px; padding: 9px 13px; background: #7dd3fc; color: #071018; font-weight: 700; cursor: pointer; }
+    button:hover { filter: brightness(1.08); } button:disabled { opacity: .5; cursor: wait; }
+    button.stop { background: #fb7185; } button.neutral { background: #94a3b8; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(245px,1fr)); gap: 10px; margin-bottom: 14px; }
+    .card { padding: 13px; min-width: 0; }
+    .card h3 { margin-bottom: 7px; color: #b9c9d7; }
+    .big { font-size: 21px; font-weight: 750; overflow-wrap: anywhere; }
+    .detail { margin-top: 6px; color: #c2cfdb; font-size: 12px; overflow-wrap: anywhere; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit,minmax(125px,1fr)); gap: 8px; margin-bottom: 14px; }
+    .metric { padding: 10px 12px; }
+    .metric .label { font-size: 11px; color: #93a8ba; }
+    .metric .value { font-size: 18px; font-weight: 700; margin-top: 4px; overflow-wrap: anywhere; }
+    .panel { padding: 14px; margin-bottom: 14px; }
+    .slots,.buckets { display: grid; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); gap: 9px; }
+    .kv { display: grid; grid-template-columns: minmax(105px,auto) 1fr; gap: 3px 8px; font-size: 12px; }
+    .kv .key { color: #93a8ba; }
+    .bucket { border-left: 3px solid #41576b; }
+    .bucket.complete { border-left-color: #4ade80; }
+    .bucket.held { border-left-color: #fbbf24; }
+    .bucket.failed { border-left-color: #fb7185; }
+    .bucket h3 { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .badge { border-radius: 999px; padding: 2px 7px; background: #263747; font-size: 10px; white-space: nowrap; }
+    .ok { color: #86efac; } .warn { color: #fbbf24; } .bad { color: #fb7185; }
+    .mono { font-family: ui-monospace,SFMono-Regular,Consolas,monospace; font-size: 11px; overflow-wrap: anywhere; }
+    .incident { padding: 9px 0; border-bottom: 1px solid #293b4b; }
+    .incident:last-child { border-bottom: 0; }
+    .empty { color: #93a8ba; }
+    @media (max-width: 650px) { body { padding: 10px; } .toolbar { gap: 8px; } .title { width: 100%; } button { flex: 1; } }
+  </style>
+</head>
+<body>
+  <header class="toolbar">
+    <div class="title"><h1>R4.3.3 Audit Controller</h1><div class="subtle">Local operations · 6 buckets · 2 reusable reviewer slots · 3 automation tabs maximum</div></div>
+    <div id="runState">Loading controller status…</div>
+    <button class="stop" data-action="stop">STOP AUTOMATION</button>
+    <button data-action="start">RESTART AUTOMATION</button>
+    <button class="neutral" id="refresh">REFRESH</button>
+  </header>
+
+  <section class="grid" id="runtime"></section>
+  <section class="panel"><h2>Reviewer slots</h2><div class="slots" id="reviewerSlots"></div></section>
+  <section class="metrics" id="metrics"></section>
+  <section class="panel"><h2>Scheduler exclusions</h2><div id="scheduler"></div></section>
+  <section class="panel"><h2>Buckets B0–B5</h2><div class="buckets" id="buckets"></div></section>
+  <section class="grid" id="operations"></section>
+  <section class="panel"><h2>Recent incidents</h2><div id="incidents" class="empty">No incidents recorded.</div></section>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const controls = [...document.querySelectorAll('[data-action]')];
+    const esc = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const time = value => value ? (Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : esc(value)) : '—';
+    const shortTime = value => value ? (Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleTimeString() : esc(value)) : '—';
+    const ageSeconds = value => { const t = value ? Date.parse(value) : NaN; return Number.isFinite(t) ? Math.max(0, Math.floor((Date.now()-t)/1000)) : null; };
+    const val = (value, fallback='—') => value == null || value === '' ? fallback : value;
+    const yesNo = value => value === true ? '<span class="ok">YES</span>' : value === false ? '<span class="bad">NO</span>' : '<span class="subtle">UNKNOWN</span>';
+    const shortId = value => value ? String(value).slice(0, 10) : '—';
+    const slotName = slot => String(slot?.slotId || slot?.slot || '');
+
+    function render(data) {
+      const s = data.status || {};
+      const metrics = s.metrics || {};
+      const tracker = data.tracker || {};
+      const watchdog = data.watchdog || {};
+      const build = s.build || {};
+      const buckets = s.buckets || {};
+      const heartbeatAt = s.heartbeatAt || s.updatedAt;
+      const heartbeatAge = ageSeconds(heartbeatAt);
+      const controllerState = s.controllerState || s.runState || 'UNKNOWN';
+      const health = heartbeatAge == null ? 'UNKNOWN' : heartbeatAge > 120 ? 'STALE' : (s.browserConnected === false ? 'DEGRADED' : 'HEALTHY');
+      const desired = String(data.control?.desiredState || controllerState).toUpperCase();
+      $('runState').innerHTML = `${esc(controllerState)} · ${health} <span class="subtle">· heartbeat ${heartbeatAge == null ? 'unknown' : `${heartbeatAge}s ago`}</span>`;
+
+      const automationTabs = s.automationTabCount ?? ((s.coordinatorTabPresent ? 1 : 0) + Number(s.reviewerTabCount || 0));
+      const canonical = s.canonicalRegistry || tracker.canonicalRegistry || {};
+      const canonicalVerified = canonical.status === 'AVAILABLE'
+        && canonical.acceptedTerminalCount != null
+        && canonical.remainingAuditableCases != null
+        && Number.isFinite(Number(canonical.acceptedTerminalCount))
+        && Number.isFinite(Number(canonical.remainingAuditableCases))
+        && Boolean(canonical.reconciledAt);
+      const terminal = canonicalVerified ? Number(canonical.acceptedTerminalCount).toLocaleString() : 'Unavailable';
+      const remaining = canonicalVerified ? Number(canonical.remainingAuditableCases).toLocaleString() : 'Unavailable';
+      const localCases = s.casesProcessedTotal ?? metrics.casesProcessed ?? '—';
+      const localRemaining = s.casesRemainingEstimate ?? metrics.casesRemaining ?? '—';
+      const integrityAt = tracker.reconciledAt || tracker.updatedAt || tracker.snapshotAt || null;
+      const integrityTimestamped = tracker.sanitized === true
+        && Boolean(integrityAt && Number.isFinite(Date.parse(integrityAt)));
+      const integritySummary = integrityTimestamped
+        ? `Latest sanitized snapshot ${time(integrityAt)} (may be stale): conflicts ${esc(val(tracker.conflictingTerminalRows))} · misowned ${esc(val(tracker.ownershipMismatches))}`
+        : 'Integrity conflict and misowned counts unavailable; no timestamped sanitized snapshot is loaded.';
+      const buildSha = build.gitSha || s.gitSha || 'unavailable';
+      const sourceHash = build.sourceHash || 'unavailable';
+      const loadedHash = build.loadedSourceHash || sourceHash;
+      const diskHash = build.diskSourceHash || sourceHash;
+      const endpoint = s.cdpEndpoint || '—';
+      $('runtime').innerHTML = [
+        `<article class="card"><h3>Controller</h3><div class="big">${esc(controllerState)}</div><div class="detail">Desired: ${esc(desired)} · PID: ${esc(s.controllerPid ?? '—')}<br>Started: ${esc(time(s.startedAt))}<br>Heartbeat: ${esc(time(heartbeatAt))}</div></article>`,
+        `<article class="card"><h3>Build fingerprint</h3><div class="big mono">${esc(buildSha)}</div><div class="detail">Source: ${esc(sourceHash)}<br>Loaded: ${esc(loadedHash)}<br>On disk: ${esc(diskHash)}<br>Process started: ${esc(time(build.startedAt || s.startedAt))}</div></article>`,
+        `<article class="card"><h3>Browser and CDP</h3><div class="big">${s.browserConnected === true ? '<span class="ok">CONNECTED</span>' : s.browserConnected === false ? '<span class="bad">DISCONNECTED</span>' : 'UNKNOWN'}</div><div class="detail">${esc(s.browserExecutable || 'Browser unknown')} · PID ${esc(s.browserPid ?? '—')}<br>CDP: ${esc(endpoint)}<br>Coordinator page: ${yesNo(s.coordinatorTabPresent)} · Reviewer pages: ${esc(s.reviewerTabCount ?? '—')}<br>Automation tabs: ${esc(automationTabs)} / 3</div></article>`,
+        `<article class="card"><h3>Canonical registry population</h3><div class="big">${esc(terminal)} terminal · ${esc(remaining)} remaining</div><div class="detail">Registry reconciliation: ${esc(canonical.status || 'UNAVAILABLE')} · checked ${esc(time(canonical.reconciledAt))}<br>Population: ${esc(canonical.auditablePopulation ?? metrics.auditablePopulation ?? s.auditablePopulation ?? '65,720')}<br>${integritySummary}<br>Last controller progress: ${esc(time(s.lastGlobalProgressAt || metrics.lastProgressAt))}</div></article>`,
+        `<article class="card"><h3>Coordinator</h3><div class="big">${esc(s.coordinatorState || data.coordinator?.status || 'UNKNOWN')}</div><div class="detail">Coordinator tab: ${yesNo(s.coordinatorTabPresent)}<br>Coordinator status updated: ${esc(time(data.coordinator?.updatedAt || data.coordinator?.startedAt))}</div></article>`,
+      ].join('');
+
+      const slotSource = Array.isArray(s.reviewerSlots) ? s.reviewerSlots : Object.values(s.reviewerSlots || {});
+      const slotCards = [1,2].map(index => {
+        const expected = `reviewer-${index}`;
+        const slot = slotSource.find(item => slotName(item) === expected || slotName(item) === String(index)) || {};
+        const bucketEntry = Object.values(buckets).find(b => Number(b.reviewerSlot) === index || b.reviewerSlot === expected);
+        const bucket = slot.bucket ?? bucketEntry?.bucket;
+        const generation = slot.actualGeneration ?? bucketEntry?.actualGenerationDetected;
+        const assigned = slot.present === true || bucket != null;
+        return `<article class="card"><h3>Reviewer slot ${index} <span class="badge">${assigned ? 'REUSABLE SLOT' : 'AVAILABLE'}</span></h3><div class="kv"><span class="key">Page present</span><span>${yesNo(slot.present ?? assigned)}</span><span class="key">Health</span><span>${esc(slot.health || (assigned ? 'UNKNOWN' : 'EMPTY'))}</span><span class="key">Bucket</span><span>${bucket == null ? '—' : `B${esc(bucket)}`}</span><span class="key">Generation active</span><span>${yesNo(generation)}</span><span class="key">Page</span><span>${esc(slot.pageUrl ? (() => { try { return new URL(slot.pageUrl).hostname; } catch { return 'present'; } })() : '—')}</span><span class="key">Conversation</span><span>${esc(shortId(slot.reviewerConversationId || bucketEntry?.reviewerConversationId))}</span><span class="key">Reason</span><span>${esc(slot.reason || '—')}</span></div></article>`;
+      });
+      $('reviewerSlots').innerHTML = slotCards.join('');
+
+      $('metrics').innerHTML = [
+        ['Live generations', `${esc(s.liveReviewerGenerations ?? s.activeReviewers ?? 0)} / 2`],
+        ['Cases · 5 min', esc(s.newCasesLast5m ?? 0)], ['Cases · 15 min', esc(s.newCasesLast15m ?? 0)], ['Cases · 60 min', esc(s.newCasesLast60m ?? 0)],
+        ['Verified writes · 5 min', esc(s.verifiedWritesLast5m ?? 0)], ['Verified writes · 15 min', esc(s.verifiedWritesLast15m ?? 0)], ['Verified writes · 60 min', esc(s.verifiedWritesLast60m ?? 0)],
+        ['Scheduler eligible buckets', (s.eligibleBuckets || []).map(b => `B${b}`).join(', ') || '—'],
+      ].map(([label,value]) => `<div class="metric"><div class="label">${label}</div><div class="value">${value}</div></div>`).join('');
+
+      const exclusions = s.scheduler?.bucketExclusions || s.schedulerExclusions || {};
+      $('scheduler').innerHTML = `<div class="kv">${Array.from({length:6},(_,i) => {
+        const b = buckets[String(i)] || buckets[i] || {};
+        const reason = b.schedulerExclusionReason || exclusions[String(i)] || exclusions[i] || '—';
+        const eligible = b.eligibleForScheduling;
+        return `<span class="key">B${i}</span><span>${eligible === true ? '<span class="ok">ELIGIBLE</span>' : eligible === false ? '<span class="warn">EXCLUDED</span>' : '<span class="subtle">UNKNOWN</span>'} · ${esc(reason)}</span>`;
+      }).join('')}</div>`;
+
+      $('buckets').innerHTML = Array.from({length:6},(_,i) => {
+        const b = buckets[String(i)] || buckets[i] || {};
+        const phase = b.phase || b.workflowPhase || b.operationalState || 'UNKNOWN';
+        const holdType = b.holdType || (b.complete ? 'COMPLETE' : '—');
+        const hold = b.holdReason || b.exactBlocker || '—';
+        const statusClass = b.complete ? 'complete' : b.holdType && b.holdType !== 'ADVISORY' ? 'held' : (b.phase === 'ERROR' ? 'failed' : '');
+        return `<article class="card bucket ${statusClass}"><h3>B${i}<span class="badge">${b.complete ? 'COMPLETE' : esc(phase)}</span></h3><div class="kv">
+          <span class="key">Phase</span><span>${esc(phase)} · complete ${yesNo(b.complete)}</span>
+          <span class="key">Hold</span><span>${esc(holdType)} · ${esc(hold)}<br><span class="subtle">since ${esc(time(b.holdSince))} · recoverable ${esc(val(b.recoverable))} · retry ${esc(time(b.nextRecoveryAttemptAt))}</span></span>
+          <span class="key">Scheduler</span><span>${b.eligibleForScheduling === true ? '<span class="ok">ELIGIBLE</span>' : b.eligibleForScheduling === false ? '<span class="warn">EXCLUDED</span>' : 'UNKNOWN'} · ${esc(b.schedulerExclusionReason || '—')}</span>
+          <span class="key">Reviewer</span><span>slot ${esc(b.reviewerSlot ?? '—')} · reserved ${yesNo(b.generationReserved)} · active ${yesNo(b.actualGenerationDetected)}<br><span class="subtle">conversation ${esc(shortId(b.reviewerConversationId))}</span></span>
+          <span class="key">Action</span><span>${esc(b.currentActionKind || b.currentActionType || '—')} · ${esc(b.currentActionId || '—')}<br><span class="subtle">awaiting ${esc(time(b.awaitingResponseAt))}</span></span>
+          <span class="key">Packs</span><span>current ${esc(b.currentPack || b.currentSourcePack || '—')} · last ${esc(b.lastConsumedPack || b.lastConsumedSourcePack || '—')} · target ${esc(b.targetPack || '—')}</span>
+          <span class="key">Progress</span><span>${esc(time(b.lastProgressAt))} · registry write ${esc(time(b.lastRegistryWriteAt))}<br><span class="subtle">write readback ${yesNo(b.lastRegistryWriteVerified)}</span></span>
+        </div></article>`;
+      }).join('');
+
+      const service = watchdog.controllerService || {};
+      $('operations').innerHTML = [
+        `<article class="card"><h3>Watchdog</h3><div class="big">${esc(watchdog.state || 'UNKNOWN')}</div><div class="detail">Updated: ${esc(time(watchdog.updatedAt))}<br>Issue: ${esc(watchdog.issue || 'none')}<br>Attempts in window: ${esc(watchdog.attemptsInWindow ?? 0)} / ${esc(watchdog.maxRecoveryAttempts ?? 3)}<br>Next attempt: ${esc(time(watchdog.nextAttemptAt))}<br>Last action: ${esc(watchdog.lastActionResult || '—')}</div></article>`,
+        `<article class="card"><h3>Controller service</h3><div class="big">${esc(service.activeState || 'UNKNOWN')} / ${esc(service.subState || 'UNKNOWN')}</div><div class="detail">Unit: ${esc(watchdog.controllerUnit || 'r433-audit-controller.service')}<br>PID: ${esc(service.mainPid ?? '—')} · Restart count: ${esc(service.nRestarts ?? '—')}<br>Last exit: ${esc(service.lastExitStatus ?? '—')}<br>Suppressed: ${esc(watchdog.suppressedState || 'none')}</div></article>`,
+        `<article class="card"><h3>Controller telemetry and write verification</h3><div class="big">Last progress ${esc(time(s.lastGlobalProgressAt || metrics.lastProgressAt))}</div><div class="detail">Verified write: ${esc(time(s.lastRegistryWriteAt))} · readback ${yesNo(s.lastRegistryWriteVerified)}<br>Local cases reported: ${esc(localCases)} · local remaining estimate: ${esc(localRemaining)}<br><span class="subtle">Controller telemetry is not canonical registry evidence.</span></div></article>`,
+        `<article class="card"><h3>Coordinator activity</h3><div class="big">${esc(data.coordinator?.status || s.coordinatorState || 'IDLE')}</div><div class="detail">Incident: ${esc(shortId(data.coordinator?.incidentId))}<br>Queued ${esc(time(data.coordinator?.queuedAt))} · started ${esc(time(data.coordinator?.startedAt))}<br>Finished ${esc(time(data.coordinator?.completedAt))}</div></article>`,
+      ].join('');
+
+      const incidents = data.incidents || s.incidents || [];
+      $('incidents').innerHTML = incidents.length ? incidents.slice(0,30).map(item => `<div class="incident"><b>${esc(time(item.detectedAt))} · ${esc(item.kind || 'INCIDENT')}${item.bucket == null ? '' : ` · B${esc(item.bucket)}`}</b><div>${esc(item.detail || item.requiredAction || 'No details provided.')}</div><div class="subtle">${esc(item.requiredAction || '')}</div></div>`).join('') : '<span class="ok">No incidents recorded.</span>';
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch('/api/status', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`status request failed (${response.status})`);
+        render(await response.json());
+      } catch (error) {
+        $('runState').innerHTML = `<span class="bad">DASHBOARD ERROR: ${esc(error.message)}</span>`;
+      }
+    }
+    async function control(action) {
+      controls.forEach(button => button.disabled = true);
+      try {
+        const response = await fetch('/api/control', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action}) });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `control request failed (${response.status})`);
+      } catch (error) {
+        $('runState').innerHTML = `<span class="bad">CONTROL ERROR: ${esc(error.message)}</span>`;
+      } finally {
+        controls.forEach(button => button.disabled = false);
+        await refresh();
+      }
+    }
+    controls.forEach(button => button.addEventListener('click', () => control(button.dataset.action)));
+    $('refresh').addEventListener('click', refresh);
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

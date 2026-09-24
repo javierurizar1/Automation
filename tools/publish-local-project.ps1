@@ -1,10 +1,11 @@
 param(
-    [string]$ProjectRoot = "C:\\Users\\javi_\\.codex\\Apps\\R433AuditController",
+    [string]$ProjectRoot = (Join-Path $env:USERPROFILE '.codex\Apps\R433AuditController'),
     [string]$RepoUrl = "https://github.com/javierurizar1/Automation.git",
-    [string]$Branch = "main"
+    [string]$Branch = "codex/audit-controller-import"
 )
 
 $ErrorActionPreference = "Stop"
+if ($Branch -in @("main", "master")) { throw "Refusing direct publication to protected default branch: $Branch" }
 
 if (-not (Test-Path -LiteralPath $ProjectRoot)) { throw "Project root not found: $ProjectRoot" }
 Set-Location -LiteralPath $ProjectRoot
@@ -38,6 +39,7 @@ $ignoreLines = @(
     ".env.*"
 )
 
+$ignoreLines += @("config.json", "/data/", "/logs/", "/chrome-profile/", "archive/", "scratch/", "*.jsonl", "*.sqlite*", "*.db", "__pycache__/")
 $gitignorePath = Join-Path $ProjectRoot ".gitignore"
 if (-not (Test-Path -LiteralPath $gitignorePath)) { New-Item -ItemType File -Path $gitignorePath | Out-Null }
 $currentIgnore = Get-Content -LiteralPath $gitignorePath -ErrorAction SilentlyContinue

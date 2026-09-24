@@ -1,0 +1,30 @@
+[Unit]
+Description=R4.3.3 Persistent Source Browser
+After=graphical-session.target network-online.target r433-audit-dashboard.service
+Wants=network-online.target r433-audit-dashboard.service
+StartLimitIntervalSec=30min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=@APP_ROOT@
+Environment="PATH=@NODE_BIN_DIR@:/usr/local/bin:/usr/bin:/bin"
+Environment="DISPLAY=@DISPLAY@"
+Environment="XAUTHORITY=@XAUTHORITY@"
+Environment="XDG_RUNTIME_DIR=%t"
+# The local dashboard endpoint gives Playwright a first committed document. The
+# controller navigates this same visible authenticated profile to ChatGPT
+# after CDP attach, with its own bounded timeout.
+ExecStartPre=/usr/bin/env node scripts/wait-for-bootstrap.mjs http://127.0.0.1:9350/__r433_bootstrap
+ExecStart=@BROWSER_EXECUTABLE@ --remote-debugging-port=@CDP_PORT@ --user-data-dir=@BROWSER_PROFILE_DIR@ --profile-directory=@BROWSER_PROFILE_NAME@ --no-first-run --no-default-browser-check http://127.0.0.1:9350/__r433_bootstrap
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=45s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

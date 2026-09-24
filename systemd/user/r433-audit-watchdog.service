@@ -1,0 +1,14 @@
+[Unit]
+Description=R4.3.3 Bounded Controller Watchdog
+After=r433-audit-controller.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=@APP_ROOT@
+Environment="PATH=@NODE_BIN_DIR@:/usr/local/bin:/usr/bin:/bin"
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/env node src/watchdog.mjs
+TimeoutStartSec=25s
+UMask=0077
+StandardOutput=journal
+StandardError=journal

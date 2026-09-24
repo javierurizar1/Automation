@@ -1,0 +1,14 @@
+{
+  "name": "r433-audit-controller",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/controller.mjs",
+    "dashboard": "node src/dashboard.mjs",
+    "test": "node --test tests/protocol.test.mjs tests/source-pack-recovery-static.test.mjs tests/controller-state-machine-static.test.mjs tests/reviewer-slot-occupancy.test.mjs tests/source-pack-boundary-progression.test.mjs tests/operations.test.mjs tests/watchdog-static.test.mjs tests/recovered-invariants.test.mjs tests/browser-runtime.test.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}
