@@ -107,6 +107,7 @@ const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8').replace(/^\uFEFF/
 const MAX_ACTIVE_REVIEWERS = 2;
 const MAX_REVIEWER_TABS = 2;
 const MAX_AUTOMATION_TABS = 3;
+const REVIEWER_MODEL_HOLD_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 function sourcePackShardMappingStatus() {
   const mapping = config.sourcePackShards;
   const missingBuckets = [];
@@ -4763,6 +4764,30 @@ function recoverRecoverableHoldForScheduling(bucket, bucketState) {
   const incidentId = String(bucketState.lastAction).slice('incident:'.length);
   const incidentRecord = Object.values(state.incidents).find(entry => entry.id === incidentId);
   const incident = incidentRecord?.path ? loadJson(incidentRecord.path, null) : null;
+  if (incident?.kind === 'REVIEWER_MODEL_UNAVAILABLE') {
+    const previousRetryAt = Date.parse(bucketState.reviewerModelHoldRetryAt || '');
+    if (readControl().desiredState !== 'RUNNING'
+      || browserRuntimeStatus.coordinatorHealth?.state !== 'HEALTHY'
+      || browserRuntimeStatus.authenticationRequired
+      || bucketState.sourcePackCursorReconciliationRequired
+      || bucketHasUnresolvedAwaitingAction(bucketState)
+      || (Number.isFinite(previousRetryAt)
+        && Date.now() - previousRetryAt < REVIEWER_MODEL_HOLD_RETRY_COOLDOWN_MS)) return false;
+
+    // The failed model check never sent an action. Once the signed-in ChatGPT
+    // page is healthy again, allow a fresh reviewer setup attempt. Later
+    // failures honor the retry cooldown. sendAction still verifies the model
+    // and High effort before any reviewer prompt.
+    bucketState.hold = null;
+    bucketState.phase = bucketState.chatUrl ? 'PAUSED' : 'PENDING';
+    bucketState.reviewerModelVerification = null;
+    bucketState.setupVerified = false;
+    bucketState.setupVerifiedChatId = null;
+    bucketState.reviewerModelHoldRetryAt = now();
+    bucketState.lastAction = `scheduler-model-retry:${incidentId}`;
+    log(`B${bucket}: staged one reviewer-model retry after browser health recovered; incident preserved ${incidentId}`);
+    return true;
+  }
   if (!isRecoverableSourcePackHoldIncident(incident, bucketState)) return false;
   if (!stageRecoverableSourcePackHold(bucket, bucketState, incidentId, incident, 'scheduler')) return false;
   log(`B${bucket}: staged recoverable source-pack hold for scheduling; incident preserved ${incidentId}`);
