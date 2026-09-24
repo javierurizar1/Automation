@@ -92,6 +92,8 @@ const COORDINATOR_STATUS_PATH = path.join(ROOT, 'data', 'coordinator-status.json
 const LOG_PATH = path.join(ROOT, 'logs', 'controller.log');
 const INCIDENT_DIR = path.join(ROOT, 'data', 'incidents');
 const COORDINATOR_WAKE = path.join(ROOT, 'CoordinatorWake.ps1');
+const COORDINATOR_WAKE_LINUX = path.join(ROOT, 'CoordinatorWake.mjs');
+const COORDINATOR_LOCK_PATH = path.join(ROOT, 'data', 'codex-coordinator.lock');
 const COORDINATOR_WAKE_STDOUT = path.join(ROOT, 'logs', 'coordinator-wake.stdout.log');
 const COORDINATOR_WAKE_STDERR = path.join(ROOT, 'logs', 'coordinator-wake.stderr.log');
 const SOURCE_PACK_READY_PATH = path.join(ROOT, 'data', 'source-packs-ready.json');
@@ -2160,27 +2162,38 @@ function queueCoordinatorStatus(incidentId, detectedAt, kind) {
 }
 
 function wakeCodex(incidentPath) {
-  if (process.platform !== 'win32') {
-    const error = `Coordinator wake requires Windows PowerShell (running on ${process.platform})`;
-    saveJsonAtomic(COORDINATOR_STATUS_PATH, {
-      ...loadJson(COORDINATOR_STATUS_PATH, {}),
-      status: 'UNAVAILABLE',
-      completedAt: now(),
-      exitCode: null,
-      error,
-    });
-    log(`${error}; incident ${path.basename(incidentPath)} is available in the dashboard`);
-    return;
-  }
   try {
     const stdout = fs.openSync(COORDINATOR_WAKE_STDOUT, 'a');
     const stderr = fs.openSync(COORDINATOR_WAKE_STDERR, 'a');
+    const windows = process.platform === 'win32';
     const child = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', COORDINATOR_WAKE, '-IncidentPath', incidentPath],
+      windows ? 'powershell.exe' : 'flock',
+      windows
+        ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', COORDINATOR_WAKE, '-IncidentPath', incidentPath]
+        : ['-E', '75', '-w', '1800', COORDINATOR_LOCK_PATH, process.execPath, COORDINATOR_WAKE_LINUX, incidentPath],
       { detached: true, stdio: ['ignore', stdout, stderr], windowsHide: true },
     );
-    child.on('error', error => log(`Coordinator wake process failed: ${error.message}`));
+    if (windows) {
+      child.on('error', error => log(`Coordinator wake process failed: ${error.message}`));
+    } else {
+      let failureReported = false;
+      const reportFailure = (message, exitCode = null) => {
+        if (failureReported) return;
+        failureReported = true;
+        log(`Coordinator wake process failed: ${message}`);
+        const status = loadJson(COORDINATOR_STATUS_PATH, {});
+        if (status.incidentId === path.basename(incidentPath, '.json')
+          && ['QUEUED', 'RUNNING'].includes(status.status)) {
+          saveJsonAtomic(COORDINATOR_STATUS_PATH, {
+            ...status, status: 'FAILED', completedAt: now(), exitCode, error: message,
+          });
+        }
+      };
+      child.on('error', error => reportFailure(error.message));
+      child.on('close', (code, signal) => {
+        if (code !== 0) reportFailure(`exit code ${code ?? 'none'}${signal ? `, signal ${signal}` : ''}`, code);
+      });
+    }
     child.unref();
     log(`Coordinator wake queued for ${path.basename(incidentPath)}`);
   } catch (error) {
@@ -2311,9 +2324,14 @@ function ensureCoordinatorWakeProgress() {
   const retryAfterMs = 5 * 60 * 1000;
   const currentTime = Date.now();
 
-  if (status === 'RUNNING') return;
+  if (status === 'RUNNING') {
+    const workerPid = Number(coordinatorStatus?.workerPid);
+    if (process.platform !== 'linux' || !Number.isInteger(workerPid) || workerPid <= 0) return;
+    try { process.kill(workerPid, 0); return; } catch (error) {
+      if (error.code !== 'ESRCH') return;
+    }
+  }
   if (sameIncident && status === 'COMPLETED') return;
-  if (process.platform !== 'win32' && sameIncident && status === 'UNAVAILABLE') return;
 
   const statusAt = Date.parse(
     coordinatorStatus?.startedAt
